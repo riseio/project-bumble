@@ -1,0 +1,54 @@
+diff --git a/src/render/rt64_bumble_electric.h b/src/render/rt64_bumble_electric.h
+index a614551..dd0b0e8 100644
+--- a/src/render/rt64_bumble_electric.h
++++ b/src/render/rt64_bumble_electric.h
+@@ -14,5 +14,6 @@ namespace RT64 {
+     constexpr uint32_t BumbleElectricMaxArcs = 32u;
+     constexpr uint32_t BumbleParticleMaxEffects = 32u;
++    constexpr uint32_t BumbleParticleLaserImpact = 0x4C415352u;
+ 
+     enum BumbleElectricArcFlags : uint32_t {
+         BumbleElectricArcGeometry = 1u << 0u,
+diff --git a/src/render/rt64_bumble_electric_renderer.cpp b/src/render/rt64_bumble_electric_renderer.cpp
+index 4d94898..4a31d91 100644
+--- a/src/render/rt64_bumble_electric_renderer.cpp
++++ b/src/render/rt64_bumble_electric_renderer.cpp
+@@ -551,6 +551,28 @@ namespace RT64 {
+                 effect.position.z,
+             };
+             const float age = effect.ageSeconds;
++            if (effect.type == BumbleParticleLaserImpact) {
++                constexpr float lifetime = 0.22f;
++                if (age >= lifetime) {
++                    return;
++                }
++                const float fade = 1.0f - age / lifetime;
++                appendRecord(records, origin, origin, 12.0f + age * 24.0f,
++                    fade, 1.0f, age, RecordHalo, effect.seed);
++                // A bounded contact flash plus four short sparks reuses the existing additive batch.
++                for (uint32_t index = 0u; index < 4u; ++index) {
++                    const uint32_t seed = mix32(effect.seed ^ (index * 0x85EBCA6Bu));
++                    Vec3 direction{signedHash(seed), signedHash(seed ^ 0xA511E9B3u),
++                        signedHash(seed ^ 0x27D4EB2Fu)};
++                    if (!normalize(direction)) {
++                        continue;
++                    }
++                    const Vec3 tip = add(origin, multiply(direction, age * 45.0f));
++                    appendRecord(records, subtract(tip, multiply(direction, 3.0f)),
++                        tip, 0.65f, fade, 1.0f, age, RecordSpark, seed);
++                }
++                return;
++            }
+             const float baseRadius = explosionRadius(effect.scale);
+             if (age < 0.24f) {
+                 const float progress = age / 0.24f;
+@@ -653,6 +676,9 @@ namespace RT64 {
+             std::vector<BumbleElectricGPURecord>& records,
+             const BumbleParticleEffect& effect
+         ) {
++            if (effect.type == BumbleParticleLaserImpact) {
++                return;
++            }
+             if (!std::isfinite(effect.position.x) ||
+                 !std::isfinite(effect.position.y) ||
+                 !std::isfinite(effect.position.z) ||

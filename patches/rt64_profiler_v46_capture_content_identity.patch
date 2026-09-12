@@ -1,0 +1,206 @@
+diff --git a/src/rhi/rt64_render_hooks.h b/src/rhi/rt64_render_hooks.h
+index 9318a63..24a7f64 100644
+--- a/src/rhi/rt64_render_hooks.h
++++ b/src/rhi/rt64_render_hooks.h
+@@ -28,11 +28,19 @@ namespace RT64 {
+     using RenderHookCapturePrepare = bool(
+         RenderDevice *device,
+         RenderCommandList *list,
+         RenderTexture *swapChainTexture,
+         uint32_t width,
+-        uint32_t height
++        uint32_t height,
++        uint64_t presentId,
++        uint64_t workloadId,
++        uint64_t targetSetId,
++        uint32_t sourceFrameIndex,
++        uint32_t targetStorageIndex,
++        uint32_t presentationSlotIndex,
++        uint32_t swapChainIndex,
++        uint32_t colorTargetAddress
+     );
+     using RenderHookCaptureComplete = void();
+ 
+     RenderHookInit *GetRenderHookInit();
+     RenderHookDraw *GetRenderHookDraw();
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index de06c4e..9af20b6 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -1237,10 +1237,12 @@ namespace RT64 {
+             const bool measureGPUFrame =
+                 performanceGPUInstrumentationEnabled &&
+                 ((++performanceGPUFrameCounter %
+                     performanceGPUFrameInterval) == 0u);
+             PresentationSlot *presentationSlot = nullptr;
++            uint32_t presentationSlotIndex = UINT32_MAX;
++            uint32_t selectedTargetStorageIndex = UINT32_MAX;
+             RenderWorker *frameWorker = ext.presentGraphicsWorker;
+             RenderCommandSemaphore *frameAcquiredSemaphore =
+                 acquiredSemaphore.get();
+             RenderQueryPool *framePerformanceQueryPool =
+                 performanceQueryPool.get();
+@@ -1347,10 +1349,11 @@ namespace RT64 {
+                 }
+ 
+                 if (i < framesToPresent) {
+                     const uint32_t targetStorageIndex =
+                         frameCounters.targetBaseIndex + targetIndex;
++                    selectedTargetStorageIndex = targetStorageIndex;
+                     colorTarget = ext.sharedResources
+                         ->interpolatedColorTargets[targetStorageIndex].get();
+                     if (targetStorageIndex <
+                         ext.sharedResources->interpolatedTargetSetIds.size()) {
+                         selectedTargetSetId =
+@@ -1422,12 +1425,14 @@ namespace RT64 {
+             uint64_t drawHookSubmissionId = 0;
+             bool presentWorkSubmitted = false;
+             if (presentFrame && consumesInterpolationSequence) {
+                 ensurePresentationSlots();
+                 assert(!presentationSlots.empty());
++                presentationSlotIndex =
++                    presentationSlotCursor % presentationSlots.size();
+                 presentationSlot = &presentationSlots[
+-                    presentationSlotCursor % presentationSlots.size()
++                    presentationSlotIndex
+                 ];
+                 presentationSlotCursor++;
+                 waitForPresentationSlot(
+                     *presentationSlot,
+                     "Present.PresentationSlotReuseWait"
+@@ -1608,11 +1613,21 @@ namespace RT64 {
+                         captureQueued = capturePrepare(
+                             ext.device,
+                             commandList,
+                             swapChainTexture,
+                             ext.swapChain->getWidth(),
+-                            ext.swapChain->getHeight()
++                            ext.swapChain->getHeight(),
++                            present.presentId,
++                            present.workloadId,
++                            selectedTargetSetId,
++                            frameIndex,
++                            selectedTargetStorageIndex,
++                            presentationSlotIndex,
++                            swapChainIndex,
++                            colorTarget != nullptr
++                                ? colorTarget->addressForName
++                                : 0u
+                         );
+                     }
+                     
+                     commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
+                     if (measureGPUFrame) {
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+index bbb3f74..64402c0 100644
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -2142,10 +2142,12 @@ namespace RT64 {
+             uint64_t presentationFramebufferInventoryCount = 0;
+             uint64_t presentationFramebufferOwnerMatchedCount = 0;
+             uint64_t presentationFramebufferOwnerMissingCount = 0;
+             uint64_t diagnosticCaptureQueuedCount = 0;
+             uint64_t diagnosticCaptureCompletedCount = 0;
++            uint64_t diagnosticCaptureContentCount = 0;
++            uint64_t diagnosticCaptureBlankOutputCount = 0;
+             uint64_t earlyPresentDecisionCount = 0;
+             uint64_t earlyPresentEnabledCount = 0;
+             uint64_t earlyPresentCandidateCount = 0;
+             uint64_t earlyPresentSubmittedCount = 0;
+             uint64_t earlyPresentSubmissionMissCount = 0;
+@@ -2423,10 +2425,23 @@ namespace RT64 {
+                         }
+                         else if (eventName ==
+                             "Present.DiagnosticCaptureCompleted") {
+                             diagnosticCaptureCompletedCount++;
+                         }
++                        else if (eventName ==
++                            "Host.DiagnosticCaptureContent") {
++                            const uint64_t nonblackPixels =
++                                event.argument0 >> 32u;
++                            const uint64_t totalPixels =
++                                event.argument0 & UINT32_MAX;
++                            diagnosticCaptureContentCount++;
++                            diagnosticCaptureBlankOutputCount +=
++                                totalPixels > 0u &&
++                                    nonblackPixels * 100u < totalPixels
++                                ? 1u
++                                : 0u;
++                        }
+                         else if (eventName ==
+                             "State.FullSyncEarlyPresentDecision") {
+                             const uint64_t flags = event.argument0 & 0xFFu;
+                             const bool enabled = (flags & 1u) != 0u;
+                             const bool candidate =
+@@ -4655,11 +4670,19 @@ namespace RT64 {
+             const bool presentationFramebufferOwnerMissing =
+                 presentationFramebufferOwnerMissingCount > 0u;
+             const bool diagnosticCaptureCompletionMissing =
+                 diagnosticCaptureCompletedCount <
+                     diagnosticCaptureQueuedCount;
+-            if (diagnosticCaptureCompletionMissing) {
++            const bool diagnosticCaptureBlankOutput =
++                diagnosticCaptureBlankOutputCount > 0u;
++            if (diagnosticCaptureBlankOutput) {
++                diagnosis = "DIAGNOSTIC_CAPTURE_BLANK_OUTPUT";
++                confidence = "high";
++                primaryStage = "Host.DiagnosticCaptureContent";
++                primaryP95 = 0.0;
++            }
++            else if (diagnosticCaptureCompletionMissing) {
+                 diagnosis = "DIAGNOSTIC_CAPTURE_COMPLETION_MISSING";
+                 confidence = "high";
+                 primaryStage = "Present.DiagnosticCaptureCompleted";
+                 primaryP95 = 0.0;
+             }
+@@ -4736,10 +4759,11 @@ namespace RT64 {
+                 (interpolationDynamicVertexChangedVertices >= 100u) &&
+                 (interpolationDynamicVertexSkippedVertices * 100u >=
+                     interpolationDynamicVertexChangedVertices);
+             if (observedCadenceWithinTolerance &&
+                 !hardInterpolationFailure &&
++                !diagnosticCaptureBlankOutput &&
+                 !diagnosticCaptureCompletionMissing &&
+                 !presentedInterpolationFramebufferMismatch &&
+                 !presentationFramebufferOwnerMissing &&
+                 !observedOutputContradiction) {
+                 if (dynamicVertexCoverageGap) {
+@@ -4776,9 +4800,10 @@ namespace RT64 {
+                 }
+                 else if (fifoBacklogContinuouslyAvailable &&
+                     !hardInterpolationFailure &&
+                     !gpuIdleClockMaintenanceStarved &&
+                     !threadSchedulingDeadlineMiss &&
++                    !diagnosticCaptureBlankOutput &&
+                     !diagnosticCaptureCompletionMissing &&
+                     !presentedInterpolationFramebufferMismatch &&
+                     !presentationFramebufferOwnerMissing &&
+                     (earlyPresentSubmissionMissCount <= 2u)) {
+@@ -4862,11 +4887,11 @@ namespace RT64 {
+             std::ofstream output(summaryPath, std::ios::binary);
+             if (!output.is_open()) {
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v45\",\n";
++            output << "{\n  \"schema\": \"rt64-performance-summary-v46\",\n";
+             output << "  \"capture_mode\": \""
+                 << (profiler.lowOverhead ? "low_overhead" : "detailed")
+                 << "\",\n";
+             output << "  \"durability\": {\"journal_schema\":\"rt64-performance-journal-v1\",\"journal_interval_ms\":"
+                 << profiler.journalIntervalMilliseconds
+@@ -5210,10 +5235,14 @@ namespace RT64 {
+                 << presentationFramebufferOwnerMissingCount
+                 << ",\"diagnostic_capture_queued_count\":"
+                 << diagnosticCaptureQueuedCount
+                 << ",\"diagnostic_capture_completed_count\":"
+                 << diagnosticCaptureCompletedCount
++                << ",\"diagnostic_capture_content_count\":"
++                << diagnosticCaptureContentCount
++                << ",\"diagnostic_capture_blank_output_count\":"
++                << diagnosticCaptureBlankOutputCount
+                 << ",\"diagnostic_capture_completion_missing_count\":"
+                 << (diagnosticCaptureQueuedCount >
+                         diagnosticCaptureCompletedCount
+                     ? diagnosticCaptureQueuedCount -
+                         diagnosticCaptureCompletedCount

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "status": "deterministic smoke through Level Select to the exact Mission 1 player checkpoint with immediate menu retirement",
+  "source": {
+    "path": "production custom-menu route",
+    "sha256": "not-applicable",
+    "source_clock": "native_input_poll",
+    "scope": "A opens PLAY, STICK_D selects LEVEL SELECT, game-owned A enters Mission 1, and a final game-owned A advances the briefing into actual gameplay; the first post-commit poll requires the grid and all persistent menu text to be gone."
+  },
+  "clock": {
+    "kind": "native_input_poll",
+    "origin": "first_osContStartReadData_after_game_init"
+  },
+  "controller": 0,
+  "physical_input_suppressed": true,
+  "connected_pak": "ControllerPak",
+  "require_mission1_checkpoint": true,
+  "scheduled_events": [
+    {"tick": 60, "order": 0, "control": "A", "op": "down"},
+    {"tick": 62, "order": 0, "control": "A", "op": "up"},
+    {"tick": 100, "order": 0, "control": "STICK_D", "op": "down"},
+    {"tick": 104, "order": 0, "control": "STICK_D", "op": "up"}
+  ],
+  "game_owned_events": [
+    {"control": "A", "observed_phase": "0x0000000C", "reference_tick": 200, "deadline_tick": 700},
+    {"control": "A", "observed_phase": "0x0000000E", "reference_tick": 400, "deadline_tick": 1200},
+    {"control": "A", "observed_phase": "0x00000018", "reference_tick": 900, "deadline_tick": 1400}
+  ],
+  "observations": [
+    {"tick": 80, "label": "native_play_page_open"},
+    {"tick": 120, "label": "level_select_row_selected"},
+    {"tick": 300, "label": "level_select_open"},
+    {"tick": 900, "label": "mission1_entered"},
+    {"tick": 1400, "label": "mission1_player_settled"}
+  ],
+  "success_earliest_tick": 1500,
+  "end_tick": 6000,
+  "expected_game_owned_projection": {
+    "frontend_consumer_pc": "0x800AB72C",
+    "frontend_consumer_word": "0x104000AE",
+    "accepted_button_mask": "0x8000",
+    "accepted_phase_words": ["0x0000000C", "0x0000000E", "0x00000018"],
+    "settled_frontend_phase": "0x00000019",
+    "mission1_player_pc": "0x80059E98",
+    "mission1_player_owner_slot": "0x800E91D4",
+    "mission1_player_vtable": "0x800445E8",
+    "mission1_player_index": 0,
+    "mission1_level_index_address": "0x800E9640",
+    "mission1_level_index": 1,
+    "mission1_level_record": "0x800EA004",
+    "mission1_level_id_word": "0x30315368",
+    "mission1_level_identifier": "01Shock Strike",
+    "mission1_level_load_offset": "0x00005DC0"
+  },
+  "control": {
+    "mask_control": "A",
+    "required_frontend_accept_count": 0,
+    "required_mission1_checkpoint": false
+  }
+}

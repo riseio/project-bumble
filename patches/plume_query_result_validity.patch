@@ -1,0 +1,106 @@
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -12,6 +12,7 @@
+ #include <stdexcept>
+ 
+ #include "plume_render_interface_types.h"
++#include "plume_query_read_state.h"
+ 
+ namespace plume {
+     // Interfaces.
+@@ -335,6 +336,14 @@
+     };
+ 
+     struct RenderQueryPool {
++    protected:
++        QueryReadState queryReadState;
++    public:
++        // Validity concerns the most recent read, not stale result bytes.
++        bool queryResultsValid(uint32_t first, uint32_t count) const {
++            return queryReadState.contains(first, count);
++        }
++        bool queryResultsValid() const { return queryResultsValid(0, getCount()); }
+         virtual ~RenderQueryPool() { }
+         virtual void queryResults() = 0;
+         virtual const uint64_t *getResults() const = 0;
+diff --git a/plume_query_read_state.h b/plume_query_read_state.h
+new file mode 100644
+--- /dev/null
++++ b/plume_query_read_state.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <cstdint>
++
++namespace plume {
++    // Check read success separately from query contents.
++    struct QueryReadState {
++        uint32_t first = 0;
++        uint32_t count = 0;
++        void invalidate() { first = 0; count = 0; }
++        void completed(uint32_t readFirst, uint32_t readCount) {
++            first = readFirst;
++            count = readCount;
++        }
++        bool contains(uint32_t queryFirst, uint32_t queryCount) const {
++            return queryCount > 0 && queryFirst >= first && queryFirst - first <= count &&
++                queryCount <= count - (queryFirst - first);
++        }
++    };
++}
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -3032,6 +3032,8 @@
+     }
+ 
+     void VulkanQueryPool::queryResults() {
++        queryReadState.invalidate();
++
+ 	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkGetQueryPoolResults failed with error code 0x%X.\n", res);
+@@ -3062,6 +3064,7 @@
+         // Convert results to timestamps.
+         constexpr uint64_t shift_bits = 16;
+         double timestampPeriod = double(device->physicalDeviceProperties.limits.timestampPeriod);
++        if (!(timestampPeriod >= 1.0 / 65536.0 && timestampPeriod < 281474976710656.0)) return;
+         uint64_t h = 0, l = 0;
+         for (uint64_t &result : results) {
+             mult64to128(result, uint64_t(timestampPeriod * double(1 << shift_bits)), h, l);
+@@ -3069,6 +3072,7 @@
+             result >>= shift_bits;
+             result |= h << (64 - shift_bits);
+         }
++        queryReadState.completed(0, uint32_t(results.size()));
+     }
+ 
+     const uint64_t *VulkanQueryPool::getResults() const {
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -1906,13 +1906,21 @@
+     }
+ 
+     void D3D12QueryPool::queryResults() {
++        queryReadState.invalidate();
++
++        if (device->timestampFrequency == 0) return;
+         void *readbackData = readbackBuffer->map();
++        if (readbackData == nullptr) return;
+         memcpy(results.data(), readbackData, sizeof(uint64_t) * results.size());
+         readbackBuffer->unmap();
+ 
+         for (uint64_t &result : results) {
+-            result = uint64_t(double(result) / double(device->timestampFrequency) * 1000000000.0);
+-        }
++            const double nanoseconds = double(result) / double(device->timestampFrequency) * 1000000000.0;
++            // Range comparison also rejects NaN without converting it to an integer.
++            if (!(nanoseconds >= 0.0 && nanoseconds < 18446744073709551616.0)) return;
++            result = uint64_t(nanoseconds);
++        }
++        queryReadState.completed(0, uint32_t(results.size()));
+     }
+ 
+     const uint64_t *D3D12QueryPool::getResults() const {

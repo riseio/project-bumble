@@ -1,0 +1,24 @@
+diff --git a/src/shaders/BumbleSkyPS.hlsl b/src/shaders/BumbleSkyPS.hlsl
+--- a/src/shaders/BumbleSkyPS.hlsl
++++ b/src/shaders/BumbleSkyPS.hlsl
+@@ -84,6 +84,10 @@
+ float honeycombBarrierOpacity(float3 direction) {
+     const float ceilingY = 800.0f;
+     const float playerGap = max(ceilingY - gSky.cloudShape.y, 0.0f);
++    [branch]
++    if (playerGap >= 165.0f) {
++        return 0.0f;
++    }
+     const float3 eye = float3(
+         gSky.cloudShape.w,
+         gSky.shaftParams.w,
+@@ -114,8 +120,8 @@
+         edgeDistance
+     );
+ 
+     const float proximity = 1.0f - smoothstep(35.0f, 165.0f, playerGap);
+-    const float proximityVisibility = lerp(0.18f, 1.0f, proximity * proximity);
++    const float proximityVisibility = proximity * proximity;
+     const float viewFade = smoothstep(0.025f, 0.115f, abs(direction.y));
+     const float distanceFade = 1.0f - smoothstep(
+         5200.0f,

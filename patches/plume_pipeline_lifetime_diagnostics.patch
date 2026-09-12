@@ -1,0 +1,189 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index 8f863ca..92844f7 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -1315,6 +1315,10 @@ namespace plume {
+             setSRV(descriptorIndex, nullptr, nullptr);
+         }
+     }
++
++    void D3D12DescriptorSet::setName(const std::string &name) {
++        (void)name;
++    }
+     
+     void D3D12DescriptorSet::setSRV(uint32_t descriptorIndex, ID3D12Resource *resource, const D3D12_SHADER_RESOURCE_VIEW_DESC *viewDesc) {
+         if ((resource != nullptr) || (viewDesc != nullptr)) {
+diff --git a/plume_d3d12.h b/plume_d3d12.h
+index 458d069..50d9078 100644
+--- a/plume_d3d12.h
++++ b/plume_d3d12.h
+@@ -95,6 +95,7 @@ namespace plume {
+         void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override;
+         void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override;
+         void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) override;
++        void setName(const std::string &name) override;
+         void setSRV(uint32_t descriptorIndex, ID3D12Resource *resource, const D3D12_SHADER_RESOURCE_VIEW_DESC *viewDesc);
+         void setUAV(uint32_t descriptorIndex, ID3D12Resource *resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC *viewDesc);
+         void setCBV(uint32_t descriptorIndex, ID3D12Resource *resource, uint64_t bufferSize);
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index d5edcaf..8b86748 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -1788,6 +1788,10 @@ namespace plume {
+         // TODO: Unimplemented.
+     }
+ 
++    void MetalDescriptorSet::setName(const std::string &name) {
++        (void)name;
++    }
++
+     void MetalDescriptorSet::setDescriptor(const uint32_t descriptorIndex, const Descriptor *descriptor) {
+         assert(descriptorIndex < setLayout->descriptorBindingIndices.size());
+ 
+diff --git a/plume_metal.h b/plume_metal.h
+index 27c932c..c968753 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -227,6 +227,7 @@ namespace plume {
+         void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override;
+         void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override;
+         void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) override;
++        void setName(const std::string &name) override;
+         void setDescriptor(uint32_t descriptorIndex, const Descriptor *descriptor);
+         void bindImmutableSamplers() const;
+         void commit();
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 49d522b..bc8a3d8 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -94,6 +94,7 @@ namespace plume {
+         virtual void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView = nullptr) = 0;
+         virtual void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) = 0;
+         virtual void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) = 0;
++        virtual void setName(const std::string &name) = 0;
+     };
+ 
+     struct RenderSwapChain {
+diff --git a/plume_render_interface_builders.h b/plume_render_interface_builders.h
+index acfedce..5da0f4e 100644
+--- a/plume_render_interface_builders.h
++++ b/plume_render_interface_builders.h
+@@ -7,6 +7,7 @@
+ 
+ #pragma once
+ 
++#include <typeinfo>
+ #include <unordered_set>
+ 
+ namespace plume {
+@@ -118,8 +119,13 @@ namespace plume {
+         RenderDescriptorSetBuilder builder;
+         std::unique_ptr<RenderDescriptorSet> descriptorSet;
+ 
++        virtual ~RenderDescriptorSetBase() = default;
++
+         void create(RenderDevice *device) {
+             descriptorSet = builder.create(device);
++            if (descriptorSet != nullptr) {
++                descriptorSet->setName(typeid(*this).name());
++            }
+         }
+ 
+         RenderDescriptorSet *get() const {
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 879c43a..8f77ed6 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -926,7 +926,7 @@ namespace plume {
+     }
+ 
+     void VulkanBuffer::setName(const std::string &name) {
+-        setObjectName(device->vk, VK_OBJECT_TYPE_IMAGE, uint64_t(vk), name);
++        setObjectName(device->vk, VK_OBJECT_TYPE_BUFFER, uint64_t(vk), name);
+     }
+ 
+     uint64_t VulkanBuffer::getDeviceAddress() const {
+@@ -2066,6 +2066,43 @@ namespace plume {
+             fprintf(stderr, "vkAllocateDescriptorSets failed with error code 0x%X.\n", res);
+             return;
+         }
++
++        // Name Vulkan objects so validation errors identify the failing descriptor.
++        std::string descriptorName = "Plume DescriptorSet bindings=";
++        for (uint32_t i = 0; i < desc.descriptorRangesCount; i++) {
++            if (i > 0) {
++                descriptorName += ',';
++            }
++            descriptorName += std::to_string(desc.descriptorRanges[i].binding);
++            if (desc.descriptorRanges[i].count > 1u) {
++                descriptorName += 'x';
++                descriptorName += std::to_string(
++                    desc.descriptorRanges[i].count
++                );
++            }
++        }
++        if (desc.lastRangeIsBoundless) {
++            descriptorName += " variable=";
++            descriptorName += std::to_string(boundlessRangeSize);
++        }
++        setObjectName(
++            device->vk,
++            VK_OBJECT_TYPE_DESCRIPTOR_SET,
++            uint64_t(vk),
++            descriptorName
++        );
++        const char *descriptorDiagnostics = std::getenv(
++            "RT64_VULKAN_DESCRIPTOR_DIAGNOSTICS"
++        );
++        if ((descriptorDiagnostics != nullptr) &&
++            (descriptorDiagnostics[0] == '1')) {
++            std::fprintf(
++                stderr,
++                "RT64_VULKAN_DESCRIPTOR_SET handle=0x%llX layout=\"%s\"\n",
++                static_cast<unsigned long long>(uint64_t(vk)),
++                descriptorName.c_str()
++            );
++        }
+     }
+ 
+     VulkanDescriptorSet::~VulkanDescriptorSet() {
+@@ -2150,6 +2190,27 @@ namespace plume {
+         setDescriptor(descriptorIndex, nullptr, nullptr, nullptr, &setAccelerationStructure);
+     }
+ 
++    void VulkanDescriptorSet::setName(const std::string &name) {
++        setObjectName(
++            device->vk,
++            VK_OBJECT_TYPE_DESCRIPTOR_SET,
++            uint64_t(vk),
++            name
++        );
++        const char *descriptorDiagnostics = std::getenv(
++            "RT64_VULKAN_DESCRIPTOR_DIAGNOSTICS"
++        );
++        if ((descriptorDiagnostics != nullptr) &&
++            (descriptorDiagnostics[0] == '1')) {
++            std::fprintf(
++                stderr,
++                "RT64_VULKAN_DESCRIPTOR_OWNER handle=0x%llX name=\"%s\"\n",
++                static_cast<unsigned long long>(uint64_t(vk)),
++                name.c_str()
++            );
++        }
++    }
++
+     void VulkanDescriptorSet::setDescriptor(uint32_t descriptorIndex, const VkDescriptorBufferInfo *bufferInfo, const VkDescriptorImageInfo *imageInfo, const VkBufferView *texelBufferView, void *pNext) {
+         assert(descriptorIndex < setLayout->descriptorBindingIndices.size());
+ 
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 19a4c9a..d0bcaf2 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -218,6 +218,7 @@ namespace plume {
+         void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override;
+         void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override;
+         void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) override;
++        void setName(const std::string &name) override;
+         void setDescriptor(uint32_t descriptorIndex, const VkDescriptorBufferInfo *bufferInfo, const VkDescriptorImageInfo *imageInfo, const VkBufferView *texelBufferView, void *pNext);
+         static VkDescriptorPool createDescriptorPool(VulkanDevice *device, const std::unordered_map<VkDescriptorType, uint32_t> &typeCounts, bool lastRangeIsBoundless);
+     };

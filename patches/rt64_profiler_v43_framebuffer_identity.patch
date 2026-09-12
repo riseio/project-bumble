@@ -1,0 +1,164 @@
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -899,6 +899,7 @@ namespace RT64 {
+         uint32_t firstFrameToPresent = 0;
+         bool consumesInterpolationSequence = false;
+         bool interpolationSequenceFullyQueued = false;
++        bool interpolationFramebufferMismatch = false;
+         bool retainWorkloadLock = false;
+         InterpolatedFrameCounters unmatchedFrameCounters;
+         InterpolatedFrameCounters *matchingFrameCounters = nullptr;
+@@ -988,8 +989,31 @@ namespace RT64 {
+                 }
+ 
+                 if (presentFb->interpolationEnabled) {
++                    interpolationFramebufferMismatch =
++                        (matchingFrameCounters != nullptr) &&
++                        frameCounters.generated &&
++                        (frameCounters.targetAddress !=
++                            presentFb->addressStart);
++                    if ((matchingFrameCounters != nullptr) &&
++                        frameCounters.generated) {
++                        performanceLastCounterTargetAddress.store(
++                            frameCounters.targetAddress,
++                            std::memory_order_relaxed
++                        );
++                        performanceLastPresentFramebufferAddress.store(
++                            presentFb->addressStart,
++                            std::memory_order_relaxed
++                        );
++                        if (interpolationFramebufferMismatch) {
++                            performanceFramebufferSetMismatches.fetch_add(
++                                1,
++                                std::memory_order_relaxed
++                            );
++                        }
++                    }
+                     if ((matchingFrameCounters != nullptr) &&
+-                        frameCounters.generated) {
++                        frameCounters.generated &&
++                        !interpolationFramebufferMismatch) {
+                         {
+                             const std::scoped_lock<std::mutex> interpolatedLock(
+                                 ext.sharedResources->interpolatedMutex
+@@ -1018,23 +1042,9 @@ namespace RT64 {
+                             framesToPresent = 1;
+                             retainWorkloadLock = true;
+                         }
+-                        performanceLastCounterTargetAddress.store(
+-                            frameCounters.targetAddress,
+-                            std::memory_order_relaxed
+-                        );
+-                        performanceLastPresentFramebufferAddress.store(
+-                            presentFb->addressStart,
+-                            std::memory_order_relaxed
+-                        );
+-                        if (frameCounters.targetAddress !=
+-                            presentFb->addressStart) {
+-                            performanceFramebufferSetMismatches.fetch_add(
+-                                1,
+-                                std::memory_order_relaxed
+-                            );
+-                        }
+                     }
+                     else if (matchingFrameCounters != nullptr) {
++                        // A non-interpolated workload has no override target.
+                         framesToPresent = 1;
+                         retainWorkloadLock = true;
+                     }
+@@ -1173,7 +1183,8 @@ namespace RT64 {
+         if ((matchingFrameCounters != nullptr) &&
+             matchingFrameCounters->generated &&
+             !consumesInterpolationSequence &&
+-            !interpolationSequenceFullyQueued) {
++            (!interpolationSequenceFullyQueued ||
++                interpolationFramebufferMismatch)) {
+             if (managerLock.owns_lock()) {
+                 managerLock.unlock();
+             }
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -2136,6 +2136,8 @@ namespace RT64 {
+             uint64_t interpolationResolvedGeneratedCount = 0;
+             uint64_t interpolationResolvedConsumedCount = 0;
+             uint64_t interpolationFramebufferMismatchCount = 0;
++            uint64_t interpolationFramebufferMismatchPresentedCount = 0;
++            uint64_t interpolationFramebufferMismatchRejectedCount = 0;
+             uint64_t earlyPresentDecisionCount = 0;
+             uint64_t earlyPresentEnabledCount = 0;
+             uint64_t earlyPresentCandidateCount = 0;
+@@ -2384,8 +2386,16 @@ namespace RT64 {
+                                 (flags & (1u << 1u)) != 0u ? 1u : 0u;
+                             interpolationResolvedConsumedCount +=
+                                 (flags & (1u << 2u)) != 0u ? 1u : 0u;
++                            const bool consumed =
++                                (flags & (1u << 2u)) != 0u;
++                            const bool framebufferMismatch =
++                                (flags & (1u << 3u)) != 0u;
+                             interpolationFramebufferMismatchCount +=
+-                                (flags & (1u << 3u)) != 0u ? 1u : 0u;
++                                framebufferMismatch ? 1u : 0u;
++                            interpolationFramebufferMismatchPresentedCount +=
++                                framebufferMismatch && consumed ? 1u : 0u;
++                            interpolationFramebufferMismatchRejectedCount +=
++                                framebufferMismatch && !consumed ? 1u : 0u;
+                         }
+                         else if (eventName ==
+                             "State.FullSyncEarlyPresentDecision") {
+@@ -4614,7 +4624,16 @@ namespace RT64 {
+                 (idleSuppressedRealWork >= 1'000u) &&
+                 (swapChainAcquireP95 > (budget * 1.5)) &&
+                 (presentationSlotCompletionP95 > budget);
+-            if (gpuIdleClockMaintenanceStarved) {
++            const bool presentedInterpolationFramebufferMismatch =
++                interpolationFramebufferMismatchPresentedCount > 0u;
++            if (presentedInterpolationFramebufferMismatch) {
++                diagnosis =
++                    "PRESENTED_INTERPOLATION_FRAMEBUFFER_IDENTITY_MISMATCH";
++                confidence = "high";
++                primaryStage = "Present.InterpolationResolved";
++                primaryP95 = 0.0;
++            }
++            else if (gpuIdleClockMaintenanceStarved) {
+                 diagnosis = "GPU_IDLE_CLOCK_MAINTENANCE_STARVATION";
+                 confidence = "high";
+                 primaryStage = "Present.PresentationSlotGPUCompletion";
+@@ -4675,6 +4694,7 @@ namespace RT64 {
+                     interpolationDynamicVertexChangedVertices);
+             if (observedCadenceWithinTolerance &&
+                 !hardInterpolationFailure &&
++                !presentedInterpolationFramebufferMismatch &&
+                 !observedOutputContradiction) {
+                 if (dynamicVertexCoverageGap) {
+                     diagnosis =
+@@ -4712,5 +4732,5 @@ namespace RT64 {
+                     !hardInterpolationFailure &&
+                     !gpuIdleClockMaintenanceStarved &&
+                     !threadSchedulingDeadlineMiss &&
+-                    (interpolationFramebufferMismatchCount == 0u) &&
++                    !presentedInterpolationFramebufferMismatch &&
+                     (earlyPresentSubmissionMissCount <= 2u)) {
+@@ -4795,7 +4815,7 @@ namespace RT64 {
+             if (!output.is_open()) {
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v42\",\n";
++            output << "{\n  \"schema\": \"rt64-performance-summary-v43\",\n";
+             output << "  \"capture_mode\": \""
+                 << (profiler.lowOverhead ? "low_overhead" : "detailed")
+@@ -5127,6 +5147,12 @@ namespace RT64 {
+                 << interpolationResolvedConsumedCount
+                 << ",\"framebuffer_mismatch_count\":"
+                 << interpolationFramebufferMismatchCount
++                << ",\"framebuffer_mismatch_detected_count\":"
++                << interpolationFramebufferMismatchCount
++                << ",\"framebuffer_mismatch_presented_count\":"
++                << interpolationFramebufferMismatchPresentedCount
++                << ",\"framebuffer_mismatch_rejected_count\":"
++                << interpolationFramebufferMismatchRejectedCount
+                 << ",\"early_present_decision_count\":"
+                 << earlyPresentDecisionCount
+                 << ",\"early_present_enabled_count\":"

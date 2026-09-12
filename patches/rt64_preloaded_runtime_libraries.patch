@@ -1,0 +1,49 @@
+diff --git a/src/common/rt64_dynamic_libraries.h b/src/common/rt64_dynamic_libraries.h
+--- a/src/common/rt64_dynamic_libraries.h
++++ b/src/common/rt64_dynamic_libraries.h
+@@ -8,6 +8,8 @@
+ 
+ namespace RT64 {
+     struct DynamicLibraries {
++        // Set before application setup only.
++        static void usePreloadedLibraries();
+         static bool load();
+     };
+-};
+\ No newline at end of file
++};
+diff --git a/src/common/rt64_dynamic_libraries.cpp b/src/common/rt64_dynamic_libraries.cpp
+--- a/src/common/rt64_dynamic_libraries.cpp
++++ b/src/common/rt64_dynamic_libraries.cpp
+@@ -27,8 +27,24 @@
+ 
+     // DynamicLibraries
+ 
++    static bool hostOwnsLibraries = false;
++
++    void DynamicLibraries::usePreloadedLibraries() {
++        hostOwnsLibraries = true;
++    }
++
+     bool DynamicLibraries::load() {
+ #   if defined(_WIN32)
++        if (hostOwnsLibraries) {
++            for (const NameRequiredPair &pair : DynamicLibraryList) {
++                if (pair.second && !GetModuleHandleW(win32::Utf8ToUtf16(pair.first).c_str())) {
++                    fprintf(stderr, "Required host-owned runtime library is absent: %s\n", pair.first.c_str());
++                    return false;
++                }
++            }
++            return true;
++        }
++
+         HMODULE moduleHandle = nullptr;
+         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, LPCWSTR(LocalFunction), &moduleHandle)) {
+             fprintf(stderr, "GetModuleHandleExW failed with error code 0x%lX\n", GetLastError());
+@@ -59,4 +75,4 @@
+ 
+         return true;
+     }
+-};
+\ No newline at end of file
++};

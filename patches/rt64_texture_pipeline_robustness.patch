@@ -1,0 +1,454 @@
+diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+--- a/src/shaders/TextureSampler.hlsli
++++ b/src/shaders/TextureSampler.hlsli
+@@ -11,6 +11,7 @@
+ #include "shared/rt64_other_mode.h"
+ #include "shared/rt64_render_flags.h"
+ #include "shared/rt64_render_params.h"
++#include "shared/rt64_texture_lod.h"
+ 
+ #define SIMULATE_LOW_PRECISION 1
+ #define FIX_UPSCALING_PRECISION 1
+@@ -36,7 +37,7 @@
+             maxDst = max(maxDst, primLOD.y);
+         }
+ 
+-        int tileBase = floor(log2(maxDst));
++        int tileBase = textureLODTileBase(maxDst);
+         lodFraction = maxDst / pow(2, max(tileBase, 0)) - 1.0f;
+ 
+         if (lodSharpen) {
+@@ -278,9 +279,8 @@
+             float2 ddxUVScaled = ddxUV * gpuTile.tcScale;
+             float2 ddyUVScaled = ddyUV * gpuTile.tcScale;
+             float ddMax = max(dot(ddxUVScaled, ddxUVScaled), dot(ddyUVScaled, ddyUVScaled));
+-            float mipBias = -0.25f;
+-            mip = 0.5 * log2(ddMax) + mipBias;
+             float maxMip = float(gpuTile.textureDimensions.z - 1);
++            mip = textureMipLevel(ddMax, maxMip);
+             RDPMipLevels[0] = min(floor(mip), maxMip);
+             RDPMipLevels[1] = min(floor(mip) + 1, maxMip);
+             numRDPSamples = 2;
+@@ -356,4 +356,4 @@
+     }
+     
+     return textureColor;
+-}
+\ No newline at end of file
++}
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -882,7 +882,12 @@
+             return false;
+         }
+ 
+-        assert(ddsDescriptor.arraySize == 1 && "DDS with multiple arrays are not supported yet.");
++        // This cache is sampled as Texture2D.
++        uint32_t maximumMips = 0;
++        for (uint32_t extent = std::max(ddsDescriptor.width, ddsDescriptor.height); extent; extent >>= 1) ++maximumMips;
++        if (ddsDescriptor.arraySize != 1 || ddsDescriptor.type != ddspp::Texture2D ||
++            ddsDescriptor.numMips > maximumMips || ddsDescriptor.numMips >= 32 ||
++            ddsDescriptor.width > UINT32_MAX - 4 || ddsDescriptor.height > UINT32_MAX - 4) return false;
+ 
+         // Retrieve the block size of the format.
+         uint32_t blockWidth, blockHeight;
+@@ -903,33 +909,44 @@
+             return false;
+         }
+ 
+-        dstTexture->texture = device->createTexture(desc);
+-        if (dstTexture->texture == nullptr) {
+-            return false;
+-        }
+-        dstTexture->width = desc.width;
+-        dstTexture->height = desc.height;
+-        dstTexture->mipmaps = desc.mipLevels;
+-        dstTexture->format = desc.format;
+-
+         const uint8_t *imageData = &bytes[ddsDescriptor.headerSize];
+         size_t imageDataSize = byteCount - ddsDescriptor.headerSize;
+ 
+         // Compute the additional padding that will be required on the buffer to align the mipmap data.
+         std::vector<uint32_t> mipmapOffsets;
++        std::vector<size_t> sourceMipmapOffsets;
++        size_t sourceOffset = 0;
+         const uint32_t formatSize = RenderFormatSize(desc.format);
+         uint32_t totalSize = 0;
+         for (uint32_t mip = 0; mip < desc.mipLevels; mip++) {
++            if (totalSize > UINT32_MAX - TextureDataPlacementAlignment) return false;
+             totalSize = nextSizeAlignedTo(totalSize, TextureDataPlacementAlignment);
+             mipmapOffsets.emplace_back(totalSize);
+ 
+             uint32_t mipHeight = std::max(desc.height >> mip, 1U);
++            const uint64_t mipWidth = std::max(ddsDescriptor.width >> mip, 1U);
++            const uint64_t rowPitch64 = (((mipWidth + blockWidth - 1) / blockWidth) * ddsDescriptor.bitsPerPixelOrBlock + 7) / 8;
++            if (rowPitch64 == 0 || rowPitch64 > UINT32_MAX - TextureDataPitchAlignment) return false;
+             uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip);
++            if (ddsRowPitch != rowPitch64) return false;
+             uint32_t alignedRowPitch = nextSizeAlignedTo(ddsRowPitch, TextureDataPitchAlignment);
+             uint32_t rowCount = (mipHeight + blockHeight - 1) / blockHeight;
+-            totalSize += alignedRowPitch * rowCount;
++            // Single-layer 2D DDS mip payloads are tightly packed.
++            if (sourceOffset > imageDataSize || rowPitch64 > (imageDataSize - sourceOffset) / rowCount) return false;
++            sourceMipmapOffsets.emplace_back(sourceOffset);
++            sourceOffset += size_t(rowPitch64 * rowCount);
++            const uint64_t nextSize = uint64_t(totalSize) + uint64_t(alignedRowPitch) * rowCount;
++            if (nextSize > UINT32_MAX) return false;
++            totalSize = uint32_t(nextSize);
+         }
+ 
++        dstTexture->texture = device->createTexture(desc);
++        if (dstTexture->texture == nullptr) return false;
++        dstTexture->width = desc.width;
++        dstTexture->height = desc.height;
++        dstTexture->mipmaps = desc.mipLevels;
++        dstTexture->format = desc.format;
++
+         if (uploadResourcePool != nullptr) {
+             assert(uploadResourcePoolMutex != nullptr);
+             std::unique_lock queueLock(*uploadResourcePoolMutex);
+@@ -953,7 +971,7 @@
+         for (uint32_t mip = 0; mip < desc.mipLevels; mip++) {
+             uint32_t mipOffset = mipmapOffsets[mip];
+             uint32_t mipHeight = std::max(desc.height >> mip, 1U);
+-            uint32_t ddsOffset = ddspp::get_offset(ddsDescriptor, mip, 0);
++            size_t ddsOffset = sourceMipmapOffsets[mip];
+             uint32_t ddsRowPitch = ddspp::get_row_pitch(ddsDescriptor, mip);
+             uint32_t alignedRowPitch = nextSizeAlignedTo(ddsRowPitch, TextureDataPitchAlignment);
+             uint32_t rowCount = (mipHeight + blockHeight - 1) / blockHeight;
+@@ -1146,21 +1164,26 @@
+ 
+     Texture *TextureCache::loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool, std::mutex *uploadResourcePoolMutex) {
+         const uint32_t PNG_MAGIC = 0x474E5089;
+-        Texture *replacementTexture = new Texture();
+-        uint32_t magicNumber = *reinterpret_cast<const uint32_t *>(fileBytes.data());
++        if (fileBytes.size() < sizeof(uint32_t) || fileBytes.size() > INT_MAX) {
++            return nullptr;
++        }
++        auto replacementTexture = std::make_unique<Texture>();
++        uint32_t magicNumber = 0;
++        memcpy(&magicNumber, fileBytes.data(), sizeof(magicNumber));
+         bool loadedTexture = false;
+         switch (magicNumber) {
+         case ddspp::DDS_MAGIC:
+-            loadedTexture = TextureCache::setDDS(replacementTexture, device, commandList, fileBytes.data(), fileBytes.size(), dstUploadResource, resourcePool, uploadResourcePoolMutex);
++            loadedTexture = TextureCache::setDDS(replacementTexture.get(), device, commandList, fileBytes.data(), fileBytes.size(), dstUploadResource, resourcePool, uploadResourcePoolMutex);
+             break;
+         case PNG_MAGIC: {
+             int width, height;
+-            stbi_uc *data = stbi_load_from_memory(fileBytes.data(), fileBytes.size(), &width, &height, nullptr, 4);
++            std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(
++                stbi_load_from_memory(fileBytes.data(), int(fileBytes.size()), &width, &height, nullptr, 4), stbi_image_free);
++            stbi_uc *data = pixels.get();
+             if (data != nullptr) {
+                 uint32_t rowPitch = uint32_t(width) * 4;
+                 size_t byteCount = uint32_t(height) * rowPitch;
+-                TextureCache::setRGBA32(replacementTexture, device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource, resourcePool);
+-                stbi_image_free(data);
++                TextureCache::setRGBA32(replacementTexture.get(), device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource, resourcePool, uploadResourcePoolMutex);
+                 loadedTexture = true;
+             }
+ 
+@@ -1172,10 +1195,9 @@
+         }
+ 
+         if (loadedTexture) {
+-            return replacementTexture;
++            return replacementTexture.release();
+         }
+         else {
+-            delete replacementTexture;
+             return nullptr;
+         }
+     }
+diff --git a/src/render/rt64_raster_shader_cache.cpp b/src/render/rt64_raster_shader_cache.cpp
+--- a/src/render/rt64_raster_shader_cache.cpp
++++ b/src/render/rt64_raster_shader_cache.cpp
+@@ -99,22 +99,30 @@
+             }
+ 
+             // The compact provisional pipeline is optional background work.
+-            const bool queueFinal = shaderCache->compileAndStore(request);
++            bool queueFinal = false;
++            try {
++                queueFinal = shaderCache->compileAndStore(request);
++                if (queueFinal) {
++                    RasterShader *publishedShader = shaderCache->getGPUShader(request.desc);
++                    if (!publishedShader) throw std::runtime_error("Provisional shader was not published");
++                    const std::unique_lock<std::mutex> queueLock(shaderCache->descQueueMutex);
++                    shaderCache->descQueue.push_back({request.desc, false, publishedShader});
++                }
++            }
++            catch (const std::exception &error) {
++                std::fprintf(stderr, "BUMBLE_SHADER_SPECIALIZATION stage=failed hash=%016" PRIX64 " error=%s retained=existing_valid_pipeline\n",
++                    request.desc.hash(), error.what());
++                std::fflush(stderr);
++            }
++            catch (...) {
++                std::fprintf(stderr, "BUMBLE_SHADER_SPECIALIZATION stage=failed hash=%016" PRIX64 " error=unknown retained=existing_valid_pipeline\n", request.desc.hash());
++                std::fflush(stderr);
++            }
+ 
+             {
+                 const std::unique_lock<std::mutex> queueLock(
+                     shaderCache->descQueueMutex
+                 );
+-                if (queueFinal) {
+-                    RasterShader *publishedShader =
+-                        shaderCache->getGPUShader(request.desc);
+-                    assert(publishedShader != nullptr);
+-                    shaderCache->descQueue.push_back({
+-                        request.desc,
+-                        false,
+-                        publishedShader
+-                    });
+-                }
+                 assert(shaderCache->activeCompilationCount > 0);
+                 --shaderCache->activeCompilationCount;
+             }
+diff --git a/src/render/rt64_raster_shader.h b/src/render/rt64_raster_shader.h
+--- a/src/render/rt64_raster_shader.h
++++ b/src/render/rt64_raster_shader.h
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <array>
+ #include <condition_variable>
++#include <exception>
+ #include <mutex>
+ #include <thread>
+ 
+@@ -110,6 +111,7 @@
+         std::mutex firstPipelineMutex;
+         std::condition_variable firstPipelineCondition;
+         bool pipelinesCreated = false;
++        std::exception_ptr pipelineCreationError;
+         std::unique_ptr<RenderPipelineLayout> pipelineLayout;
+         std::vector<std::vector<PipelineCreation>> pipelineThreadCreations;
+         std::vector<std::unique_ptr<std::thread>> pipelineThreads;
+@@ -119,7 +121,7 @@
+         RasterShaderUber(RenderDevice *device, RenderShaderFormat shaderFormat, const RenderMultisampling &multisampling, const ShaderLibrary *shaderLibrary, uint32_t threadCount);
+         ~RasterShaderUber();
+         void threadCreatePipelines(uint32_t threadIndex);
+-        void waitForPipelineCreation();
++        void waitForPipelineCreation(bool propagateError = true);
+         uint32_t pipelineStateIndex(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd, bool depthLessEqual = false) const;
+         const RenderPipeline *getPipeline(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd, bool depthLessEqual = false) const;
+     };
+diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
+--- a/src/render/rt64_raster_shader.cpp
++++ b/src/render/rt64_raster_shader.cpp
+@@ -844,13 +844,6 @@
+             threadIndex = (threadIndex + 1) % threadCount;
+         }
+ 
+-        // Spawn the threads that will compile all the pipelines.
+-        pipelineThreads.clear();
+-        pipelineThreads.resize(pipelineThreadCreations.size());
+-        for (uint32_t i = 0; i < uint32_t(pipelineThreads.size()); i++) {
+-            pipelineThreads[i] = std::make_unique<std::thread>(&RasterShaderUber::threadCreatePipelines, this, i);
+-        }
+-
+         // Create the pipelines for post blend operations.
+         std::unique_ptr<RenderShader> postBlendAddPixelShader;
+         std::unique_ptr<RenderShader> postBlendSubPixelShader;
+@@ -913,42 +906,72 @@
+ 
+         postBlendDesc.pixelShader = postBlendSubNegativePixelShader.get();
+         postBlendDitherNoiseSubNegativePipeline = device->createGraphicsPipeline(postBlendDesc);
++
++        // Start threads only after synchronous construction can no longer fail.
++        try {
++            pipelineThreads.resize(pipelineThreadCreations.size());
++            for (uint32_t i = 0; i < uint32_t(pipelineThreads.size()); i++) {
++                pipelineThreads[i] = std::make_unique<std::thread>(&RasterShaderUber::threadCreatePipelines, this, i);
++            }
++        }
++        catch (...) {
++            {
++                const std::lock_guard lock(firstPipelineMutex);
++                pipelineCreationError = std::current_exception();
++            }
++            firstPipelineCondition.notify_all();
++            waitForPipelineCreation(false);
++            throw;
++        }
+     }
+ 
+     RasterShaderUber::~RasterShaderUber() {
+-        waitForPipelineCreation();
++        waitForPipelineCreation(false);
+     }
+ 
+     void RasterShaderUber::threadCreatePipelines(uint32_t threadIndex) {
++        try {
+         // Delay the creation of all other pipelines until the first pipeline is created. This can help the
+         // driver reuse its shader cache between pipelines and achieve a much lower creation time than if
+         // all threads started at the same time.
+         if (threadIndex > 0) {
+             std::unique_lock<std::mutex> lock(firstPipelineMutex);
+             firstPipelineCondition.wait(lock, [this]() {
+-                return (pipelines[0] != nullptr);
++                return pipelines[0] != nullptr || pipelineCreationError != nullptr;
+             });
++            if (pipelineCreationError != nullptr) return;
+         }
+ 
+         for (const PipelineCreation &creation : pipelineThreadCreations[threadIndex]) {
+             uint32_t pipelineIndex = pipelineStateIndex(creation.shaderFamily, creation.zCmp, creation.zUpd, creation.cvgAdd, creation.depthLessEqual);
+ 
+             if (pipelineIndex == 0) {
+-                firstPipelineMutex.lock();
+-                pipelines[pipelineIndex] = RasterShader::createPipeline(creation);
+-                firstPipelineMutex.unlock();
++                {
++                    const std::lock_guard lock(firstPipelineMutex);
++                    pipelines[pipelineIndex] = RasterShader::createPipeline(creation);
++                    if (!pipelines[pipelineIndex]) throw std::runtime_error("Required raster pipeline creation failed");
++                }
+                 firstPipelineCondition.notify_all();
+             }
+             else {
+                 pipelines[pipelineIndex] = RasterShader::createPipeline(creation);
++                if (!pipelines[pipelineIndex]) throw std::runtime_error("Required raster pipeline creation failed");
+             }
+         }
++        }
++        catch (...) {
++            {
++                const std::lock_guard lock(firstPipelineMutex);
++                if (!pipelineCreationError) pipelineCreationError = std::current_exception();
++            }
++            firstPipelineCondition.notify_all();
++        }
+     }
+ 
+-    void RasterShaderUber::waitForPipelineCreation() {
++    void RasterShaderUber::waitForPipelineCreation(bool propagateError) {
+         if (!pipelinesCreated) {
+             for (std::unique_ptr<std::thread> &thread : pipelineThreads) {
+-                thread->join();
++                if (thread && thread->joinable()) thread->join();
+             }
+ 
+             pipelineThreads.clear();
+@@ -959,6 +984,7 @@
+             }
+             pipelinesCreated = true;
+         }
++        if (propagateError && pipelineCreationError) std::rethrow_exception(pipelineCreationError);
+     }
+ 
+     uint32_t RasterShaderUber::pipelineStateIndex(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd, bool depthLessEqual) const {
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -92,7 +92,7 @@
+         }
+     }
+ 
+-    Application::SetupResult Application::setup(uint32_t threadId) {
++    Application::SetupResult Application::setup(uint32_t threadId, RenderHookInit *deviceReadyCheck) {
+         PerformanceScope setupScope(
+             PerformanceCategory::CPU,
+             "Application.Setup"
+@@ -324,6 +324,7 @@
+         }
+ 
+         // Call the init hook if one was attached.
++        if (deviceReadyCheck != nullptr) deviceReadyCheck(renderInterface.get(), device.get());
+         RenderHookInit *initHook = GetRenderHookInit();
+         if (initHook != nullptr) {
+             initHook(renderInterface.get(), device.get());
+@@ -496,6 +497,10 @@
+         }
+ #   endif
+ 
++        // Required raster pipelines must be valid before queue/guest admission.
++        rasterShaderCache->shaderUber->waitForPipelineCreation();
++        reflectionRasterShaderCache->shaderUber->waitForPipelineCreation();
++
+         // Create the texture cache.
+         const uint32_t textureCacheThreads = std::max(threadsAvailable / 4U, 1U);
+         textureCache = std::make_unique<TextureCache>(textureDirectWorker.get(), textureCopyWorker.get(), workloadGraphicsWorker.get(), textureCacheThreads, shaderLibrary.get());
+@@ -832,14 +838,14 @@
+         std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=coordinated_stop_begin\n");
+         std::fflush(stderr);
+-        workloadQueue->stop();
+-        presentQueue->stop();
++        if (workloadQueue) workloadQueue->stop();
++        if (presentQueue) presentQueue->stop();
+         std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=coordinated_stop_end\n");
+         std::fflush(stderr);
+         // Keep both queues alive until both sets of workers have returned.
+         std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=coordinated_join_begin\n");
+         std::fflush(stderr);
+-        workloadQueue->join();
+-        presentQueue->join();
++        if (workloadQueue) workloadQueue->join();
++        if (presentQueue) presentQueue->join();
+         std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=coordinated_join_end\n");
+         std::fflush(stderr);
+         std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=workload_reset_begin\n");
+@@ -857,7 +863,8 @@
+ 
+         // Call the deinit hook if one was attached.
+         RenderHookDeinit *deinitHook = GetRenderHookDeinit();
+-        if (deinitHook != nullptr) {
++        // Hosts may install render/deinit hooks without an init hook.
++        if (device != nullptr && deinitHook != nullptr) {
+             deinitHook();
+         }
+ 
+diff --git a/src/hle/rt64_application.h b/src/hle/rt64_application.h
+--- a/src/hle/rt64_application.h
++++ b/src/hle/rt64_application.h
+@@ -19,6 +19,7 @@
+ #include "preset/rt64_preset_material.h"
+ #include "preset/rt64_preset_scene.h"
+ #include "render/rt64_render_worker.h"
++#include "rhi/rt64_render_hooks.h"
+ #include "render/rt64_shader_library.h"
+ #include "plume_render_interface.h"
+ 
+@@ -154,7 +155,7 @@
+ 
+         Application(const Core &core, const ApplicationConfiguration &appConfig);
+         virtual ~Application();
+-        SetupResult setup(uint32_t threadId);
++        SetupResult setup(uint32_t threadId, RenderHookInit *deviceReadyCheck = nullptr);
+         void processDisplayLists(uint8_t *memory, uint32_t dlStartAddress, uint32_t dlEndAddress, bool isHLE);
+         void updateScreen();
+         void destroyShaderCache();
+diff --git a/src/shared/rt64_texture_lod.h b/src/shared/rt64_texture_lod.h
+new file mode 100644
+--- /dev/null
++++ b/src/shared/rt64_texture_lod.h
+@@ -0,0 +1,27 @@
++// Shared CPU/shader domain contract for texture LOD selection.
++#pragma once
++
++#ifdef HLSL_CPU
++#include <algorithm>
++#include <cmath>
++namespace interop {
++using std::floor;
++using std::log2;
++using std::max;
++using std::min;
++#endif
++
++inline float textureMipLevel(float gradientSquared, float maxMip) {
++    // All magnification selects level zero.
++    float mip = 0.5f * log2(max(gradientSquared, 1.0f)) - 0.25f;
++    return min(max(mip, 0.0f), maxMip);
++}
++
++inline int textureLODTileBase(float distance) {
++    // Preserve the original distance for authored detail/sharpen fractions.
++    return int(floor(log2(max(distance, 1.0f / 65536.0f))));
++}
++
++#ifdef HLSL_CPU
++}
++#endif

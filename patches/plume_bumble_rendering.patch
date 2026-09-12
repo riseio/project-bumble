@@ -1,0 +1,1796 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index 8c239f4..8f863ca 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -7,6 +7,10 @@
+ 
+ #include "plume_d3d12.h"
+ 
++#include <cstring>
++#include <cstdio>
++#include <cwchar>
++#include <fstream>
+ #include <unordered_set>
+ 
+ #include <dxgi1_5.h>
+@@ -48,6 +52,37 @@ namespace plume {
+     static const uint32_t SamplerDescriptorHeapSize = 1024;
+     static const uint32_t TargetDescriptorHeapSize = 16384;
+ 
++    static uint64_t pipelineCacheHashBytes(
++        uint64_t hash,
++        const void *data,
++        size_t size
++    ) {
++        constexpr uint64_t FNVPrime = 1099511628211ULL;
++        const uint8_t *bytes = static_cast<const uint8_t *>(data);
++        for (size_t i = 0; i < size; i++) {
++            hash ^= bytes[i];
++            hash *= FNVPrime;
++        }
++        return hash;
++    }
++
++    template <typename T>
++    static uint64_t pipelineCacheHashValue(uint64_t hash, const T &value) {
++        return pipelineCacheHashBytes(hash, &value, sizeof(value));
++    }
++
++    static std::wstring pipelineCacheKey(wchar_t kind, uint64_t hash) {
++        wchar_t key[32] = {};
++        std::swprintf(
++            key,
++            _countof(key),
++            L"%lc-%016llX",
++            kind,
++            static_cast<unsigned long long>(hash)
++        );
++        return key;
++    }
++
+     // Common functions.
+ 
+     static std::wstring Utf8ToUtf16(const std::string_view& value) {
+@@ -116,6 +151,8 @@ namespace plume {
+             return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+         case RenderFormat::R8G8B8A8_UNORM:
+             return DXGI_FORMAT_R8G8B8A8_UNORM;
++        case RenderFormat::R8G8B8A8_UNORM_SRGB:
++            return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+         case RenderFormat::R8G8B8A8_UINT:
+             return DXGI_FORMAT_R8G8B8A8_UINT;
+         case RenderFormat::R8G8B8A8_SNORM:
+@@ -1331,7 +1368,16 @@ namespace plume {
+         if (commandQueue->device->renderInterface->allowTearing) {
+             swapChainFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+         }
+-        
++
++        create();
++    }
++
++    bool D3D12SwapChain::create() {
++        getWindowSize(width, height);
++        if ((width == 0) || (height == 0)) {
++            return false;
++        }
++
+         DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
+         swapChainDesc.BufferCount = desc.textureCount;
+         swapChainDesc.Width = width;
+@@ -1342,18 +1388,23 @@ namespace plume {
+         swapChainDesc.SampleDesc.Count = 1;
+         swapChainDesc.Flags = swapChainFlags;
+ 
+-        IDXGISwapChain1 *swapChain1;
++        IDXGISwapChain1 *swapChain1 = nullptr;
+         IDXGIFactory4 *dxgiFactory = commandQueue->device->renderInterface->dxgiFactory;
+         HRESULT res = dxgiFactory->CreateSwapChainForHwnd(commandQueue->d3d, desc.renderWindow, &swapChainDesc, nullptr, nullptr, &swapChain1);
+         if (FAILED(res)) {
+             fprintf(stderr, "CreateSwapChainForHwnd failed with error code 0x%lX.\n", res);
+-            return;
++            width = 0;
++            height = 0;
++            return false;
+         }
+ 
+         res = dxgiFactory->MakeWindowAssociation(desc.renderWindow, DXGI_MWA_NO_ALT_ENTER);
+         if (FAILED(res)) {
+             fprintf(stderr, "MakeWindowAssociation failed with error code 0x%lX.\n", res);
+-            return;
++            swapChain1->Release();
++            width = 0;
++            height = 0;
++            return false;
+         }
+ 
+         d3d = static_cast<IDXGISwapChain3 *>(swapChain1);
+@@ -1373,22 +1424,33 @@ namespace plume {
+         }
+ 
+         setTextures();
++        return true;
+     }
+ 
+     D3D12SwapChain::~D3D12SwapChain() {
+-        for (uint32_t i = 0; i < desc.textureCount; i++) {
+-            if (textures[i].d3d != nullptr) {
+-                textures[i].d3d->Release();
+-                textures[i].d3d = nullptr;
++        for (D3D12Texture &texture : textures) {
++            if (texture.d3d != nullptr) {
++                texture.d3d->Release();
++                texture.d3d = nullptr;
+             }
+         }
+ 
+         if (d3d != nullptr) {
+             d3d->Release();
++            d3d = nullptr;
++        }
++
++        if (waitableObject != NULL) {
++            CloseHandle(waitableObject);
++            waitableObject = NULL;
+         }
+     }
+ 
+     bool D3D12SwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) {
++        if (d3d == nullptr) {
++            return false;
++        }
++
+         // If using present wait, we prefer using a SyncInterval of 0 even when Vsync is enabled. Tearing won't happen if DXGI_PRESENT_ALLOW_TEARING is not specified.
+         const bool tearingAllowed = (swapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0U;
+         UINT syncInterval = (vsyncEnabled && !desc.enablePresentWait) ? 1 : 0;
+@@ -1397,12 +1459,22 @@ namespace plume {
+         return SUCCEEDED(res);
+     }
+ 
+-    void D3D12SwapChain::wait() {
++    bool D3D12SwapChain::wait(uint32_t timeoutMilliseconds) {
+         assert(desc.enablePresentWait && "Present wait should've been explicitly enabled during swap chain creation before using the wait function.");
+ 
+         if (waitableObject != NULL) {
+-            WaitForSingleObject(waitableObject, INFINITE);
++            const DWORD result = WaitForSingleObject(waitableObject, timeoutMilliseconds);
++            if (result == WAIT_TIMEOUT) {
++                return false;
++            }
++            if (result == WAIT_FAILED) {
++                fprintf(stderr,
++                    "D3D12 swap-chain present wait failed with error code 0x%lX.\n",
++                    GetLastError());
++            }
+         }
++
++        return true;
+     }
+ 
+     bool D3D12SwapChain::resize() {
+@@ -1413,9 +1485,15 @@ namespace plume {
+             return false;
+         }
+ 
+-        for (uint32_t i = 0; i < desc.textureCount; i++) {
+-            textures[i].d3d->Release();
+-            textures[i].d3d = nullptr;
++        if (d3d == nullptr) {
++            return create();
++        }
++
++        for (D3D12Texture &texture : textures) {
++            if (texture.d3d != nullptr) {
++                texture.d3d->Release();
++                texture.d3d = nullptr;
++            }
+         }
+ 
+         HRESULT res = d3d->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, swapChainFlags);
+@@ -1442,6 +1520,10 @@ namespace plume {
+         return vsyncEnabled;
+     }
+ 
++    const char *D3D12SwapChain::getPresentModeName() const {
++        return vsyncEnabled ? "dxgi_vsync" : "dxgi_immediate";
++    }
++
+     uint32_t D3D12SwapChain::getWidth() const {
+         return width;
+     }
+@@ -1451,14 +1533,21 @@ namespace plume {
+     }
+ 
+     void D3D12SwapChain::getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const {
+-        RECT rect;
+-        GetClientRect(desc.renderWindow, &rect);
+-        dstWidth = rect.right - rect.left;
+-        dstHeight = rect.bottom - rect.top;
++        RECT rect = {};
++        if (!GetClientRect(desc.renderWindow, &rect) ||
++            (rect.right <= rect.left) || (rect.bottom <= rect.top)) {
++            dstWidth = 0;
++            dstHeight = 0;
++            return;
++        }
++
++        dstWidth = uint32_t(rect.right - rect.left);
++        dstHeight = uint32_t(rect.bottom - rect.top);
+     }
+ 
+     void D3D12SwapChain::setTextures() {
+         assert(desc.textureCount == textures.size());
++        assert(d3d != nullptr);
+ 
+         for (uint32_t i = 0; i < desc.textureCount; i++) {
+             d3d->GetBuffer(i, IID_PPV_ARGS(&textures[i].d3d));
+@@ -1471,15 +1560,21 @@ namespace plume {
+     }
+ 
+     RenderTexture *D3D12SwapChain::getTexture(uint32_t textureIndex) {
++        if (textureIndex >= textures.size()) {
++            return nullptr;
++        }
+         return &textures[textureIndex];
+     }
+ 
+     uint32_t D3D12SwapChain::getTextureCount() const {
+-        return desc.textureCount;
++        return uint32_t(textures.size());
+     }
+ 
+     bool D3D12SwapChain::acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) {
+         assert(textureIndex != nullptr);
++        if ((d3d == nullptr) || (textureIndex == nullptr)) {
++            return false;
++        }
+         *textureIndex = d3d->GetCurrentBackBufferIndex();
+         return true;
+     }
+@@ -2312,7 +2407,12 @@ namespace plume {
+ 
+         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
+         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
+-        setSamplePositions(dstLocation.texture);
++        // Readback destinations are buffers; take sample positions from the texture side.
++        setSamplePositions(
++            dstLocation.texture != nullptr
++                ? dstLocation.texture
++                : srcLocation.texture
++        );
+         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
+         resetSamplePositions();
+     }
+@@ -2761,19 +2864,36 @@ namespace plume {
+ 
+         HRESULT res = device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, nullptr, &allocation, IID_PPV_ARGS(&d3d));
+         if (FAILED(res)) {
+-            fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
++            const HRESULT removed = device->d3d->GetDeviceRemovedReason();
++            fprintf(stderr,
++                "PLUME_D3D12 stage=buffer_create_failed hresult=0x%08lX"
++                " removed_reason=0x%08lX size=%llu flags=%u heap=%u"
++                " committed=%d pooled=%d\n",
++                res,
++                removed,
++                static_cast<unsigned long long>(desc.size),
++                static_cast<unsigned int>(desc.flags),
++                static_cast<unsigned int>(desc.heapType),
++                desc.committed ? 1 : 0,
++                pool != nullptr ? 1 : 0
++            );
+             return;
+         }
+     }
+ 
+     D3D12Buffer::~D3D12Buffer() {
+-        if (allocation != nullptr) {
++        if (d3d != nullptr) {
+             d3d->Release();
++        }
++        if (allocation != nullptr) {
+             allocation->Release();
+         }
+     }
+ 
+     void *D3D12Buffer::map(uint32_t subresource, const RenderRange *readRange) {
++        if (d3d == nullptr) {
++            return nullptr;
++        }
+         D3D12_RANGE range;
+         if (readRange != nullptr) {
+             range.Begin = readRange->begin;
+@@ -2786,6 +2906,10 @@ namespace plume {
+     }
+ 
+     void D3D12Buffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
++        if (d3d == nullptr) {
++            return;
++        }
++
+         D3D12_RANGE range;
+         if (writtenRange != nullptr) {
+             range.Begin = writtenRange->begin;
+@@ -2800,12 +2924,14 @@ namespace plume {
+     }
+ 
+     void D3D12Buffer::setName(const std::string &name) {
+-        setObjectName(d3d, name);
++        if (d3d != nullptr) {
++            setObjectName(d3d, name);
++        }
+     }
+ 
+     uint64_t D3D12Buffer::getDeviceAddress() const {
+         assert((desc.flags & RenderBufferFlag::DEVICE_ADDRESSABLE) != 0 && "Buffer must have been created with GPU_ADDRESSABLE flag.");
+-        return d3d->GetGPUVirtualAddress();
++        return d3d != nullptr ? d3d->GetGPUVirtualAddress() : 0;
+     }
+ 
+     // D3D12BufferFormattedView
+@@ -2877,14 +3003,32 @@ namespace plume {
+ 
+         HRESULT res = device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, (desc.optimizedClearValue != nullptr) ? &optimizedClearValue : nullptr, &allocation, IID_PPV_ARGS(&d3d));
+         if (FAILED(res)) {
+-            fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
++            const HRESULT removed = device->d3d->GetDeviceRemovedReason();
++            fprintf(stderr,
++                "PLUME_D3D12 stage=texture_create_failed hresult=0x%08lX"
++                " removed_reason=0x%08lX dimensions=%ux%ux%u array=%u"
++                " mips=%u format=%u samples=%u flags=%u pooled=%d\n",
++                res,
++                removed,
++                desc.width,
++                desc.height,
++                desc.depth,
++                desc.arraySize,
++                desc.mipLevels,
++                static_cast<unsigned int>(desc.format),
++                desc.multisampling.sampleCount,
++                static_cast<unsigned int>(desc.flags),
++                pool != nullptr ? 1 : 0
++            );
+             return;
+         }
+     }
+ 
+     D3D12Texture::~D3D12Texture() {
+-        if (allocation != nullptr) {
++        if (d3d != nullptr) {
+             d3d->Release();
++        }
++        if (allocation != nullptr) {
+             allocation->Release();
+         }
+     }
+@@ -2894,7 +3038,9 @@ namespace plume {
+     }
+ 
+     void D3D12Texture::setName(const std::string &name) {
+-        setObjectName(d3d, name);
++        if (d3d != nullptr) {
++            setObjectName(d3d, name);
++        }
+     }
+ 
+     // D3D12AccelerationStructure
+@@ -2952,11 +3098,19 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderBuffer> D3D12Pool::createBuffer(const RenderBufferDesc &desc) {
+-        return std::make_unique<D3D12Buffer>(device, this, desc);
++        auto buffer = std::make_unique<D3D12Buffer>(device, this, desc);
++        if (buffer->d3d == nullptr) {
++            return nullptr;
++        }
++        return buffer;
+     }
+ 
+     std::unique_ptr<RenderTexture> D3D12Pool::createTexture(const RenderTextureDesc &desc) {
+-        return std::make_unique<D3D12Texture>(device, this, desc);
++        auto texture = std::make_unique<D3D12Texture>(device, this, desc);
++        if (texture->d3d == nullptr) {
++            return nullptr;
++        }
++        return texture;
+     }
+ 
+     // D3D12Shader
+@@ -3040,6 +3194,97 @@ namespace plume {
+ 
+     D3D12Pipeline::~D3D12Pipeline() { }
+ 
++    static uint64_t computePipelineCacheHash(
++        const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc,
++        const D3D12PipelineLayout *pipelineLayout,
++        const D3D12Shader *computeShader
++    ) {
++        constexpr uint64_t FNVOffsetBasis = 14695981039346656037ULL;
++        D3D12_COMPUTE_PIPELINE_STATE_DESC stableDesc = desc;
++        stableDesc.pRootSignature = nullptr;
++        stableDesc.CS.pShaderBytecode = nullptr;
++        stableDesc.CachedPSO = {};
++
++        uint64_t hash = pipelineCacheHashBytes(
++            FNVOffsetBasis,
++            &stableDesc,
++            sizeof(stableDesc)
++        );
++        hash = pipelineCacheHashValue(hash, pipelineLayout->cacheHash);
++        if (computeShader != nullptr && !computeShader->d3d.empty()) {
++            hash = pipelineCacheHashBytes(
++                hash,
++                computeShader->d3d.data(),
++                computeShader->d3d.size()
++            );
++        }
++        return hash;
++    }
++
++    static uint64_t graphicsPipelineCacheHash(
++        const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
++        const D3D12PipelineLayout *pipelineLayout,
++        const D3D12Shader *vertexShader,
++        const D3D12Shader *geometryShader,
++        const D3D12Shader *pixelShader,
++        const std::vector<D3D12_INPUT_ELEMENT_DESC> &inputElements
++    ) {
++        constexpr uint64_t FNVOffsetBasis = 14695981039346656037ULL;
++        D3D12_GRAPHICS_PIPELINE_STATE_DESC stableDesc = desc;
++        stableDesc.pRootSignature = nullptr;
++        stableDesc.VS.pShaderBytecode = nullptr;
++        stableDesc.GS.pShaderBytecode = nullptr;
++        stableDesc.PS.pShaderBytecode = nullptr;
++        stableDesc.DS.pShaderBytecode = nullptr;
++        stableDesc.HS.pShaderBytecode = nullptr;
++        stableDesc.InputLayout.pInputElementDescs = nullptr;
++        stableDesc.StreamOutput.pSODeclaration = nullptr;
++        stableDesc.StreamOutput.pBufferStrides = nullptr;
++        stableDesc.CachedPSO = {};
++
++        uint64_t hash = pipelineCacheHashBytes(
++            FNVOffsetBasis,
++            &stableDesc,
++            sizeof(stableDesc)
++        );
++        hash = pipelineCacheHashValue(hash, pipelineLayout->cacheHash);
++        const D3D12Shader *shaders[] = {
++            vertexShader,
++            geometryShader,
++            pixelShader
++        };
++        for (const D3D12Shader *shader : shaders) {
++            const uint64_t shaderSize =
++                shader != nullptr ? shader->d3d.size() : 0;
++            hash = pipelineCacheHashValue(hash, shaderSize);
++            if (shaderSize > 0) {
++                hash = pipelineCacheHashBytes(
++                    hash,
++                    shader->d3d.data(),
++                    shader->d3d.size()
++                );
++            }
++        }
++
++        for (const D3D12_INPUT_ELEMENT_DESC &element : inputElements) {
++            D3D12_INPUT_ELEMENT_DESC stableElement = element;
++            stableElement.SemanticName = nullptr;
++            hash = pipelineCacheHashBytes(
++                hash,
++                &stableElement,
++                sizeof(stableElement)
++            );
++            if (element.SemanticName != nullptr) {
++                hash = pipelineCacheHashBytes(
++                    hash,
++                    element.SemanticName,
++                    std::strlen(element.SemanticName)
++                );
++            }
++        }
++        return hash;
++    }
++
+     // D3D12ComputePipeline
+ 
+     D3D12ComputePipeline::D3D12ComputePipeline(D3D12Device *device, const RenderComputePipelineDesc &desc) : D3D12Pipeline(device, Type::Compute) {
+@@ -3053,7 +3298,36 @@ namespace plume {
+         psoDesc.pRootSignature = rootSignature->rootSignature;
+         psoDesc.CS.pShaderBytecode = computeShader->d3d.data();
+         psoDesc.CS.BytecodeLength = computeShader->d3d.size();
+-        device->d3d->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        const std::wstring cacheKey = pipelineCacheKey(
++            L'c',
++            computePipelineCacheHash(
++                psoDesc,
++                rootSignature,
++                computeShader
++            )
++        );
++        HRESULT createResult = device->loadComputePipeline(
++            cacheKey,
++            psoDesc,
++            &d3d
++        );
++        if (FAILED(createResult)) {
++            createResult = device->d3d->CreateComputePipelineState(
++                &psoDesc,
++                IID_PPV_ARGS(&d3d)
++            );
++            if (SUCCEEDED(createResult)) {
++                device->storePipeline(cacheKey, d3d);
++            }
++        }
++        if (FAILED(createResult)) {
++            std::fprintf(
++                stderr,
++                "PLUME_D3D12 stage=compute_pipeline_create_failed hresult=0x%08lX\n",
++                static_cast<unsigned long>(createResult)
++            );
++            std::fflush(stderr);
++        }
+     }
+ 
+     D3D12ComputePipeline::~D3D12ComputePipeline() {
+@@ -3198,7 +3472,39 @@ namespace plume {
+ 
+         psoDesc.InputLayout = { inputElements.data(), UINT(inputElements.size()) };
+ 
+-        device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
++        const std::wstring cacheKey = pipelineCacheKey(
++            L'g',
++            graphicsPipelineCacheHash(
++                psoDesc,
++                pipelineLayout,
++                vertexShader,
++                geometryShader,
++                pixelShader,
++                inputElements
++            )
++        );
++        HRESULT createResult = device->loadGraphicsPipeline(
++            cacheKey,
++            psoDesc,
++            &d3d
++        );
++        if (FAILED(createResult)) {
++            createResult = device->d3d->CreateGraphicsPipelineState(
++                &psoDesc,
++                IID_PPV_ARGS(&d3d)
++            );
++            if (SUCCEEDED(createResult)) {
++                device->storePipeline(cacheKey, d3d);
++            }
++        }
++        if (FAILED(createResult)) {
++            std::fprintf(
++                stderr,
++                "PLUME_D3D12 stage=graphics_pipeline_create_failed hresult=0x%08lX\n",
++                static_cast<unsigned long>(createResult)
++            );
++            std::fflush(stderr);
++        }
+     }
+ 
+     D3D12GraphicsPipeline::~D3D12GraphicsPipeline() {
+@@ -3616,15 +3922,28 @@ namespace plume {
+         rootSignatureDesc.NumStaticSamplers = UINT(staticSamplers.size());
+ 
+         // Serialize the root signature.
+-        ID3DBlob *signatureBlob;
+-        ID3DBlob *errorBlob;
++        ID3DBlob *signatureBlob = nullptr;
++        ID3DBlob *errorBlob = nullptr;
+         HRESULT res = D3D12SerializeRootSignature(&rootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &signatureBlob, &errorBlob);
+         if (FAILED(res)) {
+-            fprintf(stderr, "%s\n", (char *)(errorBlob->GetBufferPointer()));
++            if (errorBlob != nullptr) {
++                fprintf(stderr, "%s\n", (char *)(errorBlob->GetBufferPointer()));
++                errorBlob->Release();
++            }
+             return;
+         }
+ 
++        cacheHash = pipelineCacheHashBytes(
++            14695981039346656037ULL,
++            signatureBlob->GetBufferPointer(),
++            signatureBlob->GetBufferSize()
++        );
++
+         res = device->d3d->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
++        signatureBlob->Release();
++        if (errorBlob != nullptr) {
++            errorBlob->Release();
++        }
+         if (FAILED(res)) {
+             fprintf(stderr, "CreateRootSignature failed with error code 0x%lX.\n", res);
+             return;
+@@ -3797,6 +4116,8 @@ namespace plume {
+             d3d->SetStablePowerState(TRUE);
+         #endif
+ 
++        initializePipelineCache();
++
+         D3D12MA::ALLOCATOR_DESC allocatorDesc = {};
+         allocatorDesc.pDevice = d3d;
+         allocatorDesc.pAdapter = adapter;
+@@ -3921,16 +4242,25 @@ namespace plume {
+     }
+     
+     std::unique_ptr<RenderBuffer> D3D12Device::createBuffer(const RenderBufferDesc &desc) {
++        std::unique_ptr<D3D12Buffer> buffer;
+         if ((desc.heapType == RenderHeapType::GPU_UPLOAD) && gpuUploadHeapFallback) {
+-            return std::make_unique<D3D12Buffer>(this, customUploadPool.get(), desc);
++            buffer = std::make_unique<D3D12Buffer>(this, customUploadPool.get(), desc);
+         }
+         else {
+-            return std::make_unique<D3D12Buffer>(this, nullptr, desc);
++            buffer = std::make_unique<D3D12Buffer>(this, nullptr, desc);
+         }
++        if (buffer->d3d == nullptr) {
++            return nullptr;
++        }
++        return buffer;
+     }
+ 
+     std::unique_ptr<RenderTexture> D3D12Device::createTexture(const RenderTextureDesc &desc) {
+-        return std::make_unique<D3D12Texture>(this, nullptr, desc);
++        auto texture = std::make_unique<D3D12Texture>(this, nullptr, desc);
++        if (texture->d3d == nullptr) {
++            return nullptr;
++        }
++        return texture;
+     }
+ 
+     std::unique_ptr<RenderAccelerationStructure> D3D12Device::createAccelerationStructure(const RenderAccelerationStructureDesc &desc) {
+@@ -4147,7 +4477,177 @@ namespace plume {
+         return countsSupported;
+     }
+ 
++    HRESULT D3D12Device::loadComputePipeline(
++        const std::wstring &key,
++        const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc,
++        ID3D12PipelineState **pipelineState
++    ) {
++        if (pipelineLibrary == nullptr || pipelineState == nullptr) {
++            return E_NOINTERFACE;
++        }
++
++        const std::lock_guard cacheLock(pipelineCacheMutex);
++        return pipelineLibrary->LoadComputePipeline(
++            key.c_str(),
++            &desc,
++            IID_PPV_ARGS(pipelineState)
++        );
++    }
++
++    HRESULT D3D12Device::loadGraphicsPipeline(
++        const std::wstring &key,
++        const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
++        ID3D12PipelineState **pipelineState
++    ) {
++        if (pipelineLibrary == nullptr || pipelineState == nullptr) {
++            return E_NOINTERFACE;
++        }
++
++        const std::lock_guard cacheLock(pipelineCacheMutex);
++        return pipelineLibrary->LoadGraphicsPipeline(
++            key.c_str(),
++            &desc,
++            IID_PPV_ARGS(pipelineState)
++        );
++    }
++
++    void D3D12Device::storePipeline(
++        const std::wstring &key,
++        ID3D12PipelineState *pipelineState
++    ) {
++        if (pipelineLibrary == nullptr || pipelineState == nullptr) {
++            return;
++        }
++
++        const std::lock_guard cacheLock(pipelineCacheMutex);
++        if (SUCCEEDED(pipelineLibrary->StorePipeline(
++                key.c_str(),
++                pipelineState))) {
++            pipelineCacheDirty = true;
++        }
++    }
++
++    void D3D12Device::initializePipelineCache() {
++        const wchar_t *configuredPath =
++            _wgetenv(L"RT64_D3D12_PIPELINE_CACHE");
++        if (configuredPath != nullptr && configuredPath[0] != 0) {
++            pipelineCachePath = std::filesystem::path(configuredPath);
++        }
++
++        constexpr uint64_t MaxPipelineCacheBytes =
++            64ULL * 1024ULL * 1024ULL;
++        std::vector<uint8_t> initialData;
++        if (!pipelineCachePath.empty()) {
++            std::ifstream input(
++                pipelineCachePath,
++                std::ios::binary | std::ios::ate
++            );
++            if (input) {
++                const std::streamoff size = input.tellg();
++                if (size > 0 &&
++                    static_cast<uint64_t>(size) <= MaxPipelineCacheBytes) {
++                    initialData.resize(static_cast<size_t>(size));
++                    input.seekg(0, std::ios::beg);
++                    if (!input.read(
++                            reinterpret_cast<char *>(initialData.data()),
++                            size)) {
++                        initialData.clear();
++                    }
++                }
++            }
++        }
++
++        HRESULT result = d3d->CreatePipelineLibrary(
++            initialData.empty() ? nullptr : initialData.data(),
++            initialData.size(),
++            IID_PPV_ARGS(&pipelineLibrary)
++        );
++        if (FAILED(result) && !initialData.empty()) {
++            pipelineLibrary = nullptr;
++            result = d3d->CreatePipelineLibrary(
++                nullptr,
++                0,
++                IID_PPV_ARGS(&pipelineLibrary)
++            );
++        }
++        if (FAILED(result)) {
++            pipelineLibrary = nullptr;
++        }
++    }
++
++    void D3D12Device::savePipelineCache() {
++        if (pipelineLibrary == nullptr || pipelineCachePath.empty() ||
++            !pipelineCacheDirty) {
++            return;
++        }
++
++        const std::lock_guard cacheLock(pipelineCacheMutex);
++        constexpr uint64_t MaxPipelineCacheBytes =
++            64ULL * 1024ULL * 1024ULL;
++        const SIZE_T dataSize = pipelineLibrary->GetSerializedSize();
++        if (dataSize == 0 ||
++            static_cast<uint64_t>(dataSize) > MaxPipelineCacheBytes) {
++            return;
++        }
++
++        std::vector<uint8_t> data(dataSize);
++        if (FAILED(pipelineLibrary->Serialize(
++                data.data(),
++                data.size()))) {
++            return;
++        }
++
++        std::error_code error;
++        const std::filesystem::path parent =
++            pipelineCachePath.parent_path();
++        if (!parent.empty()) {
++            std::filesystem::create_directories(parent, error);
++            if (error) {
++                return;
++            }
++        }
++
++        std::filesystem::path temporaryPath = pipelineCachePath;
++        temporaryPath += L".tmp";
++        {
++            std::ofstream output(
++                temporaryPath,
++                std::ios::binary | std::ios::trunc
++            );
++            if (!output.write(
++                    reinterpret_cast<const char *>(data.data()),
++                    static_cast<std::streamsize>(data.size()))) {
++                return;
++            }
++        }
++
++        std::filesystem::rename(
++            temporaryPath,
++            pipelineCachePath,
++            error
++        );
++        if (error) {
++            error.clear();
++            std::filesystem::remove(pipelineCachePath, error);
++            error.clear();
++            std::filesystem::rename(
++                temporaryPath,
++                pipelineCachePath,
++                error
++            );
++        }
++        if (!error) {
++            pipelineCacheDirty = false;
++        }
++    }
++
+     void D3D12Device::release() {
++        if (pipelineLibrary != nullptr) {
++            savePipelineCache();
++            pipelineLibrary->Release();
++            pipelineLibrary = nullptr;
++        }
++
+         if (d3d != nullptr) {
+             d3d->Release();
+             d3d = nullptr;
+diff --git a/plume_d3d12.h b/plume_d3d12.h
+index 4827452..458d069 100644
+--- a/plume_d3d12.h
++++ b/plume_d3d12.h
+@@ -9,6 +9,7 @@
+ 
+ #include "plume_render_interface.h"
+ 
++#include <filesystem>
+ #include <map>
+ #include <mutex>
+ #include <unordered_map>
+@@ -115,11 +116,12 @@ namespace plume {
+         D3D12SwapChain(D3D12CommandQueue *commandQueue, const RenderSwapChainDesc &desc);
+         ~D3D12SwapChain() override;
+         bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override;
+-        void wait() override;
++        bool wait(uint32_t timeoutMilliseconds) override;
+         bool resize() override;
+         bool needsResize() const override;
+         void setVsyncEnabled(bool vsyncEnabled) override;
+         bool isVsyncEnabled() const override;
++        const char *getPresentModeName() const override;
+         uint32_t getWidth() const override;
+         uint32_t getHeight() const override;
+         RenderTexture *getTexture(uint32_t textureIndex) override;
+@@ -128,6 +130,7 @@ namespace plume {
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
+         uint32_t getRefreshRate() const override;
++        bool create();
+         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+         void setTextures();
+     };
+@@ -426,6 +429,7 @@ namespace plume {
+         std::vector<std::pair<uint32_t, RenderRootDescriptorType>> rootDescriptorRootIndicesAndTypes;
+         uint32_t setCount = 0;
+         uint32_t rootCount = 0;
++        uint64_t cacheHash = 0;
+ 
+         D3D12PipelineLayout(D3D12Device *device, const RenderPipelineLayoutDesc &desc);
+         ~D3D12PipelineLayout() override;
+@@ -436,6 +440,10 @@ namespace plume {
+         D3D12Interface *renderInterface = nullptr;
+         IDXGIAdapter1 *adapter = nullptr;
+         D3D12MA::Allocator *allocator = nullptr;
++        ID3D12PipelineLibrary *pipelineLibrary = nullptr;
++        std::filesystem::path pipelineCachePath;
++        std::mutex pipelineCacheMutex;
++        bool pipelineCacheDirty = false;
+         D3D_SHADER_MODEL shaderModel = D3D_SHADER_MODEL(0);
+         std::unique_ptr<RenderPipelineLayout> rtDummyGlobalPipelineLayout;
+         std::unique_ptr<RenderPipelineLayout> rtDummyLocalPipelineLayout;
+@@ -473,6 +481,16 @@ namespace plume {
+         const RenderDeviceCapabilities &getCapabilities() const override;
+         const RenderDeviceDescription &getDescription() const override;
+         RenderSampleCounts getSampleCountsSupported(RenderFormat format) const override;
++        HRESULT loadComputePipeline(const std::wstring &key,
++            const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc,
++            ID3D12PipelineState **pipelineState);
++        HRESULT loadGraphicsPipeline(const std::wstring &key,
++            const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
++            ID3D12PipelineState **pipelineState);
++        void storePipeline(const std::wstring &key,
++            ID3D12PipelineState *pipelineState);
++        void initializePipelineCache();
++        void savePipelineCache();
+         void release();
+         bool isValid() const;
+         bool beginCapture() override;
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 418a29f..1e13fda 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -3484,7 +3484,37 @@ namespace plume {
+             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
+             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
+         }
++        else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
++            assert(dstBuffer != nullptr);
++            assert(srcTexture != nullptr);
++
++            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
++            VkBufferImageCopy imageCopy = {};
++            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
++            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
++            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
++            imageCopy.imageSubresource.layerCount = 1;
++            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
++            if (srcBox != nullptr) {
++                imageCopy.imageOffset.x = srcBox->left;
++                imageCopy.imageOffset.y = srcBox->top;
++                imageCopy.imageOffset.z = srcBox->front;
++                imageCopy.imageExtent.width = srcBox->right - srcBox->left;
++                imageCopy.imageExtent.height = srcBox->bottom - srcBox->top;
++                imageCopy.imageExtent.depth = srcBox->back - srcBox->front;
++            }
++            else {
++                imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
++                imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
++                imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
++            }
++            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
++        }
+         else {
++            assert(dstTexture != nullptr);
++            assert(srcTexture != nullptr);
+             VkImageCopy imageCopy = {};
+             imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+             imageCopy.srcSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index a5f30a3..d5edcaf 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -195,6 +195,8 @@ namespace plume {
+                     return RenderFormat::R32G32_SINT;
+                 case MTL::PixelFormatRGBA8Unorm:
+                     return RenderFormat::R8G8B8A8_UNORM;
++                case MTL::PixelFormatRGBA8Unorm_sRGB:
++                    return RenderFormat::R8G8B8A8_UNORM_SRGB;
+                 case MTL::PixelFormatRGBA8Uint:
+                     return RenderFormat::R8G8B8A8_UINT;
+                 case MTL::PixelFormatRGBA8Snorm:
+@@ -330,6 +332,8 @@ namespace plume {
+                 return MTL::PixelFormatRGBA8Unorm;
+             case RenderFormat::R8G8B8A8_UNORM:
+                 return MTL::PixelFormatRGBA8Unorm;
++            case RenderFormat::R8G8B8A8_UNORM_SRGB:
++                return MTL::PixelFormatRGBA8Unorm_sRGB;
+             case RenderFormat::R8G8B8A8_UINT:
+                 return MTL::PixelFormatRGBA8Uint;
+             case RenderFormat::R8G8B8A8_SNORM:
+@@ -1976,15 +1980,18 @@ namespace plume {
+         return true;
+     }
+ 
+-    void MetalSwapChain::wait() {
++    bool MetalSwapChain::wait(uint32_t timeoutMilliseconds) {
+         assert(desc.enablePresentWait && "Present wait should've been explicitly enabled during swap chain creation before using the wait function.");
+ 
+         if (currentPresentId >= desc.maxFrameLatency) {
+             std::unique_lock lock(lastPresentedIdMutex);
+-            lastPresentedIdCondVar.wait_for(lock, std::chrono::seconds(1), [this] {
++            return lastPresentedIdCondVar.wait_for(lock,
++                std::chrono::milliseconds(timeoutMilliseconds), [this] {
+                 return lastPresentedId >= currentPresentId - (desc.maxFrameLatency - 1);
+             });
+         }
++
++        return true;
+     }
+ 
+     bool MetalSwapChain::resize() {
+@@ -2022,6 +2029,10 @@ namespace plume {
+         return layer->displaySyncEnabled();
+     }
+ 
++    const char *MetalSwapChain::getPresentModeName() const {
++        return layer->displaySyncEnabled() ? "metal_vsync" : "metal_immediate";
++    }
++
+     uint32_t MetalSwapChain::getWidth() const {
+         return width;
+     }
+diff --git a/plume_metal.h b/plume_metal.h
+index 8de188d..27c932c 100644
+--- a/plume_metal.h
++++ b/plume_metal.h
+@@ -253,11 +253,12 @@ namespace plume {
+         MetalSwapChain(MetalCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
+         ~MetalSwapChain() override;
+         bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override;
+-        void wait() override;
++        bool wait(uint32_t timeoutMilliseconds) override;
+         bool resize() override;
+         bool needsResize() const override;
+         void setVsyncEnabled(bool vsyncEnabled) override;
+         bool isVsyncEnabled() const override;
++        const char *getPresentModeName() const override;
+         uint32_t getWidth() const override;
+         uint32_t getHeight() const override;
+         RenderTexture *getTexture(uint32_t textureIndex) override;
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 2048557..49d522b 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -14,6 +14,15 @@
+ namespace plume {
+     // Interfaces.
+ 
++    // Presentation IDs are valid only for the lifetime of their swap chain.
++    struct RenderPresentationTiming {
++        uint32_t presentationId = 0;
++        uint64_t desiredPresentTimeNanoseconds = 0;
++        uint64_t actualPresentTimeNanoseconds = 0;
++        uint64_t earliestPresentTimeNanoseconds = 0;
++        uint64_t presentMarginNanoseconds = 0;
++    };
++
+     struct RenderBufferFormattedView {
+         virtual ~RenderBufferFormattedView() { }
+     };
+@@ -88,11 +99,13 @@ namespace plume {
+     struct RenderSwapChain {
+         virtual ~RenderSwapChain() { }
+         virtual bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) = 0;
+-        virtual void wait() = 0;
++        // Wait at most timeoutMilliseconds for presentation capacity.
++        virtual bool wait(uint32_t timeoutMilliseconds) = 0;
+         virtual bool resize() = 0;
+         virtual bool needsResize() const = 0;
+         virtual void setVsyncEnabled(bool vsyncEnabled) = 0;
+         virtual bool isVsyncEnabled() const = 0;
++        virtual const char *getPresentModeName() const { return "unknown"; }
+         virtual uint32_t getWidth() const = 0;
+         virtual uint32_t getHeight() const = 0;
+         virtual RenderTexture *getTexture(uint32_t textureIndex) = 0;
+@@ -101,6 +117,17 @@ namespace plume {
+         virtual RenderWindow getWindow() const = 0;
+         virtual bool isEmpty() const = 0;
+ 
++        // Backends without completed-scanout timing retain the default empty implementation.
++        virtual uint32_t getLastPresentationTimingId() const { return 0; }
++        virtual uint32_t consumePresentationTimings(
++            RenderPresentationTiming *timings,
++            uint32_t capacity
++        ) { return 0; }
++
++        // Expose submitted/completed presentation IDs even without scanout timestamps.
++        virtual uint64_t getLastPresentId() const { return 0; }
++        virtual uint64_t getLastCompletedPresentId() const { return 0; }
++
+         // Only valid if displayTiming is enabled in capabilities.
+         virtual uint32_t getRefreshRate() const = 0;
+     };
+@@ -199,6 +230,20 @@ namespace plume {
+ 
+     struct RenderCommandQueue {
+         virtual ~RenderCommandQueue() { }
++        // Queue topology is diagnostic information.
++        virtual bool sharesNativeQueue(
++            const RenderCommandQueue *other) const {
++            return this == other;
++        }
++        virtual uint32_t getNativeQueueFamilyIndex() const {
++            return UINT32_MAX;
++        }
++        virtual uint32_t getNativeQueueIndex() const {
++            return UINT32_MAX;
++        }
++        virtual uint32_t getNativeQueueCount() const {
++            return 1;
++        }
+         virtual std::unique_ptr<RenderCommandList> createCommandList() = 0;
+         virtual std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) = 0;
+         virtual void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores = nullptr, uint32_t waitSemaphoreCount = 0, RenderCommandSemaphore **signalSemaphores = nullptr, uint32_t signalSemaphoreCount = 0, RenderCommandFence *signalFence = nullptr) = 0;
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index 9dcfedf..01fb59c 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -106,6 +106,7 @@ namespace plume {
+         R32G32_SINT,
+         R8G8B8A8_TYPELESS,
+         R8G8B8A8_UNORM,
++        R8G8B8A8_UNORM_SRGB,
+         R8G8B8A8_UINT,
+         R8G8B8A8_SNORM,
+         R8G8B8A8_SINT,
+@@ -536,6 +537,7 @@ namespace plume {
+             return 8;
+         case RenderFormat::R8G8B8A8_TYPELESS:
+         case RenderFormat::R8G8B8A8_UNORM:
++        case RenderFormat::R8G8B8A8_UNORM_SRGB:
+         case RenderFormat::R8G8B8A8_UINT:
+         case RenderFormat::R8G8B8A8_SNORM:
+         case RenderFormat::R8G8B8A8_SINT:
+@@ -619,6 +621,7 @@ namespace plume {
+         case RenderFormat::R32G32_SINT:
+         case RenderFormat::R8G8B8A8_TYPELESS:
+         case RenderFormat::R8G8B8A8_UNORM:
++        case RenderFormat::R8G8B8A8_UNORM_SRGB:
+         case RenderFormat::R8G8B8A8_UINT:
+         case RenderFormat::R8G8B8A8_SNORM:
+         case RenderFormat::R8G8B8A8_SINT:
+@@ -1305,6 +1308,12 @@ namespace plume {
+         uint32_t inputElementsCount = 0;
+         const RenderSpecConstant *specConstants = nullptr;
+         uint32_t specConstantsCount = 0;
++        const RenderSpecConstant *vertexSpecConstants = nullptr;
++        uint32_t vertexSpecConstantsCount = 0;
++        const RenderSpecConstant *pixelSpecConstants = nullptr;
++        uint32_t pixelSpecConstantsCount = 0;
++        // Compile into a private cache, then merge into the persistent device cache.
++        bool isolatedPipelineCache = false;
+     };
+ 
+     struct RenderRaytracingPipelineLibrarySymbol {
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 2800022..418a29f 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -13,6 +13,9 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <climits>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
+ #include <unordered_map>
+ 
+ #if DLSS_ENABLED
+@@ -141,6 +144,8 @@ namespace plume {
+             return VK_FORMAT_R8G8B8A8_UNORM;
+         case RenderFormat::R8G8B8A8_UNORM:
+             return VK_FORMAT_R8G8B8A8_UNORM;
++        case RenderFormat::R8G8B8A8_UNORM_SRGB:
++            return VK_FORMAT_R8G8B8A8_SRGB;
+         case RenderFormat::R8G8B8A8_UINT:
+             return VK_FORMAT_R8G8B8A8_UINT;
+         case RenderFormat::R8G8B8A8_SNORM:
+@@ -1390,7 +1395,8 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.stage = stageInfo;
+ 
+-        VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        const std::lock_guard cacheLock(device->pipelineCacheMutex);
++        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -1420,12 +1426,51 @@ namespace plume {
+         thread_local std::vector<VkPipelineShaderStageCreateInfo> stages;
+         stages.clear();
+ 
+-        std::vector<VkSpecializationMapEntry> specEntries(desc.specConstantsCount);
+-        std::vector<uint32_t> specData(desc.specConstantsCount);
+-        VkSpecializationInfo specInfo = {};
+-        fillSpecInfo(desc.specConstants, desc.specConstantsCount, specInfo, specEntries.data(), specData.data());
+-
+-        const VkSpecializationInfo *pSpecInfo = (specInfo.mapEntryCount > 0) ? &specInfo : nullptr;
++        const RenderSpecConstant *vertexSpecConstants =
++            desc.vertexSpecConstantsCount > 0
++                ? desc.vertexSpecConstants
++                : desc.specConstants;
++        const uint32_t vertexSpecConstantsCount =
++            desc.vertexSpecConstantsCount > 0
++                ? desc.vertexSpecConstantsCount
++                : desc.specConstantsCount;
++        const RenderSpecConstant *pixelSpecConstants =
++            desc.pixelSpecConstantsCount > 0
++                ? desc.pixelSpecConstants
++                : desc.specConstants;
++        const uint32_t pixelSpecConstantsCount =
++            desc.pixelSpecConstantsCount > 0
++                ? desc.pixelSpecConstantsCount
++                : desc.specConstantsCount;
++        std::vector<VkSpecializationMapEntry> vertexSpecEntries(
++            vertexSpecConstantsCount
++        );
++        std::vector<uint32_t> vertexSpecData(vertexSpecConstantsCount);
++        VkSpecializationInfo vertexSpecInfo = {};
++        fillSpecInfo(
++            vertexSpecConstants,
++            vertexSpecConstantsCount,
++            vertexSpecInfo,
++            vertexSpecEntries.data(),
++            vertexSpecData.data()
++        );
++        std::vector<VkSpecializationMapEntry> pixelSpecEntries(
++            pixelSpecConstantsCount
++        );
++        std::vector<uint32_t> pixelSpecData(pixelSpecConstantsCount);
++        VkSpecializationInfo pixelSpecInfo = {};
++        fillSpecInfo(
++            pixelSpecConstants,
++            pixelSpecConstantsCount,
++            pixelSpecInfo,
++            pixelSpecEntries.data(),
++            pixelSpecData.data()
++        );
++
++        const VkSpecializationInfo *pVertexSpecInfo =
++            vertexSpecInfo.mapEntryCount > 0 ? &vertexSpecInfo : nullptr;
++        const VkSpecializationInfo *pPixelSpecInfo =
++            pixelSpecInfo.mapEntryCount > 0 ? &pixelSpecInfo : nullptr;
+         if (desc.vertexShader != nullptr) {
+             const VulkanShader *vertexShader = static_cast<const VulkanShader *>(desc.vertexShader);
+             VkPipelineShaderStageCreateInfo stageInfo = {};
+@@ -1433,7 +1478,7 @@ namespace plume {
+             stageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+             stageInfo.module = vertexShader->vk;
+             stageInfo.pName = vertexShader->entryPointName.c_str();
+-            stageInfo.pSpecializationInfo = pSpecInfo;
++            stageInfo.pSpecializationInfo = pVertexSpecInfo;
+             stages.emplace_back(stageInfo);
+         }
+ 
+@@ -1444,7 +1489,7 @@ namespace plume {
+             stageInfo.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+             stageInfo.module = geometryShader->vk;
+             stageInfo.pName = geometryShader->entryPointName.c_str();
+-            stageInfo.pSpecializationInfo = pSpecInfo;
++            stageInfo.pSpecializationInfo = pVertexSpecInfo;
+             stages.emplace_back(stageInfo);
+         }
+ 
+@@ -1455,7 +1500,7 @@ namespace plume {
+             stageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+             stageInfo.module = pixelShader->vk;
+             stageInfo.pName = pixelShader->entryPointName.c_str();
+-            stageInfo.pSpecializationInfo = pSpecInfo;
++            stageInfo.pSpecializationInfo = pPixelSpecInfo;
+             stages.emplace_back(stageInfo);
+         }
+ 
+@@ -1649,7 +1694,89 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.renderPass = renderPass;
+ 
+-        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        VkResult res = VK_ERROR_INITIALIZATION_FAILED;
++        bool compileAgainstMainCache = !desc.isolatedPipelineCache;
++        if (desc.isolatedPipelineCache) {
++            VkPipelineCache localPipelineCache = VK_NULL_HANDLE;
++            VkPipelineCacheCreateInfo cacheInfo = {};
++            cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++            res = vkCreatePipelineCache(
++                device->vk,
++                &cacheInfo,
++                nullptr,
++                &localPipelineCache
++            );
++            if (res == VK_SUCCESS) {
++                // Lock the persistent cache while seeding the private cache.
++                if (device->pipelineCache != VK_NULL_HANDLE) {
++                    const std::lock_guard cacheLock(
++                        device->pipelineCacheMutex
++                    );
++                    const VkResult seedResult = vkMergePipelineCaches(
++                        device->vk,
++                        localPipelineCache,
++                        1,
++                        &device->pipelineCache
++                    );
++                    if (seedResult != VK_SUCCESS) {
++                        fprintf(
++                            stderr,
++                            "vkMergePipelineCaches failed to seed private"
++                            " cache with error code 0x%X.\n",
++                            seedResult
++                        );
++                    }
++                }
++                res = vkCreateGraphicsPipelines(
++                    device->vk,
++                    localPipelineCache,
++                    1,
++                    &pipelineInfo,
++                    nullptr,
++                    &vk
++                );
++                if (res == VK_SUCCESS &&
++                    device->pipelineCache != VK_NULL_HANDLE) {
++                    const std::lock_guard cacheLock(
++                        device->pipelineCacheMutex
++                    );
++                    const VkResult mergeResult = vkMergePipelineCaches(
++                        device->vk,
++                        device->pipelineCache,
++                        1,
++                        &localPipelineCache
++                    );
++                    if (mergeResult != VK_SUCCESS) {
++                        fprintf(
++                            stderr,
++                            "vkMergePipelineCaches failed with error code"
++                            " 0x%X.\n",
++                            mergeResult
++                        );
++                    }
++                }
++                vkDestroyPipelineCache(
++                    device->vk,
++                    localPipelineCache,
++                    nullptr
++                );
++            }
++            else {
++                // A private cache is a latency optimization, not a pipeline creation requirement.
++                compileAgainstMainCache = true;
++            }
++        }
++        if (compileAgainstMainCache) {
++            const std::lock_guard cacheLock(device->pipelineCacheMutex);
++            res = vkCreateGraphicsPipelines(
++                device->vk,
++                device->pipelineCache,
++                1,
++                &pipelineInfo,
++                nullptr,
++                &vk
++            );
++        }
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -1855,7 +1986,8 @@ namespace plume {
+ 
+         this->descriptorSetCount = uint32_t(pipelineLayout->descriptorSetLayouts.size());
+ 
+-        VkResult res = vkCreateRayTracingPipelinesKHR(device->vk, nullptr, nullptr, 1, &pipelineInfo, nullptr, &vk);
++        const std::lock_guard cacheLock(device->pipelineCacheMutex);
++        VkResult res = vkCreateRayTracingPipelinesKHR(device->vk, nullptr, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateRayTracingPipelinesKHR failed with error code 0x%X.\n", res);
+             return;
+@@ -2277,8 +2409,24 @@ namespace plume {
+             presentId.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+             presentId.pPresentIds = &currentPresentId;
+             presentId.swapchainCount = 1;
++            presentId.pNext = presentInfo.pNext;
+             presentInfo.pNext = &presentId;
+         }
++
++        VkPresentTimeGOOGLE presentationTime = {};
++        VkPresentTimesInfoGOOGLE presentationTimes = {};
++        if (commandQueue->device->capabilities.displayTiming) {
++            currentPresentationTimingId++;
++            // Zero requests the earliest normal presentation.
++            presentationTime.presentID = currentPresentationTimingId;
++            presentationTime.desiredPresentTime = 0;
++            presentationTimes.sType =
++                VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
++            presentationTimes.pNext = presentInfo.pNext;
++            presentationTimes.swapchainCount = 1;
++            presentationTimes.pTimes = &presentationTime;
++            presentInfo.pNext = &presentationTimes;
++        }
+         
+         VkResult res;
+         {
+@@ -2297,16 +2447,37 @@ namespace plume {
+             return false;
+         }
+ 
++        ++presentCount;
++        if (textureIndex < imagePresentIds.size()) {
++            imagePresentIds[textureIndex] = presentCount;
++        }
++
+         return true;
+     }
+ 
+-    void VulkanSwapChain::wait() {
++    bool VulkanSwapChain::wait(uint32_t timeoutMilliseconds) {
+         assert(desc.enablePresentWait && "Present wait should've been explicitly enabled during swap chain creation before using the wait function.");
+ 
+         if (currentPresentId >= desc.maxFrameLatency) {
+-            constexpr uint64_t waitTimeout = 100000000;
+-            vkWaitForPresentKHR(commandQueue->device->vk, vk, currentPresentId - (desc.maxFrameLatency - 1), waitTimeout);
++            const uint64_t waitTimeout = uint64_t(timeoutMilliseconds) * 1'000'000ULL;
++            const uint64_t waitPresentId =
++                currentPresentId - (desc.maxFrameLatency - 1);
++            const VkResult result = vkWaitForPresentKHR(
++                commandQueue->device->vk,
++                vk,
++                waitPresentId,
++                waitTimeout
++            );
++            if (result == VK_SUCCESS) {
++                lastCompletedPresentId = std::max(
++                    lastCompletedPresentId,
++                    waitPresentId
++                );
++            }
++            return result != VK_TIMEOUT;
+         }
++
++        return true;
+     }
+ 
+     bool VulkanSwapChain::resize() {
+@@ -2349,8 +2520,11 @@ namespace plume {
+         // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
+         createdPresentMode = requiredPresentMode;
+ 
+-        // Reset present counter.
+-        presentCount = 1;
++        // Presentation IDs are scoped to this swap chain.
++        presentCount = 0;
++        currentPresentId = 0;
++        lastCompletedPresentId = 0;
++        currentPresentationTimingId = 0;
+ 
+         if (createInfo.oldSwapchain != VK_NULL_HANDLE) {
+             vkDestroySwapchainKHR(commandQueue->device->vk, createInfo.oldSwapchain, nullptr);
+@@ -2365,6 +2539,7 @@ namespace plume {
+         }
+ 
+         desc.textureCount = retrievedImageCount;
++        imagePresentIds.assign(desc.textureCount, 0);
+ 
+         std::vector<VkImage> images(desc.textureCount);
+         res = vkGetSwapchainImagesKHR(commandQueue->device->vk, vk, &desc.textureCount, images.data());
+@@ -2406,7 +2581,6 @@ namespace plume {
+         if (immediatePresentModeSupported && !vsyncEnabled) {
+             requiredPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+         }
+-        // FIFO is guaranteed to be supported.
+         else {
+             requiredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+         }
+@@ -2416,6 +2590,19 @@ namespace plume {
+         return (createdPresentMode == VK_PRESENT_MODE_FIFO_KHR) || (createdPresentMode == VK_PRESENT_MODE_MAILBOX_KHR);
+     }
+ 
++    const char *VulkanSwapChain::getPresentModeName() const {
++        switch (createdPresentMode) {
++        case VK_PRESENT_MODE_FIFO_KHR:
++            return "fifo";
++        case VK_PRESENT_MODE_MAILBOX_KHR:
++            return "mailbox";
++        case VK_PRESENT_MODE_IMMEDIATE_KHR:
++            return "immediate";
++        default:
++            return "other";
++        }
++    }
++
+     uint32_t VulkanSwapChain::getWidth() const {
+         return width;
+     }
+@@ -2440,6 +2627,69 @@ namespace plume {
+         return (vk == VK_NULL_HANDLE) || (width == 0) || (height == 0);
+     }
+ 
++    uint32_t VulkanSwapChain::getLastPresentationTimingId() const {
++        return currentPresentationTimingId;
++    }
++
++    uint32_t VulkanSwapChain::consumePresentationTimings(
++        RenderPresentationTiming *timings,
++        uint32_t capacity
++    ) {
++        if (!commandQueue->device->capabilities.displayTiming ||
++            (vk == VK_NULL_HANDLE) || (timings == nullptr) ||
++            (capacity == 0)) {
++            return 0;
++        }
++
++        uint32_t availableTimingCount = 0;
++        VkResult result = vkGetPastPresentationTimingGOOGLE(
++            commandQueue->device->vk,
++            vk,
++            &availableTimingCount,
++            nullptr
++        );
++        if ((result != VK_SUCCESS) || (availableTimingCount == 0)) {
++            return 0;
++        }
++
++        uint32_t timingCount = std::min(
++            availableTimingCount,
++            capacity
++        );
++        std::vector<VkPastPresentationTimingGOOGLE> pastTimings(timingCount);
++        result = vkGetPastPresentationTimingGOOGLE(
++            commandQueue->device->vk,
++            vk,
++            &timingCount,
++            pastTimings.data()
++        );
++        if ((result != VK_SUCCESS) && (result != VK_INCOMPLETE)) {
++            return 0;
++        }
++        timingCount = std::min(timingCount, capacity);
++        for (uint32_t i = 0; i < timingCount; i++) {
++            timings[i].presentationId = pastTimings[i].presentID;
++            timings[i].desiredPresentTimeNanoseconds =
++                pastTimings[i].desiredPresentTime;
++            timings[i].actualPresentTimeNanoseconds =
++                pastTimings[i].actualPresentTime;
++            timings[i].earliestPresentTimeNanoseconds =
++                pastTimings[i].earliestPresentTime;
++            timings[i].presentMarginNanoseconds =
++                pastTimings[i].presentMargin;
++        }
++
++        return timingCount;
++    }
++
++    uint64_t VulkanSwapChain::getLastPresentId() const {
++        return presentCount;
++    }
++
++    uint64_t VulkanSwapChain::getLastCompletedPresentId() const {
++        return lastCompletedPresentId;
++    }
++
+     uint32_t VulkanSwapChain::getRefreshRate() const {
+         VkRefreshCycleDurationGOOGLE refreshCycle = {};
+         VkResult res = vkGetRefreshCycleDurationGOOGLE(commandQueue->device->vk, vk, &refreshCycle);
+@@ -2485,6 +2735,14 @@ namespace plume {
+             return false;
+         }
+ 
++        // FIFO reacquisition waits for the presentation engine to release the image.
++        if (*textureIndex < imagePresentIds.size()) {
++            lastCompletedPresentId = std::max(
++                lastCompletedPresentId,
++                imagePresentIds[*textureIndex]
++            );
++        }
++
+         return true;
+     }
+ 
+@@ -3554,6 +3815,25 @@ namespace plume {
+         device->queueFamilies[familyIndex].remove(this);
+     }
+ 
++    bool VulkanCommandQueue::sharesNativeQueue(
++        const RenderCommandQueue *other) const {
++        const VulkanCommandQueue *otherQueue =
++            dynamic_cast<const VulkanCommandQueue *>(other);
++        return (otherQueue != nullptr) && (queue == otherQueue->queue);
++    }
++
++    uint32_t VulkanCommandQueue::getNativeQueueFamilyIndex() const {
++        return familyIndex;
++    }
++
++    uint32_t VulkanCommandQueue::getNativeQueueIndex() const {
++        return queueIndex;
++    }
++
++    uint32_t VulkanCommandQueue::getNativeQueueCount() const {
++        return uint32_t(device->queueFamilies[familyIndex].queues.size());
++    }
++
+     std::unique_ptr<RenderCommandList> VulkanCommandQueue::createCommandList() {
+         return std::make_unique<VulkanCommandList>(this);
+     }
+@@ -3569,9 +3849,11 @@ namespace plume {
+         thread_local std::vector<VkSemaphore> waitSemaphoreVector;
+         thread_local std::vector<VkSemaphore> signalSemaphoreVector;
+         thread_local std::vector<VkCommandBuffer> commandBuffers;
++        thread_local std::vector<VkPipelineStageFlags> waitStageVector;
+         waitSemaphoreVector.clear();
+         signalSemaphoreVector.clear();
+         commandBuffers.clear();
++        waitStageVector.clear();
+ 
+         for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
+             VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(waitSemaphores[i]);
+@@ -3595,11 +3877,15 @@ namespace plume {
+         submitInfo.pCommandBuffers = commandBuffers.data();
+         submitInfo.commandBufferCount = uint32_t(commandBuffers.size());
+ 
+-        const VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+         if (!waitSemaphoreVector.empty()) {
++            // Wait every semaphore before any transfer, compute, or graphics work.
++            waitStageVector.assign(
++                waitSemaphoreVector.size(),
++                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
++            );
+             submitInfo.pWaitSemaphores = waitSemaphoreVector.data();
+             submitInfo.waitSemaphoreCount = uint32_t(waitSemaphoreVector.size());
+-            submitInfo.pWaitDstStageMask = &waitStages;
++            submitInfo.pWaitDstStageMask = waitStageVector.data();
+         }
+ 
+         if (!signalSemaphoreVector.empty()) {
+@@ -4049,6 +4339,8 @@ namespace plume {
+             return;
+         }
+ 
++        initializePipelineCache();
++
+         for (uint32_t i = 0; i < queueFamilyCount; i++) {
+             for (uint32_t j = 0; j < queueFamilies[i].queues.size(); j++) {
+                 vkGetDeviceQueue(vk, i, j, &queueFamilies[i].queues[j].vk);
+@@ -4423,6 +4715,95 @@ namespace plume {
+         }
+     }
+ 
++    void VulkanDevice::initializePipelineCache() {
++#   if defined(_WIN32)
++        const wchar_t *configuredPath = _wgetenv(L"RT64_VULKAN_PIPELINE_CACHE");
++#   else
++        const char *configuredPath = std::getenv("RT64_VULKAN_PIPELINE_CACHE");
++#   endif
++        if ((configuredPath != nullptr) && (configuredPath[0] != 0)) {
++            pipelineCachePath = std::filesystem::path(configuredPath);
++        }
++
++        constexpr uint64_t MaxPipelineCacheBytes = 64ULL * 1024ULL * 1024ULL;
++        std::vector<uint8_t> initialData;
++        if (!pipelineCachePath.empty()) {
++            std::ifstream input(pipelineCachePath, std::ios::binary | std::ios::ate);
++            if (input) {
++                const std::streamoff size = input.tellg();
++                if ((size > 0) && (static_cast<uint64_t>(size) <= MaxPipelineCacheBytes)) {
++                    initialData.resize(static_cast<size_t>(size));
++                    input.seekg(0, std::ios::beg);
++                    if (!input.read(reinterpret_cast<char *>(initialData.data()), size)) {
++                        initialData.clear();
++                    }
++                }
++            }
++        }
++
++        VkPipelineCacheCreateInfo createInfo = {};
++        createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++        createInfo.initialDataSize = initialData.size();
++        createInfo.pInitialData = initialData.empty() ? nullptr : initialData.data();
++        VkResult res = vkCreatePipelineCache(vk, &createInfo, nullptr, &pipelineCache);
++        if ((res != VK_SUCCESS) && !initialData.empty()) {
++            createInfo.initialDataSize = 0;
++            createInfo.pInitialData = nullptr;
++            res = vkCreatePipelineCache(vk, &createInfo, nullptr, &pipelineCache);
++        }
++
++        if (res != VK_SUCCESS) {
++            pipelineCache = VK_NULL_HANDLE;
++            fprintf(stderr, "vkCreatePipelineCache failed with error code 0x%X.\n", res);
++        }
++    }
++
++    void VulkanDevice::savePipelineCache() {
++        if ((pipelineCache == VK_NULL_HANDLE) || pipelineCachePath.empty()) {
++            return;
++        }
++
++        const std::lock_guard cacheLock(pipelineCacheMutex);
++        size_t dataSize = 0;
++        VkResult res = vkGetPipelineCacheData(vk, pipelineCache, &dataSize, nullptr);
++        if ((res != VK_SUCCESS) || (dataSize == 0)) {
++            return;
++        }
++
++        std::vector<uint8_t> data(dataSize);
++        res = vkGetPipelineCacheData(vk, pipelineCache, &dataSize, data.data());
++        if ((res != VK_SUCCESS) || (dataSize == 0)) {
++            return;
++        }
++        data.resize(dataSize);
++
++        std::error_code error;
++        const std::filesystem::path parent = pipelineCachePath.parent_path();
++        if (!parent.empty()) {
++            std::filesystem::create_directories(parent, error);
++            if (error) {
++                return;
++            }
++        }
++
++        std::filesystem::path temporaryPath = pipelineCachePath;
++        temporaryPath += ".tmp";
++        {
++            std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
++            if (!output.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()))) {
++                return;
++            }
++        }
++
++        std::filesystem::rename(temporaryPath, pipelineCachePath, error);
++        if (error) {
++            error.clear();
++            std::filesystem::remove(pipelineCachePath, error);
++            error.clear();
++            std::filesystem::rename(temporaryPath, pipelineCachePath, error);
++        }
++    }
++
+     void VulkanDevice::release() {
+         nullBuffer = nullptr; // force destruction before destroying allocator
+ 
+@@ -4432,6 +4813,11 @@ namespace plume {
+         }
+ 
+         if (vk != VK_NULL_HANDLE) {
++            savePipelineCache();
++            if (pipelineCache != VK_NULL_HANDLE) {
++                vkDestroyPipelineCache(vk, pipelineCache, nullptr);
++                pipelineCache = VK_NULL_HANDLE;
++            }
+             vkDestroyDevice(vk, nullptr);
+             vk = VK_NULL_HANDLE;
+         }
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 0a1edbe..19a4c9a 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -9,6 +9,7 @@
+ 
+ #include "plume_render_interface.h"
+ 
++#include <filesystem>
+ #include <mutex>
+ #include <set>
+ #include <unordered_map>
+@@ -238,18 +239,22 @@ namespace plume {
+         VkPresentModeKHR requiredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+         VkCompositeAlphaFlagBitsKHR pickedAlphaFlag = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+         std::vector<VulkanTexture> textures;
++        std::vector<uint64_t> imagePresentIds;
+         uint64_t currentPresentId = 0;
++        uint64_t lastCompletedPresentId = 0;
++        uint32_t currentPresentationTimingId = 0;
+         bool immediatePresentModeSupported = false;
+         bool mailboxPresentModeSupported = false;
+ 
+         VulkanSwapChain(VulkanCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
+         ~VulkanSwapChain() override;
+         bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override;
+-        void wait() override;
++        bool wait(uint32_t timeoutMilliseconds) override;
+         bool resize() override;
+         bool needsResize() const override;
+         void setVsyncEnabled(bool vsyncEnabled) override;
+         bool isVsyncEnabled() const override;
++        const char *getPresentModeName() const override;
+         uint32_t getWidth() const override;
+         uint32_t getHeight() const override;
+         RenderTexture *getTexture(uint32_t textureIndex) override;
+@@ -257,6 +262,13 @@ namespace plume {
+         bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
++        uint32_t getLastPresentationTimingId() const override;
++        uint32_t consumePresentationTimings(
++            RenderPresentationTiming *timings,
++            uint32_t capacity
++        ) override;
++        uint64_t getLastPresentId() const override;
++        uint64_t getLastCompletedPresentId() const override;
+         uint32_t getRefreshRate() const override;
+         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+         void releaseSwapChain();
+@@ -373,6 +385,11 @@ namespace plume {
+ 
+         VulkanCommandQueue(VulkanDevice *device, RenderCommandListType type);
+         ~VulkanCommandQueue() override;
++        bool sharesNativeQueue(
++            const RenderCommandQueue *other) const override;
++        uint32_t getNativeQueueFamilyIndex() const override;
++        uint32_t getNativeQueueIndex() const override;
++        uint32_t getNativeQueueCount() const override;
+         std::unique_ptr<RenderCommandList> createCommandList() override;
+         std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) override;
+         void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) override;
+@@ -404,6 +421,9 @@ namespace plume {
+ 
+     struct VulkanDevice : RenderDevice {
+         VkDevice vk = VK_NULL_HANDLE;
++        VkPipelineCache pipelineCache = VK_NULL_HANDLE;
++        std::mutex pipelineCacheMutex;
++        std::filesystem::path pipelineCachePath;
+         VulkanInterface *renderInterface = nullptr;
+         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+         VkPhysicalDeviceProperties physicalDeviceProperties = {};
+@@ -442,6 +462,8 @@ namespace plume {
+         const RenderDeviceCapabilities &getCapabilities() const override;
+         const RenderDeviceDescription &getDescription() const override;
+         RenderSampleCounts getSampleCountsSupported(RenderFormat format) const override;
++        void initializePipelineCache();
++        void savePipelineCache();
+         void release();
+         bool isValid() const;
+         bool beginCapture() override;

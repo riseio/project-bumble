@@ -1,0 +1,185 @@
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index cc6da77..1c86d4a 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -9,6 +9,8 @@
+ #include "Depth.hlsli"
+ #include "FbRendererCommon.hlsli"
+ #include "Library.hlsli"
++#include "BumbleSurfaceFog.hlsli"
++#include "BumbleShadowReceiver.hlsli"
+ #include "Random.hlsli"
+ #include "TextureSampler.hlsli"
+ 
+@@ -69,6 +71,8 @@ float bumbleShadowMapCoverage(float2 shadowUv) {
+ float sampleBumbleDirectionalShadow(
+     float4 shadowClip,
+     float4 dynamicShadowClip,
++    float2 shadowDepthGradient,
++    float2 dynamicDepthGradient,
+     float surfaceLightReception
+ ) {
+     if (FbParams.modernShadowParams.x < 0.5f) {
+@@ -85,17 +89,12 @@ float sampleBumbleDirectionalShadow(
+         if (shadowDepth > 0.0f && shadowDepth < 1.0f &&
+             all(shadowUv > 0.0f) && all(shadowUv < 1.0f)) {
+             const float inverseResolution = FbParams.modernShadowParams.y;
+-            // GatherCmp replaces four depth comparisons; offset half a texel to center the footprint.
+-            const float4 staticComparisons =
+-                gBumbleShadowMap.GatherCmp(
+-                    gBumbleShadowComparisonSampler,
+-                    shadowUv + inverseResolution * 0.5f,
+-                    shadowDepth - receiverBias
+-                );
+-            const float filteredStaticVisibility = dot(
+-                staticComparisons,
+-                float4(0.25f, 0.25f, 0.25f, 0.25f)
+-            );
++            // Compare each gathered texel against the receiver plane at that texel.
++            const float4 depths = gBumbleShadowMap.Gather(
++                gNearestClampClampSampler, shadowUv);
++            const float filteredStaticVisibility = bumbleShadowReceiverVisibility(
++                depths, shadowClip.xyz, inverseResolution.xx,
++                shadowDepthGradient, receiverBias, false);
+             staticVisibility = lerp(
+                 1.0f,
+                 filteredStaticVisibility,
+@@ -117,13 +111,15 @@ float sampleBumbleDirectionalShadow(
+         const float dynamicDepth = dynamicShadowClip.z;
+         if (dynamicDepth > 0.0f && dynamicDepth < 1.0f &&
+             all(dynamicUv > 0.0f) && all(dynamicUv < 1.0f)) {
++            uint dynamicWidth, dynamicHeight;
++            gBumbleDynamicShadowMap.GetDimensions(dynamicWidth, dynamicHeight);
++            const float4 depths = gBumbleDynamicShadowMap.Gather(
++                gNearestClampClampSampler, dynamicUv);
+             dynamicVisibility = lerp(
+                 1.0f,
+-                gBumbleDynamicShadowMap.SampleCmpLevelZero(
+-                    gBumbleShadowComparisonSampler,
+-                    dynamicUv,
+-                    dynamicDepth - receiverBias
+-                ),
++                bumbleShadowReceiverVisibility(depths, dynamicShadowClip.xyz,
++                    rcp(float2(dynamicWidth, dynamicHeight)),
++                    dynamicDepthGradient, receiverBias, true),
+                 bumbleShadowMapCoverage(dynamicUv)
+             );
+         }
+@@ -411,6 +407,10 @@ LIBRARY_EXPORT bool RasterPS(
+     // Keep derivatives outside the per-pixel shoreline rejection below.
+     const float3 waterDdx = ddx(vertexWorldPosition);
+     const float3 waterDdy = ddy(vertexWorldPosition);
++    const float2 shadowDepthGradient = bumbleShadowDepthGradient(
++        ddx(vertexShadowPosition.xyz), ddy(vertexShadowPosition.xyz));
++    const float2 dynamicDepthGradient = bumbleShadowDepthGradient(
++        ddx(vertexDynamicShadowPosition.xyz), ddy(vertexDynamicShadowPosition.xyz));
+     int2 pixelPosSeed = floor(vertexPosition.xy);
+     uint randomSeed = initRand(FrParams.frameCount, instanceIndex * pixelPosSeed.y * pixelPosSeed.x, 16); // TODO: Review seed.
+ 
+@@ -614,7 +614,9 @@ LIBRARY_EXPORT bool RasterPS(
+         (otherMode.alphaCompare() == G_AC_NONE) &&
+         !otherMode.cvgXAlpha() &&
+         !alphaBlend;
+-    // Preserve RT64's standard N64 fog blender cycle.
++    // Keep atmosphere out of the material lighting calculation.
++    const bool deferredSurfaceFog = modernWorldSurface &&
++        bumbleCanDeferSurfaceFog(otherMode, rp.flags);
+     Blender::Inputs blInputs;
+     blInputs.blendColor = instanceRDPParams[instanceIndex].blendColor;
+     blInputs.fogColor = instanceRDPParams[instanceIndex].fogColor;
+@@ -626,7 +627,7 @@ LIBRARY_EXPORT bool RasterPS(
+         rp.flags,
+         blInputs,
+         combinerColor,
+-        false
++        deferredSurfaceFog
+     );
+     resultAlpha = 1.0f;
+     // Preserve the game-authored combiner result as the albedo reference for the modern grade.
+@@ -715,6 +716,8 @@ LIBRARY_EXPORT bool RasterPS(
+                 waterShadowVisibility = sampleBumbleDirectionalShadow(
+                     vertexShadowPosition,
+                     vertexDynamicShadowPosition,
++                    shadowDepthGradient,
++                    dynamicDepthGradient,
+                     dot(geometricSurfaceNormal, lightDirection)
+                 );
+             }
+@@ -1131,6 +1134,8 @@ LIBRARY_EXPORT bool RasterPS(
+             shadowVisibility = sampleBumbleDirectionalShadow(
+                 vertexShadowPosition,
+                 vertexDynamicShadowPosition,
++                shadowDepthGradient,
++                dynamicDepthGradient,
+                 directReception
+             );
+         }
+@@ -1228,4 +1233,9 @@ LIBRARY_EXPORT bool RasterPS(
+             resultColor.rgb * daylightHeadroomGain
+         );
+ 
++        if (deferredSurfaceFog) {
++            resultColor.rgb = bumbleComposeSurfaceFog(otherMode, rp.flags,
++                blInputs, resultColor.rgb, combinerColor.a);
++        }
++
+         // Development-only visibility modes selected through BUMBLE_SHADOW_DEBUG_MODE.
+diff --git a/src/shaders/BumbleSurfaceFog.hlsli b/src/shaders/BumbleSurfaceFog.hlsli
+new file mode 100644
+--- /dev/null
++++ b/src/shaders/BumbleSurfaceFog.hlsli
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include "shared/rt64_blender.h"
++
++// Only separate the standard atmospheric cycle from an opaque material.
++bool bumbleCanDeferSurfaceFog(OtherMode mode, RenderFlags flags) {
++    return mode.cycleType() == G_CYC_2CYCLE && !mode.forceBlend() &&
++        renderBlenderApproximation(flags) == 0 &&
++        Blender::usesStandardFogCycle(mode.blenderInputs(), 0) &&
++        Blender::decodeInputP(mode.blenderInputs(), true) == Blender::PM_CC_OR_BLENDER;
++}
++
++float3 bumbleComposeSurfaceFog(OtherMode mode, RenderFlags flags,
++    Blender::Inputs inputs, float3 litSurface, float combinerAlpha) {
++    // Use the native blender to preserve rounding and overflow.
++    return Blender::run(mode, flags, inputs, float4(litSurface, combinerAlpha), false).rgb;
++}
+
+diff --git a/src/shaders/BumbleShadowReceiver.hlsli b/src/shaders/BumbleShadowReceiver.hlsli
+new file mode 100644
+--- /dev/null
++++ b/src/shaders/BumbleShadowReceiver.hlsli
+@@ -0,0 +1,31 @@
++#pragma once
++
++float2 bumbleShadowDepthGradient(float3 dx, float3 dy) {
++    const float determinant = dx.x * dy.y - dx.y * dy.x;
++    const float scale = abs(dx.x * dy.y) + abs(dx.y * dy.x);
++    if (abs(determinant) <= max(scale * 1.0e-6f, 1.0e-30f)) {
++        return 0.0f;
++    }
++    return float2(dy.y * dx.z - dx.y * dy.z,
++        dx.x * dy.z - dy.x * dx.z) / determinant;
++}
++
++float bumbleShadowReceiverVisibility(float4 depths, float3 coordinate,
++    float2 inverseSize, float2 depthGradient, float bias, bool bilinear) {
++    const float2 fraction = frac(coordinate.xy / inverseSize - 0.5f);
++    // HLSL Gather order: lower-left, lower-right, upper-right, upper-left.
++    const float4 offsetX = clamp(coordinate.x +
++        (float4(0, 1, 1, 0) - fraction.x) * inverseSize.x,
++        inverseSize.x * 0.5f, 1.0f - inverseSize.x * 0.5f) - coordinate.x;
++    const float4 offsetY = clamp(coordinate.y +
++        (float4(1, 1, 0, 0) - fraction.y) * inverseSize.y,
++        inverseSize.y * 0.5f, 1.0f - inverseSize.y * 0.5f) - coordinate.y;
++    const float4 references = coordinate.z - bias +
++        depthGradient.x * offsetX + depthGradient.y * offsetY;
++    const float4 visible = float4(references <= depths);
++    if (bilinear) {
++        return lerp(lerp(visible.w, visible.z, fraction.x),
++            lerp(visible.x, visible.y, fraction.x), fraction.y);
++    }
++    return dot(visible, 0.25f.xxxx);
++}

@@ -1,0 +1,216 @@
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -12,6 +12,7 @@
+ #include <stdexcept>
+ 
+ #include "plume_render_interface_types.h"
++#include "plume_clock_calibration.h"
+ #include "plume_query_read_state.h"
+ 
+ namespace plume {
+@@ -301,5 +302,10 @@
+     };
+ 
+     struct RenderCommandQueue {
++        // Explicit diagnostics only; implementations do not wait for GPU work.
++        virtual bool getProfileClockCalibration(ProfileClockCalibration &sample) {
++            sample = {};
++            return false;
++        }
+         virtual ~RenderCommandQueue() { }
+         // Queue topology is diagnostic information.
+diff --git a/plume_clock_calibration.h b/plume_clock_calibration.h
+new file mode 100644
+--- /dev/null
++++ b/plume_clock_calibration.h
+@@ -0,0 +1,38 @@
++#pragma once
++#include <cstdint>
++#include <cmath>
++
++namespace plume {
++    enum class ProfileHostClock : uint32_t { Unknown, QueryPerformanceCounter, Monotonic };
++
++    struct ProfileClockCalibration {
++        uint64_t gpuNanoseconds = 0;
++        uint64_t hostTicks = 0;
++        uint64_t hostFrequency = 0;
++        uint64_t maximumDeviationNanoseconds = 0;
++        bool maximumDeviationKnown = false;
++        uint32_t timestampValidBits = 0;
++        uint64_t gpuWrapNanoseconds = 0;
++        ProfileHostClock hostClock = ProfileHostClock::Unknown;
++        // Existing Vulkan query results use a fixed-point period.
++        double queryScaleErrorPartsPerBillion = 0;
++    };
++
++    inline bool profileVulkanNanoseconds(uint64_t ticks, double period, uint64_t &nanoseconds) {
++        if (!(period >= 1.0 / 65536.0 && period < 281474976710656.0)) return false;
++        const uint64_t factor = uint64_t(period * 65536.0);
++        const uint64_t u1 = ticks & 0xffffffff, v1 = factor & 0xffffffff;
++        uint64_t t = u1 * v1;
++        const uint64_t w3 = t & 0xffffffff;
++        uint64_t k = t >> 32;
++        t = (ticks >> 32) * v1 + k;
++        k = t & 0xffffffff;
++        const uint64_t w1 = t >> 32;
++        t = u1 * (factor >> 32) + k;
++        const uint64_t high = (ticks >> 32) * (factor >> 32) + w1 + (t >> 32);
++        const uint64_t low = (t << 32) + w3;
++        if ((high >> 16) != 0) return false;
++        nanoseconds = (low >> 16) | (high << 48);
++        return true;
++    }
++}
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -387,6 +387,7 @@
+ 
+         VulkanCommandQueue(VulkanDevice *device, RenderCommandListType type);
+         ~VulkanCommandQueue() override;
++        bool getProfileClockCalibration(ProfileClockCalibration &sample) override;
+         bool sharesNativeQueue(
+             const RenderCommandQueue *other) const override;
+         uint32_t getNativeQueueFamilyIndex() const override;
+@@ -422,6 +423,7 @@
+     };
+ 
+     struct VulkanDevice : RenderDevice {
++        uint32_t profileCalibrationExtension = 0;
+         VkDevice vk = VK_NULL_HANDLE;
+         VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+         std::mutex pipelineCacheMutex;
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -76,6 +76,10 @@
+     };
+     
+     static const std::unordered_set<std::string> OptionalDeviceExtensions = {
++        VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
++#if defined(VK_KHR_calibrated_timestamps)
++        VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
++#endif
+         VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
+         VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME,
+         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+@@ -3971,6 +3975,64 @@
+         return uint32_t(device->queueFamilies[familyIndex].queues.size());
+     }
+ 
++    bool VulkanCommandQueue::getProfileClockCalibration(ProfileClockCalibration &sample) {
++        sample = {};
++        if (!device->profileCalibrationExtension) return false;
++        const bool khr = device->profileCalibrationExtension == 2;
++        const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT>(
++            vkGetInstanceProcAddr(device->renderInterface->instance,
++                khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
++        const auto timestamps = reinterpret_cast<PFN_vkGetCalibratedTimestampsEXT>(
++            vkGetDeviceProcAddr(device->vk, khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT"));
++        if (!domains || !timestamps) return false;
++        // Tiny fixed arrays: never allocate or retry on a game worker.
++        VkTimeDomainEXT available[16] = {};
++        uint32_t count = 16;
++        if (domains(device->physicalDevice, &count, available) != VK_SUCCESS) return false;
++#ifdef _WIN32
++        constexpr auto hostDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
++        LARGE_INTEGER frequency;
++        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) return false;
++        sample.hostClock = ProfileHostClock::QueryPerformanceCounter;
++        sample.hostFrequency = uint64_t(frequency.QuadPart);
++#else
++        constexpr auto hostDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
++        sample.hostClock = ProfileHostClock::Monotonic;
++        sample.hostFrequency = 1000000000;
++#endif
++        bool host = false, gpu = false;
++        for (uint32_t i = 0; i < count; ++i) {
++            host |= available[i] == hostDomain;
++            gpu |= available[i] == VK_TIME_DOMAIN_DEVICE_EXT;
++        }
++        if (!host || !gpu) return false;
++        VkQueueFamilyProperties families[32] = {};
++        uint32_t familyCount = 32;
++        vkGetPhysicalDeviceQueueFamilyProperties(device->physicalDevice, &familyCount, families);
++        if (familyIndex >= familyCount || familyIndex >= 32) return false;
++        sample.timestampValidBits = families[familyIndex].timestampValidBits;
++        if (!sample.timestampValidBits || sample.timestampValidBits > 64) return false;
++        VkCalibratedTimestampInfoEXT info[2] = {};
++        info[0].sType = info[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
++        info[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
++        info[1].timeDomain = hostDomain;
++        uint64_t values[2] = {}, deviation = 0;
++        if (timestamps(device->vk, 2, info, values, &deviation) != VK_SUCCESS || !deviation) return false;
++        const double period = device->physicalDeviceProperties.limits.timestampPeriod;
++        if (sample.timestampValidBits < 64) {
++            const uint64_t wrapTicks = uint64_t(1) << sample.timestampValidBits;
++            values[0] &= wrapTicks - 1;
++            if (!profileVulkanNanoseconds(wrapTicks, period, sample.gpuWrapNanoseconds)) return false;
++        }
++        if (!profileVulkanNanoseconds(values[0], period, sample.gpuNanoseconds)) return false;
++        const double effectivePeriod = double(uint64_t(period * 65536.0)) / 65536.0;
++        sample.queryScaleErrorPartsPerBillion = (period / effectivePeriod - 1.0) * 1000000000.0;
++        sample.hostTicks = values[1];
++        sample.maximumDeviationKnown = true;
++        sample.maximumDeviationNanoseconds = deviation;
++        return true;
++    }
++
+     std::unique_ptr<RenderCommandList> VulkanCommandQueue::createCommandList() {
+         return std::make_unique<VulkanCommandList>(this);
+     }
+@@ -4452,6 +4514,10 @@
+             }
+         }
+ 
++        profileCalibrationExtension = supportedOptionalExtensions.count(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? 1 : 0;
++#if defined(VK_KHR_calibrated_timestamps)
++        if (supportedOptionalExtensions.count(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) profileCalibrationExtension = 2;
++#endif
+         std::vector<const char *> enabledExtensions;
+         for (const std::string &extension : RequiredDeviceExtensions) {
+             enabledExtensions.push_back(extension.c_str());
+diff --git a/plume_d3d12.h b/plume_d3d12.h
+--- a/plume_d3d12.h
++++ b/plume_d3d12.h
+@@ -267,6 +267,7 @@
+ 
+         D3D12CommandQueue(D3D12Device *device, RenderCommandListType type);
+         ~D3D12CommandQueue() override;
++        bool getProfileClockCalibration(ProfileClockCalibration &sample) override;
+         std::unique_ptr<RenderCommandList> createCommandList() override;
+         std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) override;
+         void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) override;
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -2794,6 +2794,27 @@
+         }
+     }
+ 
++    bool D3D12CommandQueue::getProfileClockCalibration(ProfileClockCalibration &sample) {
++        sample = {};
++        UINT64 gpuTicks = 0, hostTicks = 0, frequency = 0;
++        LARGE_INTEGER hostFrequency;
++        if (FAILED(d3d->GetTimestampFrequency(&frequency)) || !frequency ||
++                frequency != device->timestampFrequency ||
++                FAILED(d3d->GetClockCalibration(&gpuTicks, &hostTicks)) ||
++                !QueryPerformanceFrequency(&hostFrequency) || hostFrequency.QuadPart <= 0) return false;
++        // Same conversion as the owning D3D12 query pool.
++        const double nanoseconds = double(gpuTicks) / double(frequency) * 1000000000.0;
++        if (!(nanoseconds >= 0.0 && nanoseconds < 18446744073709551616.0)) return false;
++        sample.gpuNanoseconds = uint64_t(nanoseconds);
++        sample.hostTicks = hostTicks;
++        sample.hostFrequency = uint64_t(hostFrequency.QuadPart);
++        sample.hostClock = ProfileHostClock::QueryPerformanceCounter;
++        sample.timestampValidBits = 64;
++        // GetClockCalibration provides no maximum-deviation estimate.
++        sample.maximumDeviationKnown = false;
++        return true;
++    }
++
+     std::unique_ptr<RenderCommandList> D3D12CommandQueue::createCommandList() {
+         return std::make_unique<D3D12CommandList>(this);
+     }

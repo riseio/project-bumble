@@ -1,0 +1,272 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index 92844f7..49eb263 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -927,7 +927,7 @@ namespace plume {
+ 
+     // D3D12DescriptorSet
+ 
+-    D3D12DescriptorSet::D3D12DescriptorSet(D3D12Device *device, const RenderDescriptorSetDesc &desc) {
++    D3D12DescriptorSet::D3D12DescriptorSet(D3D12Device *device, const RenderDescriptorSetDesc &desc) : RenderDescriptorSet(desc) {
+         assert(device != nullptr);
+ 
+         this->device = device;
+@@ -964,7 +964,7 @@ namespace plume {
+ 
+         if (desc.lastRangeIsBoundless) {
+             const RenderDescriptorRange &lastDescriptorRange = desc.descriptorRanges[desc.descriptorRangesCount - 1];
+-            addDescriptor(lastDescriptorRange, desc.boundlessRangeSize);
++            addDescriptor(lastDescriptorRange, std::max(desc.boundlessRangeSize, 1U));
+         }
+ 
+         if (!descriptorTypes.empty()) {
+@@ -990,6 +990,7 @@ namespace plume {
+ 
+             samplerAllocation.count = samplerDescriptorCount;
+         }
++        allocationReady = true;
+     }
+ 
+     D3D12DescriptorSet::~D3D12DescriptorSet() {
+@@ -1003,6 +1004,7 @@ namespace plume {
+     }
+ 
+     void D3D12DescriptorSet::setBuffer(uint32_t descriptorIndex, const RenderBuffer *buffer, uint64_t bufferSize, const RenderBufferStructuredView *bufferStructuredView, const RenderBufferFormattedView *bufferFormattedView) {
++        validateWrite(descriptorIndex, WriteKind::Buffer);
+         const D3D12Buffer *interfaceBuffer = static_cast<const D3D12Buffer *>(buffer);
+         ID3D12Resource *nativeResource = (interfaceBuffer != nullptr) ? interfaceBuffer->d3d : nullptr;
+         uint32_t descriptorIndexClamped = std::min(descriptorIndex, descriptorTypeMaxIndex);
+@@ -1132,6 +1134,7 @@ namespace plume {
+     }
+ 
+     void D3D12DescriptorSet::setTexture(uint32_t descriptorIndex, const RenderTexture *texture, const RenderTextureLayout textureLayout, const RenderTextureView *textureView) {
++        validateWrite(descriptorIndex, WriteKind::Texture);
+         // Texture state is ignored by D3D12 because image layout information is not required.
+ 
+         const D3D12Texture *interfaceTexture = static_cast<const D3D12Texture *>(texture);
+@@ -1288,6 +1291,7 @@ namespace plume {
+     }
+ 
+     void D3D12DescriptorSet::setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) {
++        validateWrite(descriptorIndex, WriteKind::Sampler);
+         if (sampler != nullptr) {
+             const D3D12Sampler *interfaceSampler = static_cast<const D3D12Sampler *>(sampler);
+             uint32_t descriptorIndexClamped = std::min(descriptorIndex, descriptorTypeMaxIndex);
+@@ -1299,6 +1303,7 @@ namespace plume {
+     }
+ 
+     void D3D12DescriptorSet::setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) {
++        validateWrite(descriptorIndex, WriteKind::AccelerationStructure);
+         const D3D12AccelerationStructure *interfaceAccelerationStructure = static_cast<const D3D12AccelerationStructure *>(accelerationStructure);
+         uint32_t descriptorIndexClamped = std::min(descriptorIndex, descriptorTypeMaxIndex);
+         RenderDescriptorRangeType descriptorType = descriptorTypes[descriptorIndexClamped];
+@@ -3754,6 +3759,9 @@ namespace plume {
+     // D3D12PipelineLayout
+ 
+     D3D12PipelineLayout::D3D12PipelineLayout(D3D12Device *device, const RenderPipelineLayoutDesc &desc) {
++        for (uint32_t i = 0; i < desc.descriptorSetDescsCount; i++) {
++            RenderDescriptorSet::validateDescription(desc.descriptorSetDescs[i]);
++        }
+         assert(device != nullptr);
+ 
+         this->device = device;
+@@ -4218,7 +4226,9 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderDescriptorSet> D3D12Device::createDescriptorSet(const RenderDescriptorSetDesc &desc) {
+-        return std::make_unique<D3D12DescriptorSet>(this, desc);
++        auto set = std::make_unique<D3D12DescriptorSet>(this, desc);
++        if (!set->allocationReady) throw std::runtime_error("Plume descriptor allocation failed");
++        return set;
+     }
+ 
+     std::unique_ptr<RenderShader> D3D12Device::createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
+diff --git a/plume_metal.cpp b/plume_metal.cpp
+index 8b86748..4fe6899 100644
+--- a/plume_metal.cpp
++++ b/plume_metal.cpp
+@@ -1624,7 +1624,7 @@ namespace plume {
+ 
+     // MetalDescriptorSet
+ 
+-    MetalDescriptorSet::MetalDescriptorSet(MetalDevice *device, const RenderDescriptorSetDesc &desc) {
++    MetalDescriptorSet::MetalDescriptorSet(MetalDevice *device, const RenderDescriptorSetDesc &desc) : RenderDescriptorSet(desc) {
+         assert(device != nullptr);
+ 
+         this->device = device;
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index bc8a3d8..2daeba6 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -8,6 +8,8 @@
+ #pragma once
+ 
+ #include <climits>
++#include <algorithm>
++#include <stdexcept>
+ 
+ #include "plume_render_interface_types.h"
+ 
+@@ -85,6 +87,72 @@ namespace plume {
+     };
+ 
+     struct RenderDescriptorSet {
++        enum class WriteKind : uint8_t { Buffer, Texture, Sampler, AccelerationStructure, Immutable };
++
++        // Validate before native layout/allocation work.
++        static uint32_t validateDescription(const RenderDescriptorSetDesc &desc) {
++            if ((desc.descriptorRangesCount && !desc.descriptorRanges) ||
++                (desc.lastRangeIsBoundless && !desc.descriptorRangesCount)) {
++                throw std::invalid_argument("Plume descriptor ranges are missing");
++            }
++            uint64_t declared = 0, allocated = 0;
++            for (uint32_t i = 0; i < desc.descriptorRangesCount; i++) {
++                const auto &range = desc.descriptorRanges[i];
++                if (!range.count || range.type <= RenderDescriptorRangeType::UNKNOWN ||
++                    range.type > RenderDescriptorRangeType::ACCELERATION_STRUCTURE) {
++                    throw std::invalid_argument("Plume invalid descriptor range");
++                }
++                const bool variable = desc.lastRangeIsBoundless && i == desc.descriptorRangesCount - 1;
++                const uint32_t count = variable ? std::max(desc.boundlessRangeSize, 1U) : range.count;
++                if (count > range.count || (variable && range.immutableSampler)) {
++                    throw std::invalid_argument("Plume descriptor allocation exceeds layout");
++                }
++                if (range.immutableSampler) {
++                    if (range.type != RenderDescriptorRangeType::SAMPLER)
++                        throw std::invalid_argument("Plume immutable resource is not a sampler");
++                    for (uint32_t s = 0; s < range.count; ++s)
++                        if (!range.immutableSampler[s]) throw std::invalid_argument("Plume immutable sampler is null");
++                }
++                declared += range.count;
++                allocated += count;
++                if (declared > UINT32_MAX || allocated > UINT32_MAX) {
++                    throw std::invalid_argument("Plume descriptor count overflow");
++                }
++            }
++            return uint32_t(allocated);
++        }
++
++        explicit RenderDescriptorSet(const RenderDescriptorSetDesc &desc) {
++            writeKinds.reserve(validateDescription(desc));
++            for (uint32_t i = 0; i < desc.descriptorRangesCount; i++) {
++                const auto &range = desc.descriptorRanges[i];
++                WriteKind kind = WriteKind::Buffer;
++                switch (range.type) {
++                case RenderDescriptorRangeType::TEXTURE:
++                case RenderDescriptorRangeType::READ_WRITE_TEXTURE: kind = WriteKind::Texture; break;
++                case RenderDescriptorRangeType::SAMPLER: kind = WriteKind::Sampler; break;
++                case RenderDescriptorRangeType::ACCELERATION_STRUCTURE: kind = WriteKind::AccelerationStructure; break;
++                default: break;
++                }
++                if (range.immutableSampler) kind = WriteKind::Immutable;
++                const uint32_t count = desc.lastRangeIsBoundless && i == desc.descriptorRangesCount - 1
++                    ? std::max(desc.boundlessRangeSize, 1U) : range.count;
++                writeKinds.insert(writeKinds.end(), count, kind);
++            }
++        }
++
++        // One bounds comparison and byte lookup per write, including Release.
++        void validateWrite(uint32_t index, WriteKind kind) const {
++            if (index >= writeKinds.size()) throw std::out_of_range("Plume descriptor write exceeds allocation");
++            if (writeKinds[index] != kind) throw std::invalid_argument("Plume incompatible descriptor write");
++            if (!allocationReady) throw std::runtime_error("Plume descriptor allocation failed");
++        }
++        bool allocationReady = false;
++
++    private:
++        std::vector<WriteKind> writeKinds;
++
++    public:
+         // Descriptor indices correspond to the index assuming the descriptor set is one contiguous array. They DO NOT correspond to the bindings, which can be sparse.
+         // User code should derive these indices on its own by looking at the order the bindings were assigned during set creation along with the descriptor count and
+         // assume it was all allocated in one contiguous array. This allows efficient mapping between Vulkan and D3D12's descriptor models.
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 8f77ed6..0d27abd 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -1150,6 +1150,7 @@ namespace plume {
+     // VulkanDescriptorSetLayout
+ 
+     VulkanDescriptorSetLayout::VulkanDescriptorSetLayout(VulkanDevice *device, const RenderDescriptorSetDesc &descriptorSetDesc) {
++        RenderDescriptorSet::validateDescription(descriptorSetDesc);
+         assert(device != nullptr);
+ 
+         this->device = device;
+@@ -1229,6 +1230,10 @@ namespace plume {
+     // VulkanPipelineLayout
+ 
+     VulkanPipelineLayout::VulkanPipelineLayout(VulkanDevice *device, const RenderPipelineLayoutDesc &desc) {
++        // Validate the whole schema before allocating any raw child layouts.
++        for (uint32_t i = 0; i < desc.descriptorSetDescsCount; i++) {
++            RenderDescriptorSet::validateDescription(desc.descriptorSetDescs[i]);
++        }
+         assert(device != nullptr);
+ 
+         this->device = device;
+@@ -2014,7 +2019,7 @@ namespace plume {
+ 
+     // VulkanDescriptorSet
+ 
+-    VulkanDescriptorSet::VulkanDescriptorSet(VulkanDevice *device, const RenderDescriptorSetDesc &desc) {
++    VulkanDescriptorSet::VulkanDescriptorSet(VulkanDevice *device, const RenderDescriptorSetDesc &desc) : RenderDescriptorSet(desc) {
+         assert(device != nullptr);
+ 
+         this->device = device;
+@@ -2041,6 +2046,7 @@ namespace plume {
+         }
+ 
+         setLayout = new VulkanDescriptorSetLayout(device, desc);
++        if (setLayout->vk == VK_NULL_HANDLE) return;
+ 
+         descriptorPool = createDescriptorPool(device, typeCounts, desc.lastRangeIsBoundless);
+         if (descriptorPool == VK_NULL_HANDLE) {
+@@ -2067,4 +2073,6 @@ namespace plume {
+             return;
+         }
+ 
++        allocationReady = true;
++
+         // Name Vulkan objects so validation errors identify the failing descriptor.
+@@ -2117,6 +2125,7 @@ namespace plume {
+     }
+     
+     void VulkanDescriptorSet::setBuffer(uint32_t descriptorIndex, const RenderBuffer *buffer, uint64_t bufferSize, const RenderBufferStructuredView *bufferStructuredView, const RenderBufferFormattedView *bufferFormattedView) {
++        validateWrite(descriptorIndex, WriteKind::Buffer);
+         if (buffer == nullptr) {
+             return;
+         }
+@@ -2147,6 +2156,7 @@ namespace plume {
+     }
+ 
+     void VulkanDescriptorSet::setTexture(uint32_t descriptorIndex, const RenderTexture *texture, const RenderTextureLayout textureLayout, const RenderTextureView *textureView) {
++        validateWrite(descriptorIndex, WriteKind::Texture);
+         if (texture == nullptr) {
+             return;
+         }
+@@ -2167,6 +2177,7 @@ namespace plume {
+     }
+ 
+     void VulkanDescriptorSet::setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) {
++        validateWrite(descriptorIndex, WriteKind::Sampler);
+         if (sampler == nullptr) {
+             return;
+         }
+@@ -2178,6 +2189,7 @@ namespace plume {
+     }
+ 
+     void VulkanDescriptorSet::setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) {
++        validateWrite(descriptorIndex, WriteKind::AccelerationStructure);
+         if (accelerationStructure == nullptr) {
+             return;
+         }
+@@ -4562,7 +4574,9 @@ namespace plume {
+     }
+ 
+     std::unique_ptr<RenderDescriptorSet> VulkanDevice::createDescriptorSet(const RenderDescriptorSetDesc &desc) {
+-        return std::make_unique<VulkanDescriptorSet>(this, desc);
++        auto set = std::make_unique<VulkanDescriptorSet>(this, desc);
++        if (!set->allocationReady) throw std::runtime_error("Plume descriptor allocation failed");
++        return set;
+     }
+ 
+     std::unique_ptr<RenderShader> VulkanDevice::createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {

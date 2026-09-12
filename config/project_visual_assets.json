@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "origin": "user_authored",
+  "redistribution_authorized": true,
+  "contains_rom_bytes": false,
+  "contains_rom_derived_assets": false,
+  "assets": [
+    {
+      "id": "menu_background",
+      "path": "NewImages/Background.png",
+      "width": 1672,
+      "height": 941,
+      "sha256": "15aefb07b2bec05ebe5b5d2cfec95556933e4c8c40d368db357180803d27d369"
+    },
+    {
+      "id": "menu_panel_background",
+      "path": "NewImages/Background_Menus.png",
+      "width": 1672,
+      "height": 941,
+      "sha256": "5d2b1784c93f0bdf7dd00f68e8e5a034cf12f5c37bc4e7fd47165e2382494812"
+    },
+    {
+      "id": "death_screen",
+      "path": "NewImages/DeathScreen.png",
+      "width": 1456,
+      "height": 1080,
+      "sha256": "a85bc8f93bdcede04745bd48d19e7b179606493fd407cca572dad919b1926037"
+    },
+    {
+      "id": "game_completion_background",
+      "path": "NewImages/BuckBumble_GameCompletion_Background.png",
+      "width": 1672,
+      "height": 941,
+      "sha256": "b92e87c19e86c4fe5afd57d470bcd7f0da73ce8636a990d060ddeae3848c949b"
+    }
+  ]
+}

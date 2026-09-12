@@ -1,0 +1,20 @@
+# User-owned ROM.
+/OriginalGame/*
+
+# Build output.
+/build/
+/.cache/
+/generated/
+
+# Local editor and compiler output.
+/.vs/
+/.vscode/
+/CMakeUserPresets.json
+*.d
+*.elf
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.map
+*.app/

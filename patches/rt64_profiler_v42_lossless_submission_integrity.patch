@@ -1,0 +1,775 @@
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+index ca61f1c..e13e25e 100644
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <cstdio>
+ #include <cstdlib>
++#include <deque>
+ #include <filesystem>
+ #include <fstream>
+ #include <iomanip>
+@@ -96,6 +97,11 @@ namespace RT64 {
+             uint64_t eventChunkCapacity = 0;
+             std::atomic<uint64_t> eventCount = 0;
+             uint64_t reservedEventsRemaining = 0;
++            bool retentionExhausted = false;
++            std::mutex streamedJournalMutex;
++            std::deque<Event> streamedJournalEvents;
++            std::atomic<uint64_t> streamedEventCount = 0;
++            std::atomic<uint64_t> latestTimestampNanoseconds = 0;
+             std::atomic<uint64_t> droppedEvents = 0;
+         };
+ 
+@@ -163,6 +169,33 @@ namespace RT64 {
+             std::vector<double> milliseconds;
+         };
+ 
++        struct SubmissionIntegritySample {
++            uint64_t timestampNanoseconds = 0;
++            uint64_t correlationId = 0;
++            double drawCalls = -1.0;
++            double triangles = -1.0;
++            double worldPipelines = -1.0;
++        };
++
++        constexpr uint64_t RequiredCollapsedSubmissionSamples = 6u;
++
++        struct SubmissionIntegrityTracker {
++            bool worldContextActive = false;
++            bool collapseDetected = false;
++            double peakGameplayDrawCalls = 0.0;
++            double peakGameplayTriangles = 0.0;
++            uint64_t collapseCandidateTimestamp = 0u;
++            uint64_t detectedCollapseTimestamp = 0u;
++            uint64_t collapsedSampleCount = 0u;
++            uint64_t consecutiveCollapsedSamples = 0u;
++            SubmissionIntegritySample lastHealthySubmission{};
++            SubmissionIntegritySample firstCollapsedSubmission{};
++            SubmissionIntegritySample detectedHealthySubmission{};
++            SubmissionIntegritySample detectedCollapsedSubmission{};
++            std::unordered_map<uint64_t, SubmissionIntegritySample>
++                pendingSamples;
++        };
++
+         struct SlowFrame {
+             uint64_t timestampNanoseconds = 0;
+             uint64_t presentId = 0;
+@@ -234,6 +267,8 @@ namespace RT64 {
+             std::vector<ThreadBuffer *> threadBuffers;
+             std::mutex metadataMutex;
+             std::map<std::string, std::string> metadata;
++            mutable std::mutex submissionIntegrityMutex;
++            SubmissionIntegrityTracker submissionIntegrity;
+             std::mutex hostObservationMutex;
+             std::atomic<bool> hostObservationRunning = false;
+             std::thread hostObservationThread;
+@@ -531,6 +566,147 @@ namespace RT64 {
+             event.name[count] = '\0';
+         }
+ 
++        void updateSubmissionIntegrity(
++            ProfilerState &profiler,
++            const Event &event
++        ) {
++            const std::string_view name(event.name.data());
++            if (event.kind == EventKind::Instant &&
++                name == "Host.Context.World") {
++                const std::scoped_lock lock(
++                    profiler.submissionIntegrityMutex
++                );
++                SubmissionIntegrityTracker &tracker =
++                    profiler.submissionIntegrity;
++                tracker.worldContextActive = event.argument0 != 0u;
++                if (!tracker.worldContextActive) {
++                    tracker.consecutiveCollapsedSamples = 0u;
++                    tracker.collapseCandidateTimestamp = 0u;
++                    tracker.pendingSamples.clear();
++                }
++                return;
++            }
++
++            if (event.kind != EventKind::Counter ||
++                (name != "Work.DrawCalls" &&
++                 name != "Work.Triangles" &&
++                 name != "Work.SpecializedPipelines.World")) {
++                return;
++            }
++
++            const std::scoped_lock lock(profiler.submissionIntegrityMutex);
++            SubmissionIntegrityTracker &tracker = profiler.submissionIntegrity;
++            if (!tracker.worldContextActive) {
++                return;
++            }
++
++            SubmissionIntegritySample &sample =
++                tracker.pendingSamples[event.correlationId];
++            sample.timestampNanoseconds = std::max(
++                sample.timestampNanoseconds,
++                event.timestampNanoseconds
++            );
++            sample.correlationId = event.correlationId;
++            if (name == "Work.DrawCalls") {
++                sample.drawCalls = event.value;
++            }
++            else if (name == "Work.Triangles") {
++                sample.triangles = event.value;
++            }
++            else {
++                sample.worldPipelines = event.value;
++            }
++            if (sample.drawCalls < 0.0 || sample.triangles < 0.0 ||
++                sample.worldPipelines < 0.0) {
++                return;
++            }
++
++            const SubmissionIntegritySample completeSample = sample;
++            tracker.pendingSamples.erase(event.correlationId);
++            const bool establishedWorld =
++                tracker.peakGameplayDrawCalls >= 128.0 &&
++                tracker.peakGameplayTriangles >= 1'024.0;
++            const bool drawCollapse = establishedWorld &&
++                completeSample.drawCalls <= std::max(
++                    16.0,
++                    tracker.peakGameplayDrawCalls * 0.05
++                );
++            const bool triangleCollapse =
++                completeSample.triangles <= std::max(
++                    128.0,
++                    tracker.peakGameplayTriangles * 0.05
++                );
++            const bool worldPipelineCollapse =
++                completeSample.worldPipelines <= 1.0;
++            if (drawCollapse && triangleCollapse && worldPipelineCollapse) {
++                if (tracker.consecutiveCollapsedSamples == 0u) {
++                    tracker.collapseCandidateTimestamp =
++                        completeSample.timestampNanoseconds;
++                    tracker.firstCollapsedSubmission = completeSample;
++                }
++                ++tracker.consecutiveCollapsedSamples;
++                ++tracker.collapsedSampleCount;
++                if (tracker.consecutiveCollapsedSamples >=
++                        RequiredCollapsedSubmissionSamples &&
++                    !tracker.collapseDetected) {
++                    tracker.collapseDetected = true;
++                    tracker.detectedCollapseTimestamp =
++                        tracker.collapseCandidateTimestamp;
++                    tracker.detectedHealthySubmission =
++                        tracker.lastHealthySubmission;
++                    tracker.detectedCollapsedSubmission =
++                        tracker.firstCollapsedSubmission;
++                }
++                return;
++            }
++
++            tracker.consecutiveCollapsedSamples = 0u;
++            tracker.collapseCandidateTimestamp = 0u;
++            if (completeSample.drawCalls >= 32.0) {
++                tracker.lastHealthySubmission = completeSample;
++                tracker.peakGameplayDrawCalls = std::max(
++                    tracker.peakGameplayDrawCalls,
++                    completeSample.drawCalls
++                );
++                tracker.peakGameplayTriangles = std::max(
++                    tracker.peakGameplayTriangles,
++                    completeSample.triangles
++                );
++            }
++        }
++
++        bool appendStreamedJournalEvent(
++            ProfilerState &profiler,
++            ThreadBuffer &buffer,
++            Event event
++        ) {
++            // Once the bounded in-memory analysis window is full, keep the durable JSONL flight recorder lossless.
++            if (profiler.checkpointStarted.load(std::memory_order_acquire) &&
++                !profiler.checkpointRunning.load(std::memory_order_acquire)) {
++                buffer.droppedEvents.fetch_add(1, std::memory_order_relaxed);
++                return false;
++            }
++            const uint64_t timestamp = event.timestampNanoseconds;
++            try {
++                const std::scoped_lock lock(buffer.streamedJournalMutex);
++                buffer.streamedJournalEvents.emplace_back(std::move(event));
++                updateSubmissionIntegrity(
++                    profiler,
++                    buffer.streamedJournalEvents.back()
++                );
++            }
++            catch (const std::bad_alloc &) {
++                buffer.droppedEvents.fetch_add(1, std::memory_order_relaxed);
++                return false;
++            }
++            buffer.latestTimestampNanoseconds.store(
++                timestamp,
++                std::memory_order_release
++            );
++            buffer.streamedEventCount.fetch_add(1, std::memory_order_release);
++            return true;
++        }
++
+         void appendEvent(Event event) {
+             ProfilerState &profiler = state();
+             if (!profiler.accepting.load(std::memory_order_acquire)) {
+@@ -543,6 +723,15 @@ namespace RT64 {
+                 return;
+             }
+ 
++            if (buffer->retentionExhausted) {
++                appendStreamedJournalEvent(
++                    profiler,
++                    *buffer,
++                    std::move(event)
++                );
++                return;
++            }
++
+             if (buffer->reservedEventsRemaining == 0) {
+                 constexpr uint64_t EventReservationSize = 1'024;
+                 const uint64_t reservationStart =
+@@ -551,9 +740,11 @@ namespace RT64 {
+                         std::memory_order_relaxed
+                     );
+                 if (reservationStart >= profiler.maximumEvents) {
+-                    buffer->droppedEvents.fetch_add(
+-                        1,
+-                        std::memory_order_relaxed
++                    buffer->retentionExhausted = true;
++                    appendStreamedJournalEvent(
++                        profiler,
++                        *buffer,
++                        std::move(event)
+                     );
+                     return;
+                 }
+@@ -568,9 +759,11 @@ namespace RT64 {
+             );
+             const uint64_t chunkIndex = eventCount / EventChunkSize;
+             if (chunkIndex >= buffer->eventChunkCapacity) {
+-                buffer->droppedEvents.fetch_add(
+-                    1,
+-                    std::memory_order_relaxed
++                buffer->retentionExhausted = true;
++                appendStreamedJournalEvent(
++                    profiler,
++                    *buffer,
++                    std::move(event)
+                 );
+                 return;
+             }
+@@ -580,9 +773,11 @@ namespace RT64 {
+                     new (std::nothrow) Event[EventChunkSize]
+                 );
+                 if (chunk == nullptr) {
+-                    buffer->droppedEvents.fetch_add(
+-                        1,
+-                        std::memory_order_relaxed
++                    buffer->retentionExhausted = true;
++                    appendStreamedJournalEvent(
++                        profiler,
++                        *buffer,
++                        std::move(event)
+                     );
+                     return;
+                 }
+@@ -596,9 +791,11 @@ namespace RT64 {
+                     );
+                 }
+                 catch (const std::bad_alloc &) {
+-                    buffer->droppedEvents.fetch_add(
+-                        1,
+-                        std::memory_order_relaxed
++                    buffer->retentionExhausted = true;
++                    appendStreamedJournalEvent(
++                        profiler,
++                        *buffer,
++                        std::move(event)
+                     );
+                     return;
+                 }
+@@ -621,6 +818,11 @@ namespace RT64 {
+                 eventCount + 1,
+                 std::memory_order_release
+             );
++            buffer->latestTimestampNanoseconds.store(
++                destination.timestampNanoseconds,
++                std::memory_order_release
++            );
++            updateSubmissionIntegrity(profiler, destination);
+             --buffer->reservedEventsRemaining;
+         }
+ 
+@@ -1166,6 +1368,31 @@ namespace RT64 {
+             uint64_t total = 0;
+             for (const ThreadBuffer *buffer : buffers) {
+                 total += buffer->eventCount.load(std::memory_order_acquire);
++                total += buffer->streamedEventCount.load(
++                    std::memory_order_acquire
++                );
++            }
++            return total;
++        }
++
++        uint64_t retainedEventCount(
++            const std::vector<ThreadBuffer *> &buffers
++        ) {
++            uint64_t total = 0;
++            for (const ThreadBuffer *buffer : buffers) {
++                total += buffer->eventCount.load(std::memory_order_acquire);
++            }
++            return total;
++        }
++
++        uint64_t streamedOnlyEventCount(
++            const std::vector<ThreadBuffer *> &buffers
++        ) {
++            uint64_t total = 0;
++            for (const ThreadBuffer *buffer : buffers) {
++                total += buffer->streamedEventCount.load(
++                    std::memory_order_acquire
++                );
+             }
+             return total;
+         }
+@@ -1305,21 +1532,32 @@ namespace RT64 {
+ 
+             uint64_t latestTimestampNanoseconds = 0;
+             for (const ThreadBuffer *buffer : buffers) {
+-                const uint64_t count = buffer->eventCount.load(
+-                    std::memory_order_acquire
++                latestTimestampNanoseconds = std::max(
++                    latestTimestampNanoseconds,
++                    buffer->latestTimestampNanoseconds.load(
++                        std::memory_order_acquire
++                    )
+                 );
+-                if (count > 0) {
+-                    latestTimestampNanoseconds = std::max(
+-                        latestTimestampNanoseconds,
+-                        eventAt(*buffer, count - 1).timestampNanoseconds
+-                    );
+-                }
+             }
+             const uint64_t generation =
+                 profiler.checkpointGeneration.fetch_add(
+                     1,
+                     std::memory_order_relaxed
+                 ) + 1;
++            bool submissionCollapseDetected = false;
++            uint64_t submissionCollapseTimestamp = 0u;
++            uint64_t collapsedSubmissionSamples = 0u;
++            {
++                const std::scoped_lock lock(
++                    profiler.submissionIntegrityMutex
++                );
++                submissionCollapseDetected =
++                    profiler.submissionIntegrity.collapseDetected;
++                submissionCollapseTimestamp =
++                    profiler.submissionIntegrity.detectedCollapseTimestamp;
++                collapsedSubmissionSamples =
++                    profiler.submissionIntegrity.collapsedSampleCount;
++            }
+             output << "{\n"
+                 << "  \"schema\": \"rt64-performance-live-v1\",\n"
+                 << "  \"generation\": " << generation << ",\n"
+@@ -1338,8 +1576,22 @@ namespace RT64 {
+                 ) << ",\n"
+                 << "  \"recorded_events\": "
+                 << recordedEventCount(buffers) << ",\n"
++                << "  \"retained_events\": "
++                << retainedEventCount(buffers) << ",\n"
++                << "  \"streamed_only_events\": "
++                << streamedOnlyEventCount(buffers) << ",\n"
+                 << "  \"dropped_events\": "
+                 << droppedEventCount(profiler, buffers) << ",\n"
++                << "  \"submission_integrity\": {\"status\":\""
++                << (submissionCollapseDetected
++                    ? "WORLD_SUBMISSION_COLLAPSE"
++                    : "NO_SUSTAINED_GAMEPLAY_COLLAPSE")
++                << "\",\"detected\":"
++                << (submissionCollapseDetected ? "true" : "false")
++                << ",\"collapsed_sample_count\":"
++                << collapsedSubmissionSamples
++                << ",\"onset_timestamp_ns\":"
++                << submissionCollapseTimestamp << "},\n"
+                 << "  \"latest_timestamp_ns\": "
+                 << latestTimestampNanoseconds << "\n}\n";
+             output.flush();
+@@ -1382,6 +1634,10 @@ namespace RT64 {
+                         profiler.journalPath.string().c_str()
+                     );
+                     std::fflush(stderr);
++                    profiler.checkpointRunning.store(
++                        false,
++                        std::memory_order_release
++                    );
+                     return;
+                 }
+ 
+@@ -1453,6 +1709,20 @@ namespace RT64 {
+                             ++cursor;
+                             ++eventsWritten;
+                         }
++
++                        std::deque<Event> streamedEvents;
++                        {
++                            const std::scoped_lock streamedLock(
++                                buffer->streamedJournalMutex
++                            );
++                            streamedEvents.swap(
++                                buffer->streamedJournalEvents
++                            );
++                        }
++                        for (const Event &event : streamedEvents) {
++                            writeJournalEvent(journal, event);
++                            ++eventsWritten;
++                        }
+                     }
+                     journal.flush();
+                     const bool healthy = journal.good();
+@@ -1488,6 +1758,10 @@ namespace RT64 {
+                     ));
+                 }
+                 journal.close();
++                profiler.checkpointRunning.store(
++                    false,
++                    std::memory_order_release
++                );
+             });
+         }
+ 
+@@ -1600,6 +1874,12 @@ namespace RT64 {
+                 output << ',';
+             }
+             output << "\n    \"budget_ms\": " << profiler.budgetMilliseconds
++                << ",\n    \"recorded_events\": "
++                << recordedEventCount(buffers)
++                << ",\n    \"retained_events\": "
++                << retainedEventCount(buffers)
++                << ",\n    \"streamed_only_events\": "
++                << streamedOnlyEventCount(buffers)
+                 << ",\n    \"dropped_events\": "
+                 << droppedEventCount(profiler, buffers)
+                 << "\n  }\n}\n";
+@@ -1822,6 +2102,8 @@ namespace RT64 {
+             std::map<std::string, ThreadExecutionStatistics>
+                 threadExecutionMap;
+             std::map<std::string, std::vector<double>> counterValues;
++            std::unordered_map<uint64_t, SubmissionIntegritySample>
++                submissionIntegritySampleMap;
+             std::vector<const Event *> durationEvents;
+             std::vector<const Event *> displayedEvents;
+             std::vector<const Event *> actualScanoutEvents;
+@@ -2154,6 +2436,28 @@ namespace RT64 {
+                     else if (event.kind == EventKind::Counter) {
+                         const std::string name(event.name.data());
+                         counterValues[name].emplace_back(event.value);
++                        if (name == "Work.DrawCalls" ||
++                            name == "Work.Triangles" ||
++                            name == "Work.SpecializedPipelines.World") {
++                            SubmissionIntegritySample &sample =
++                                submissionIntegritySampleMap[
++                                    event.correlationId
++                                ];
++                            sample.timestampNanoseconds = std::max(
++                                sample.timestampNanoseconds,
++                                event.timestampNanoseconds
++                            );
++                            sample.correlationId = event.correlationId;
++                            if (name == "Work.DrawCalls") {
++                                sample.drawCalls = event.value;
++                            }
++                            else if (name == "Work.Triangles") {
++                                sample.triangles = event.value;
++                            }
++                            else {
++                                sample.worldPipelines = event.value;
++                            }
++                        }
+                         HostResourceObservation *observation = nullptr;
+                         if ((name == "Host.SystemCPUPercent") ||
+                             (name == "Host.ExternalCPUPercent") ||
+@@ -2873,6 +3177,140 @@ namespace RT64 {
+                 (cycleSeparationNanoseconds <=
+                     CycleSnapshotWindowNanoseconds);
+ 
++            std::vector<const Event *> worldContextEvents;
++            for (const Event *event : contextEvents) {
++                if (std::string_view(event->name.data()) ==
++                    "Host.Context.World") {
++                    worldContextEvents.emplace_back(event);
++                }
++            }
++            std::sort(
++                worldContextEvents.begin(),
++                worldContextEvents.end(),
++                [](const Event *left, const Event *right) {
++                    return left->timestampNanoseconds <
++                        right->timestampNanoseconds;
++                }
++            );
++            std::vector<SubmissionIntegritySample> submissionIntegritySamples;
++            submissionIntegritySamples.reserve(
++                submissionIntegritySampleMap.size()
++            );
++            for (const auto &[correlationId, sample] :
++                 submissionIntegritySampleMap) {
++                if (sample.drawCalls >= 0.0) {
++                    submissionIntegritySamples.emplace_back(sample);
++                }
++            }
++            std::sort(
++                submissionIntegritySamples.begin(),
++                submissionIntegritySamples.end(),
++                [](const SubmissionIntegritySample &left,
++                   const SubmissionIntegritySample &right) {
++                    return left.timestampNanoseconds <
++                        right.timestampNanoseconds;
++                }
++            );
++
++            bool worldContextActive = false;
++            size_t worldContextIndex = 0u;
++            double peakGameplayDrawCalls = 0.0;
++            double peakGameplayTriangles = 0.0;
++            SubmissionIntegritySample lastHealthySubmission{};
++            SubmissionIntegritySample firstCollapsedSubmission{};
++            SubmissionIntegritySample detectedHealthySubmission{};
++            SubmissionIntegritySample detectedCollapsedSubmission{};
++            uint64_t collapseCandidateTimestamp = 0u;
++            uint64_t detectedCollapseTimestamp = 0u;
++            uint64_t collapsedSubmissionSampleCount = 0u;
++            uint64_t consecutiveCollapsedSamples = 0u;
++            bool worldSubmissionCollapseDetected = false;
++            for (const SubmissionIntegritySample &sample :
++                 submissionIntegritySamples) {
++                while (worldContextIndex < worldContextEvents.size() &&
++                       worldContextEvents[worldContextIndex]
++                               ->timestampNanoseconds <=
++                           sample.timestampNanoseconds) {
++                    worldContextActive =
++                        worldContextEvents[worldContextIndex]->argument0 != 0u;
++                    ++worldContextIndex;
++                }
++                if (!worldContextActive) {
++                    consecutiveCollapsedSamples = 0u;
++                    collapseCandidateTimestamp = 0u;
++                    continue;
++                }
++
++                const bool establishedWorld = peakGameplayDrawCalls >= 128.0 &&
++                    peakGameplayTriangles >= 1'024.0;
++                const bool drawCollapse = establishedWorld &&
++                    sample.drawCalls <= std::max(
++                        16.0,
++                        peakGameplayDrawCalls * 0.05
++                    );
++                const bool triangleCollapse = sample.triangles < 0.0 ||
++                    sample.triangles <= std::max(
++                        128.0,
++                        peakGameplayTriangles * 0.05
++                    );
++                const bool worldPipelineCollapse =
++                    sample.worldPipelines < 0.0 ||
++                    sample.worldPipelines <= 1.0;
++                if (drawCollapse && triangleCollapse &&
++                    worldPipelineCollapse) {
++                    if (consecutiveCollapsedSamples == 0u) {
++                        collapseCandidateTimestamp =
++                            sample.timestampNanoseconds;
++                        firstCollapsedSubmission = sample;
++                    }
++                    ++consecutiveCollapsedSamples;
++                    ++collapsedSubmissionSampleCount;
++                    if (consecutiveCollapsedSamples >=
++                            RequiredCollapsedSubmissionSamples &&
++                        !worldSubmissionCollapseDetected) {
++                        worldSubmissionCollapseDetected = true;
++                        detectedCollapseTimestamp =
++                            collapseCandidateTimestamp;
++                        detectedHealthySubmission = lastHealthySubmission;
++                        detectedCollapsedSubmission =
++                            firstCollapsedSubmission;
++                    }
++                    continue;
++                }
++
++                consecutiveCollapsedSamples = 0u;
++                collapseCandidateTimestamp = 0u;
++                if (sample.drawCalls >= 32.0) {
++                    lastHealthySubmission = sample;
++                    peakGameplayDrawCalls = std::max(
++                        peakGameplayDrawCalls,
++                        sample.drawCalls
++                    );
++                    if (sample.triangles >= 0.0) {
++                        peakGameplayTriangles = std::max(
++                            peakGameplayTriangles,
++                            sample.triangles
++                        );
++                    }
++                }
++            }
++
++            {
++                const std::scoped_lock lock(
++                    profiler.submissionIntegrityMutex
++                );
++                const SubmissionIntegrityTracker &tracker =
++                    profiler.submissionIntegrity;
++                worldSubmissionCollapseDetected = tracker.collapseDetected;
++                collapsedSubmissionSampleCount = tracker.collapsedSampleCount;
++                detectedCollapseTimestamp =
++                    tracker.detectedCollapseTimestamp;
++                detectedHealthySubmission =
++                    tracker.detectedHealthySubmission;
++                detectedCollapsedSubmission =
++                    tracker.detectedCollapsedSubmission;
++            }
++
+             std::vector<Statistics> statistics;
+             statistics.reserve(map.size());
+             for (auto &[key, value] : map) {
+@@ -4340,13 +4783,20 @@ namespace RT64 {
+                 }
+             );
+ 
++            if (worldSubmissionCollapseDetected) {
++                diagnosis = "WORLD_SUBMISSION_COLLAPSE";
++                confidence = "high";
++                primaryStage = "Work.DrawCalls";
++                primaryP95 = 0.0;
++            }
++
+             ensureParentDirectory(summaryPath);
+             std::ofstream output(summaryPath, std::ios::binary);
+             if (!output.is_open()) {
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v41\",\n";
++            output << "{\n  \"schema\": \"rt64-performance-summary-v42\",\n";
+             output << "  \"capture_mode\": \""
+                 << (profiler.lowOverhead ? "low_overhead" : "detailed")
+                 << "\",\n";
+@@ -4368,7 +4818,15 @@ namespace RT64 {
+                 << ",\"checkpoint_generation\":"
+                 << profiler.checkpointGeneration.load(
+                     std::memory_order_acquire
+-                ) << "},\n";
++                )
++                << ",\"events_recorded\":"
++                << recordedEventCount(buffers)
++                << ",\"events_retained_for_summary\":"
++                << retainedEventCount(buffers)
++                << ",\"events_streamed_only\":"
++                << streamedOnlyEventCount(buffers)
++                << ",\"events_dropped\":"
++                << droppedEventCount(profiler, buffers) << "},\n";
+             output << "  \"metadata\": {";
+             size_t summaryMetadataIndex = 0;
+             for (const auto &[key, value] : profiler.metadata) {
+@@ -4384,6 +4842,30 @@ namespace RT64 {
+             output << "  \"primary_stage\": \"" << jsonEscape(primaryStage) << "\",\n";
+             output << "  \"primary_stage_p95_ms\": " << std::fixed
+                 << std::setprecision(3) << primaryP95 << ",\n";
++            output << "  \"submission_integrity\": {\"status\":\""
++                << (worldSubmissionCollapseDetected
++                    ? "WORLD_SUBMISSION_COLLAPSE"
++                    : "NO_SUSTAINED_GAMEPLAY_COLLAPSE")
++                << "\",\"detected\":"
++                << (worldSubmissionCollapseDetected ? "true" : "false")
++                << ",\"required_consecutive_samples\":"
++                << RequiredCollapsedSubmissionSamples
++                << ",\"collapsed_sample_count\":"
++                << collapsedSubmissionSampleCount
++                << ",\"onset_timestamp_ns\":"
++                << detectedCollapseTimestamp
++                << ",\"healthy_draw_calls\":"
++                << detectedHealthySubmission.drawCalls
++                << ",\"collapsed_draw_calls\":"
++                << detectedCollapsedSubmission.drawCalls
++                << ",\"healthy_triangles\":"
++                << detectedHealthySubmission.triangles
++                << ",\"collapsed_triangles\":"
++                << detectedCollapsedSubmission.triangles
++                << ",\"healthy_world_pipelines\":"
++                << detectedHealthySubmission.worldPipelines
++                << ",\"collapsed_world_pipelines\":"
++                << detectedCollapsedSubmission.worldPipelines << "},\n";
+             output << "  \"budget_ms\": " << budget << ",\n";
+             output << "  \"target_hz\": "
+                 << dominantInterpolationTargetRate << ",\n";
+@@ -5098,6 +5580,10 @@ namespace RT64 {
+                     : 0.0) << ",\n";
+             output << "  \"events_recorded\": "
+                 << recordedEventCount(buffers) << ",\n";
++            output << "  \"events_retained_for_summary\": "
++                << retainedEventCount(buffers) << ",\n";
++            output << "  \"events_streamed_only\": "
++                << streamedOnlyEventCount(buffers) << ",\n";
+             output << "  \"events_dropped\": "
+                 << droppedEventCount(profiler, buffers) << ",\n";
+             output << "  \"stutter_analysis\": {\"threshold_ms\": "
+@@ -5407,8 +5893,10 @@ namespace RT64 {
+                 output << "    {\"name\":\"" << jsonEscape(name)
+                     << "\",\"count\":" << values.size()
+                     << ",\"mean\":" << (total / double(values.size()))
++                    << ",\"min\":" << percentile(values, 0.0)
+                     << ",\"p95\":" << percentile(values, 0.95)
+-                    << ",\"max\":" << percentile(values, 1.0) << "}";
++                    << ",\"max\":" << percentile(values, 1.0)
++                    << ",\"last\":" << values.back() << "}";
+             }
+             output << "\n  ],\n  \"interpretation\": "
+                 << "\"Slow-frame diagnoses use only stages measured on the RT64 "
+@@ -6445,6 +6933,8 @@ namespace RT64 {
+             }
+         }
+ #endif
++        // Close the producer gate before the journal thread drains.
++        profiler.accepting.store(false, std::memory_order_release);
+         profiler.checkpointRunning.store(false, std::memory_order_release);
+         {
+             const std::scoped_lock checkpointLock(
+@@ -6454,7 +6946,6 @@ namespace RT64 {
+                 profiler.checkpointThread.join();
+             }
+         }
+-        profiler.accepting.store(false, std::memory_order_release);
+         std::vector<ThreadBuffer *> buffers;
+         {
+             const std::scoped_lock lock(profiler.registryMutex);
+@@ -6486,7 +6977,9 @@ namespace RT64 {
+                     traceTemporary,
+                     profiler.outputPath
+                 );
+-            if (summaryWritten && traceWritten) {
++            const bool completeFinalProducts =
++                streamedOnlyEventCount(buffers) == 0u;
++            if (summaryWritten && traceWritten && completeFinalProducts) {
+                 std::error_code removeError;
+                 std::filesystem::remove(
+                     profiler.journalPath,
+@@ -6497,7 +6994,7 @@ namespace RT64 {
+             }
+             std::fprintf(
+                 stderr,
+-                "RT64_PROFILE finished=1 trace_written=%d summary_written=%d journal_healthy=%d journal_events=%llu events=%llu dropped=%llu trace=%s summary=%s\n",
++                "RT64_PROFILE finished=1 trace_written=%d summary_written=%d journal_healthy=%d journal_events=%llu events=%llu retained=%llu streamed_only=%llu dropped=%llu trace=%s summary=%s\n",
+                 traceWritten ? 1 : 0,
+                 summaryWritten ? 1 : 0,
+                 profiler.journalHealthy.load(std::memory_order_acquire)
+@@ -6508,6 +7005,10 @@ namespace RT64 {
+                     )
+                 ),
+                 static_cast<unsigned long long>(recordedEventCount(buffers)),
++                static_cast<unsigned long long>(retainedEventCount(buffers)),
++                static_cast<unsigned long long>(
++                    streamedOnlyEventCount(buffers)
++                ),
+                 static_cast<unsigned long long>(
+                     droppedEventCount(profiler, buffers)
+                 ),

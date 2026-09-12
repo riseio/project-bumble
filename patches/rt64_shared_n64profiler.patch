@@ -1,0 +1,3288 @@
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -3,13 +3,22 @@
+ //
+ 
+ #include "rt64_performance_profiler.h"
++#include "rt64_profiler_ring.h"
++#include "rt64_profiler_aggregates.h"
++#if __has_include("contrib/plume/plume_rt64_profile_interval.h")
++#include "contrib/plume/plume_rt64_profile_interval.h"
++#define N64PROFILER_HAS_PLUME_INTERVAL 1
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+ #include <chrono>
++#include <charconv>
+ #include <cmath>
+ #include <cstring>
++#include <condition_variable>
++#include <functional>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <deque>
+@@ -41,12 +50,37 @@
+ #elif defined(__linux__)
+ #include <dirent.h>
+ #include <unistd.h>
++#include <sys/syscall.h>
+ #include <time.h>
+ #endif
+ 
+ namespace RT64 {
+     namespace {
+         using Clock = std::chrono::steady_clock;
++
++        // Enforce a hard disk quota on the writer thread, including metadata.
++        class LimitedOutput : public std::streambuf {
++            std::streambuf *destination;
++            uint64_t remaining;
++        protected:
++            std::streamsize xsputn(const char *data, std::streamsize count) override {
++                const auto allowed = std::min<uint64_t>(uint64_t(count), remaining);
++                const auto written = destination->sputn(data, std::streamsize(allowed));
++                remaining -= uint64_t(written);
++                return written;
++            }
++            int_type overflow(int_type character) override {
++                if (traits_type::eq_int_type(character, traits_type::eof())) return traits_type::not_eof(character);
++                if (!remaining) return traits_type::eof();
++                const auto result = destination->sputc(traits_type::to_char_type(character));
++                if (!traits_type::eq_int_type(result, traits_type::eof())) --remaining;
++                return result;
++            }
++            int sync() override { return destination->pubsync(); }
++        public:
++            LimitedOutput(std::streambuf *destination, uint64_t quota) : destination(destination), remaining(quota) {}
++            uint64_t unused() const { return remaining; }
++        };
+ 
+         enum class EventKind : uint8_t {
+             Duration,
+@@ -66,16 +100,21 @@
+             uint64_t gpuEndNanoseconds = 0;
+             double value = 0.0;
+             uint32_t threadId = 0;
++            uint64_t osThreadId = 0;
++            uint64_t producerSequence = 0;
+             PerformanceCategory category = PerformanceCategory::CPU;
+             EventKind kind = EventKind::Duration;
+             bool gpuClock = false;
+             bool threadCpuMeasured = false;
++            bool threadScope = false;
+         };
+ 
+         constexpr uint64_t EventChunkSize = 1'024;
+ 
+         struct ThreadBuffer {
+-            explicit ThreadBuffer(uint64_t maximumEvents) {
++            explicit ThreadBuffer(uint64_t maximumEvents, uint64_t streamingCapacity = 0) {
++                streamCapacity = streamingCapacity;
++                if (streamCapacity) streamEvents = std::make_unique<Event[]>(streamCapacity);
+                 eventChunkCapacity = std::max<uint64_t>(
+                     1,
+                     (maximumEvents + EventChunkSize - 1) / EventChunkSize
+@@ -90,6 +129,7 @@
+             }
+ 
+             uint32_t id = 0;
++            std::atomic<bool> retired = false;
+             mutable std::mutex nameMutex;
+             std::string name;
+             std::unique_ptr<std::atomic<Event *>[]> eventChunks;
+@@ -98,8 +138,10 @@
+             std::atomic<uint64_t> eventCount = 0;
+             uint64_t reservedEventsRemaining = 0;
+             bool retentionExhausted = false;
+-            std::mutex streamedJournalMutex;
+-            std::deque<Event> streamedJournalEvents;
++            std::unique_ptr<Event[]> streamEvents;
++            uint64_t streamCapacity = 0;
++            std::atomic<uint64_t> streamRead = 0;
++            std::atomic<uint64_t> streamWrite = 0;
+             std::atomic<uint64_t> streamedEventCount = 0;
+             std::atomic<uint64_t> latestTimestampNanoseconds = 0;
+             std::atomic<uint64_t> droppedEvents = 0;
+@@ -181,6 +223,7 @@
+ 
+         struct SubmissionIntegrityTracker {
+             bool worldContextActive = false;
++            uint64_t completeSamples = 0;
+             bool collapseDetected = false;
+             double peakGameplayDrawCalls = 0.0;
+             double peakGameplayTriangles = 0.0;
+@@ -240,12 +283,126 @@
+             std::vector<HostProcessUsage> processes;
+         };
+ 
++        struct RenderWorkerRecord {
++            uint64_t workerId = 0, logicalQueueId = 0, nativeQueueId = 0;
++            uint32_t commandListType = 0;
++            std::array<char, 64> name{};
++        };
++
++        // Detailed attachments have an independent, hard session budget.
++        class AttachmentWriter {
++            struct Job {
++                std::filesystem::path path;
++                std::vector<char> data;
++                std::function<void(bool)> completed;
++            };
++            std::mutex mutex;
++            std::condition_variable ready;
++            std::deque<Job> jobs;
++            std::thread worker;
++            bool closed = false;
++            uint64_t pending = 0;
++            void run() {
++                for (;;) {
++                    Job job;
++                    {
++                        std::unique_lock<std::mutex> lock(mutex);
++                        ready.wait(lock, [&] { return closed || !jobs.empty(); });
++                        if (jobs.empty()) return;
++                        job = std::move(jobs.front()); jobs.pop_front();
++                    }
++#ifdef _WIN32
++                    FILE *file = _wfopen(job.path.c_str(), L"wbx");
++#else
++                    FILE *file = std::fopen(job.path.c_str(), "wbx");
++#endif
++                    bool success = false;
++                    if (file) {
++                        success = std::fwrite(job.data.data(), 1, job.data.size(), file) == job.data.size();
++                        success = (std::fclose(file) == 0) && success;
++                    }
++                    if (success) { written.fetch_add(job.data.size()); completed.fetch_add(1); }
++                    else failed.fetch_add(1);
++                    job.completed(success);
++                    const size_t size = job.data.size();
++                    std::vector<char>().swap(job.data);
++                    std::lock_guard<std::mutex> lock(mutex);
++                    pending -= size;
++                }
++            }
++        public:
++            uint64_t maximumBytes = 256ull * 1024 * 1024;
++            static constexpr uint64_t maximumPending = 64ull * 1024 * 1024;
++            std::atomic<uint64_t> reserved{0}, written{0}, rejected{0}, failed{0}, completed{0}, highWater{0};
++            bool enqueue(std::filesystem::path path, const void *data, size_t bytes,
++                    std::function<void(bool)> callback) {
++                std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
++                if (!lock || closed || bytes == 0 || bytes > maximumPending ||
++                    pending > maximumPending - bytes || jobs.size() >= 8 ||
++                    bytes > maximumBytes || reserved.load() > maximumBytes - bytes) {
++                    rejected.fetch_add(1); return false;
++                }
++                try {
++                    Job job{std::move(path), std::vector<char>(bytes), std::move(callback)};
++                    std::memcpy(job.data.data(), data, bytes);
++                    if (!worker.joinable()) worker = std::thread([this] { run(); });
++                    jobs.emplace_back(std::move(job));
++                }
++                catch (...) { rejected.fetch_add(1); return false; }
++                pending += bytes; reserved.fetch_add(bytes);
++                highWater.store(std::max(highWater.load(), pending));
++                ready.notify_one();
++                return true;
++            }
++            void stop() {
++                { std::lock_guard<std::mutex> lock(mutex); closed = true; }
++                ready.notify_all();
++                if (worker.joinable()) worker.join();
++            }
++        };
++
+         struct ProfilerState {
++            AttachmentWriter attachments;
++            std::array<RenderWorkerRecord, 1024> renderWorkers{};
++            std::atomic<uint32_t> nextRenderWorker = 0;
++            std::atomic<uint64_t> droppedRenderWorkers = 0;
++            RecorderStorage::Aggregates aggregates;
++            std::atomic<bool> recording = true;
++            uint64_t processId = 0;
++            std::atomic<uint64_t> resumeTimestamp = 0;
++            std::atomic<uint64_t> interruptedScopes = 0;
++            std::filesystem::path controlPath;
++            std::atomic<bool> controlRunning = false;
++            std::thread controlThread;
++            std::unique_ptr<RecorderStorage::Ring<Event>> incidentRing;
++            std::atomic<uint64_t> incidentDeadline = 0;
++            uint64_t incidentPostNanoseconds = 500'000'000;
++            uint64_t spikeNanoseconds = 0;
++            PerformanceCaptureMode captureMode = PerformanceCaptureMode::Disabled;
++            std::unique_ptr<RecorderStorage::Ring<Event>> passiveRing;
++            std::atomic<uint64_t> activeWriters = 0;
++            std::atomic<uint32_t> nextPassiveThread = 0;
++            std::array<std::array<char, 80>, 512> passiveThreadNames{};
++            std::array<std::atomic<bool>, 512> threadNamesReady{};
++            std::atomic<uint64_t> gpuQueryCommands = 0;
++            std::atomic<uint64_t> backendFenceStatusQueries = 0;
++            std::atomic<uint64_t> secondaryGraphicsDevices = 0;
++            std::atomic<uint64_t> framePathAllocations = 0;
+             Clock::time_point origin = Clock::now();
+             std::filesystem::path outputPath;
+             std::filesystem::path summaryPath;
+             double budgetMilliseconds = 16.667;
+             uint64_t maximumEvents = 1'000'000;
++            uint64_t maximumStreamedEvents = 32'768;
++            uint64_t maximumStreamBytes = 128ull * 1024 * 1024;
++            std::atomic<uint64_t> allocatedStreamBytes = 0;
++            uint64_t maximumJournalBytes = 256 * 1024 * 1024;
++            uint64_t maximumIncidents = 16;
++            uint64_t maximumSnapshotBytes = 256ull * 1024 * 1024;
++            uint64_t snapshotBytes = 0;
++            uint64_t maximumThreads = 128;
++            std::atomic<uint64_t> invalidEvents = 0;
++            std::atomic<uint64_t> backlogHighWater = 0;
+             uint64_t warmupFrames = 120;
+             uint64_t cooldownFrames = 30;
+             uint64_t minimumDurationNanoseconds = 250'000;
+@@ -271,6 +429,8 @@
+             SubmissionIntegrityTracker submissionIntegrity;
+             std::mutex hostObservationMutex;
+             std::atomic<bool> hostObservationRunning = false;
++            std::atomic<bool> hostObservationStarted = false;
++            std::atomic<bool> displayObservationStarted = false;
+             std::thread hostObservationThread;
+             uint64_t checkpointIntervalMilliseconds = 5'000;
+             uint64_t journalIntervalMilliseconds = 250;
+@@ -294,6 +454,7 @@
+         };
+ 
+         void startCheckpointObservation(ProfilerState &profiler);
++        void startControlObservation(ProfilerState &profiler);
+ 
+         const char *categoryName(PerformanceCategory category) {
+             switch (category) {
+@@ -328,10 +489,10 @@
+                 return fallback;
+             }
+ 
+-            char *end = nullptr;
+-            const unsigned long long value = std::strtoull(text, &end, 10);
+-            return ((end != text) && (end != nullptr) && (*end == '\0') &&
+-                (value > 0)) ? uint64_t(value) : fallback;
++            uint64_t value = 0;
++            const char *end = text + std::strlen(text);
++            const auto parsed = std::from_chars(text, end, value);
++            return parsed.ec == std::errc() && parsed.ptr == end && value > 0 ? value : fallback;
+         }
+ 
+         uint64_t parseNonNegativeInteger(const char *name, uint64_t fallback) {
+@@ -340,11 +501,10 @@
+                 return fallback;
+             }
+ 
+-            char *end = nullptr;
+-            const unsigned long long value = std::strtoull(text, &end, 10);
+-            return ((end != text) && (end != nullptr) && (*end == '\0'))
+-                ? uint64_t(value)
+-                : fallback;
++            uint64_t value = 0;
++            const char *end = text + std::strlen(text);
++            const auto parsed = std::from_chars(text, end, value);
++            return parsed.ec == std::errc() && parsed.ptr == end ? value : fallback;
+         }
+ 
+         bool parseEnabledFlag(const char *name) {
+@@ -353,41 +513,165 @@
+                 (text[0] != '0');
+         }
+ 
++        // Accept valid Unicode scalar values only.
++        bool validUTF8(std::string_view text, bool allowNull = true) {
++            for (size_t i = 0; i < text.size();) {
++                const auto first = static_cast<unsigned char>(text[i++]);
++                if (first < 0x80) {
++                    if (!allowNull && first == 0) return false;
++                    continue;
++                }
++                const size_t extra = first >= 0xc2 && first <= 0xdf ? 1 :
++                    first >= 0xe0 && first <= 0xef ? 2 :
++                    first >= 0xf0 && first <= 0xf4 ? 3 : 0;
++                if (!extra || extra > text.size() - i) return false;
++                const auto second = static_cast<unsigned char>(text[i]);
++                if ((first == 0xe0 && second < 0xa0) || (first == 0xed && second >= 0xa0) ||
++                    (first == 0xf0 && second < 0x90) || (first == 0xf4 && second >= 0x90)) return false;
++                for (size_t j = 0; j < extra; ++j) {
++                    const auto continuation = static_cast<unsigned char>(text[i++]);
++                    if (continuation < 0x80 || continuation > 0xbf) return false;
++                }
++            }
++            return true;
++        }
++
+         std::string jsonEscape(std::string_view text) {
+-            std::ostringstream escaped;
++            std::string escaped;
++            escaped.reserve(text.size());
++            static constexpr char hex[] = "0123456789abcdef";
+             for (const unsigned char character : text) {
+                 switch (character) {
+-                case '"': escaped << "\\\""; break;
+-                case '\\': escaped << "\\\\"; break;
+-                case '\b': escaped << "\\b"; break;
+-                case '\f': escaped << "\\f"; break;
+-                case '\n': escaped << "\\n"; break;
+-                case '\r': escaped << "\\r"; break;
+-                case '\t': escaped << "\\t"; break;
++                case '"': escaped += "\\\""; break;
++                case '\\': escaped += "\\\\"; break;
++                case '\b': escaped += "\\b"; break;
++                case '\f': escaped += "\\f"; break;
++                case '\n': escaped += "\\n"; break;
++                case '\r': escaped += "\\r"; break;
++                case '\t': escaped += "\\t"; break;
+                 default:
+                     if (character < 0x20) {
+-                        escaped << "\\u" << std::hex << std::setw(4)
+-                            << std::setfill('0') << int(character) << std::dec;
++                        escaped += "\\u00";
++                        escaped += hex[character >> 4];
++                        escaped += hex[character & 15];
+                     }
+                     else {
+-                        escaped << char(character);
++                        escaped += char(character);
+                     }
+                     break;
+                 }
+             }
+ 
+-            return escaped.str();
++            return escaped;
++        }
++
++        void appendTraceInteger(std::string &line, uint64_t value) {
++            char buffer[32];
++            const auto converted = std::to_chars(buffer, buffer + sizeof(buffer), value);
++            line.append(buffer, converted.ptr);
++        }
++
++        void appendTraceMicroseconds(std::string &line, uint64_t nanoseconds) {
++            appendTraceInteger(line, nanoseconds / 1000);
++            line += '.';
++            const uint32_t fraction = uint32_t(nanoseconds % 1000);
++            line += char('0' + fraction / 100);
++            line += char('0' + (fraction / 10) % 10);
++            line += char('0' + fraction % 10);
++        }
++
++        void appendTraceCounter(std::string &line, double value) {
++            char buffer[64];
++            const auto converted = std::to_chars(buffer, buffer + sizeof(buffer), value,
++                std::chars_format::general, std::numeric_limits<double>::max_digits10);
++            if (converted.ec == std::errc{} && std::isfinite(value)) line.append(buffer, converted.ptr);
++            else line += "null";
+         }
+ 
+         ProfilerState &state() {
+             static ProfilerState *instance = []() {
+                 auto *newState = new ProfilerState();
++                const char *requestedMode = std::getenv("RT64_PROFILE_MODE");
++                if (requestedMode && std::string_view(requestedMode) != "passive" &&
++                    std::string_view(requestedMode) != "gpu" && std::string_view(requestedMode) != "detailed") {
++                    std::fprintf(stderr, "RT64_PROFILE error=invalid_mode\n");
++                    return newState;
++                }
+                 const char *output = std::getenv("RT64_PROFILE_OUTPUT");
+                 if ((output == nullptr) || (output[0] == '\0')) {
+                     return newState;
+                 }
+ 
+                 newState->outputPath = std::filesystem::path(output);
++                if (!validUTF8(newState->outputPath.u8string())) {
++                    std::fprintf(stderr, "RT64_PROFILE invalid_output_path_encoding=1\n");
++                    newState->outputPath.clear();
++                    return newState;
++                }
++                const char *control = std::getenv("RT64_PROFILE_CONTROL");
++                if (control && control[0]) newState->controlPath = control;
++                newState->recording.store(!parseEnabledFlag("RT64_PROFILE_ARMED"));
++                newState->incidentPostNanoseconds = std::clamp<uint64_t>(
++                    parseNonNegativeInteger("RT64_PROFILE_POST_MS", 500), 0, 10'000) * 1'000'000;
++                newState->spikeNanoseconds = std::min<uint64_t>(
++                    parseNonNegativeInteger("RT64_PROFILE_TRIGGER_US", 0), 10'000'000) * 1000;
++                newState->metadata["recorder_revision"] = "n64profiler-0.2";
++                newState->metadata["record_identity"] = "producer_thread_sequence_v1";
++                newState->processId =
++#ifdef _WIN32
++                    GetCurrentProcessId()
++#else
++                    getpid()
++#endif
++                ;
++                newState->metadata["process_id"] = std::to_string(newState->processId);
++                newState->metadata["steady_origin_ns"] = std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    newState->origin.time_since_epoch()).count());
++#if defined(__linux__)
++                newState->metadata["native_clock"] = "CLOCK_MONOTONIC";
++                std::ifstream processStat("/proc/self/stat");
++                std::array<char, 4096> statBuffer{};
++                if (processStat.getline(statBuffer.data(), statBuffer.size())) {
++                    const std::string statText(statBuffer.data());
++                    const auto close = statText.rfind(')');
++                    if (close != std::string::npos) {
++                        std::istringstream fields(statText.substr(close + 1));
++                        std::string value;
++                        for (unsigned field = 0; field <= 19 && (fields >> value); ++field) {
++                            if (field == 19) newState->metadata["process_start_ticks"] = value;
++                        }
++                    }
++                }
++#elif defined(_WIN32)
++                newState->metadata["native_clock"] = "QPC";
++                LARGE_INTEGER nativeTicks{}, nativeFrequency{};
++                const auto qpcBefore = Clock::now();
++                const bool qpcValid = QueryPerformanceCounter(&nativeTicks) && QueryPerformanceFrequency(&nativeFrequency);
++                const auto qpcAfter = Clock::now();
++                if (qpcValid && nativeFrequency.QuadPart > 0) {
++                    const auto interval = std::chrono::duration_cast<std::chrono::nanoseconds>(qpcAfter - qpcBefore).count();
++                    const auto relative = std::chrono::duration_cast<std::chrono::nanoseconds>(qpcBefore - newState->origin).count();
++                    newState->metadata["native_qpc_ticks"] = std::to_string(nativeTicks.QuadPart);
++                    newState->metadata["native_qpc_frequency"] = std::to_string(nativeFrequency.QuadPart);
++                    newState->metadata["native_qpc_relative_ns"] = std::to_string(relative + interval / 2);
++                    newState->metadata["native_qpc_uncertainty_ns"] = std::to_string((interval + 1) / 2 + 1);
++                }
++                FILETIME processCreated{}, processExited{}, processKernel{}, processUser{};
++                if (GetProcessTimes(GetCurrentProcess(), &processCreated, &processExited, &processKernel, &processUser)) {
++                    newState->metadata["process_start_ticks"] = std::to_string(
++                        (uint64_t(processCreated.dwHighDateTime) << 32) | processCreated.dwLowDateTime);
++                }
++#else
++                newState->metadata["native_clock"] = "UNVERIFIED";
++#endif
++                const auto beforeAnchor = Clock::now();
++                newState->metadata["utc_anchor_ns"] = std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    std::chrono::system_clock::now().time_since_epoch()).count());
++                const auto afterAnchor = Clock::now();
++                newState->metadata["relative_anchor_ns"] = std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    beforeAnchor - newState->origin).count());
++                newState->metadata["anchor_uncertainty_ns"] = std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    afterAnchor - beforeAnchor).count());
+                 const char *summary = std::getenv("RT64_PROFILE_SUMMARY");
+                 if ((summary != nullptr) && (summary[0] != '\0')) {
+                     newState->summaryPath = std::filesystem::path(summary);
+@@ -400,6 +686,30 @@
+                 newState->journalPath += ".journal.jsonl";
+                 newState->livePath = newState->outputPath;
+                 newState->livePath += ".live.json";
++                // Reserve this capture name atomically across processes.
++                std::error_code pathError;
++                const auto parent = newState->outputPath.parent_path();
++                if (!parent.empty()) std::filesystem::create_directories(parent, pathError);
++                const std::filesystem::path reservation = newState->outputPath.string() + ".owner";
++                const bool occupied = std::filesystem::is_regular_file(newState->outputPath, pathError) ||
++                    std::filesystem::is_regular_file(newState->journalPath, pathError) ||
++                    std::filesystem::is_regular_file(newState->summaryPath, pathError);
++                pathError.clear();
++                if (occupied || newState->outputPath == newState->summaryPath ||
++                    !std::filesystem::create_directory(reservation, pathError)) {
++                    std::fprintf(stderr, "RT64_PROFILE capture_path_unavailable=1 output=%s\n", output);
++                    newState->outputPath.clear();
++                    return newState;
++                }
++                const auto summaryReservation = std::filesystem::u8path(newState->summaryPath.u8string() + ".owner");
++                pathError.clear();
++                const auto summaryParent = newState->summaryPath.parent_path();
++                if (!summaryParent.empty()) std::filesystem::create_directories(summaryParent, pathError);
++                if (!std::filesystem::create_directory(summaryReservation, pathError)) {
++                    std::fprintf(stderr, "RT64_PROFILE summary_path_reserved=1\n");
++                    newState->outputPath.clear();
++                    return newState;
++                }
+                 newState->checkpointIntervalMilliseconds =
+                     std::max<uint64_t>(
+                         1'000,
+@@ -422,6 +733,7 @@
+                     "RT64_PROFILE_BUDGET_MS",
+                     newState->budgetMilliseconds
+                 );
++                newState->budgetMilliseconds = std::clamp(newState->budgetMilliseconds, 0.001, 1000.0);
+                 newState->maximumEvents = std::max<uint64_t>(
+                     1'000,
+                     parsePositiveInteger(
+@@ -429,6 +741,20 @@
+                         newState->maximumEvents
+                     )
+                 );
++                newState->maximumEvents = std::min<uint64_t>(newState->maximumEvents, 4'194'304);
++                newState->maximumJournalBytes = std::clamp<uint64_t>(
++                    parsePositiveInteger("RT64_PROFILE_DISK_BYTES", 256 * 1024 * 1024), 4096, 16ULL * 1024 * 1024 * 1024);
++                newState->maximumSnapshotBytes = std::clamp<uint64_t>(parsePositiveInteger("RT64_PROFILE_SNAPSHOT_BYTES", 256ull * 1024 * 1024), 4096, 4ull * 1024 * 1024 * 1024);
++                newState->maximumIncidents = std::clamp<uint64_t>(parsePositiveInteger("RT64_PROFILE_MAX_INCIDENTS", 16), 1, 64);
++                newState->metadata["journal_disk_budget_bytes"] = std::to_string(newState->maximumJournalBytes);
++                newState->metadata["maximum_incident_snapshots"] = std::to_string(newState->maximumIncidents);
++                newState->maximumStreamBytes = std::clamp<uint64_t>(
++                    parsePositiveInteger("RT64_PROFILE_STREAM_BYTES", 128ull * 1024 * 1024),
++                    sizeof(Event) * 64, 1024ull * 1024 * 1024);
++                newState->maximumStreamedEvents = std::clamp<uint64_t>(
++                    parsePositiveInteger("RT64_PROFILE_STREAM_CAPACITY", 32'768), 64, 262'144);
++                newState->maximumThreads = std::clamp<uint64_t>(
++                    parsePositiveInteger("RT64_PROFILE_MAX_THREADS", 128), 2, 512);
+                 newState->warmupFrames = parseNonNegativeInteger(
+                     "RT64_PROFILE_WARMUP_FRAMES",
+                     newState->warmupFrames
+@@ -483,6 +809,7 @@
+                 newState->gpuInstrumentation =
+                     (parseEnabledFlag("RT64_PROFILE_GPU") ||
+-                        parseEnabledFlag("RT64_PROFILE_DRAW_DETAIL"));
++                        parseEnabledFlag("RT64_PROFILE_DRAW_DETAIL") ||
++                        (requestedMode && std::string_view(requestedMode) == "gpu"));
+                 newState->gpuFrameSampleInterval = std::max<uint64_t>(
+                     1,
+                     parsePositiveInteger(
+@@ -493,11 +820,36 @@
+                 );
+                 newState->keepDrawEvents =
+                     parseEnabledFlag("RT64_PROFILE_KEEP_DRAW_EVENTS");
++                const bool legacyDetailed = std::getenv("RT64_PROFILE_LOW_OVERHEAD") != nullptr;
++                const bool detailed = (requestedMode && std::string_view(requestedMode) == "detailed") ||
++                    (!requestedMode && legacyDetailed) || parseEnabledFlag("RT64_PROFILE_GEOMETRY");
++                newState->captureMode = detailed ? PerformanceCaptureMode::Detailed :
++                    (newState->gpuInstrumentation || (requestedMode && std::string_view(requestedMode) == "gpu")
++                        ? PerformanceCaptureMode::SparseGPU : PerformanceCaptureMode::Passive);
++                if (!detailed) {
++                    newState->gpuInstrumentation = newState->captureMode == PerformanceCaptureMode::SparseGPU;
++                    newState->gpuFrameSampleInterval = std::clamp<uint64_t>(
++                        parsePositiveInteger("RT64_PROFILE_GPU_INTERVAL", 64), 1, UINT32_MAX);
++                    newState->maximumEvents = std::clamp<uint64_t>(
++                        parsePositiveInteger("RT64_PROFILE_EVENT_CAPACITY", 262'144), 1024, 4'194'304);
++                    newState->passiveRing = std::make_unique<RecorderStorage::Ring<Event>>(newState->maximumEvents);
++                    newState->minimumDurationNanoseconds = 0;
++                    newState->durationInterval = 1;
++                    newState->counterInterval = 1;
++                }
++                else if (!newState->controlPath.empty()) {
++                    newState->incidentRing = std::make_unique<RecorderStorage::Ring<Event>>(
++                        std::clamp<uint64_t>(parsePositiveInteger("RT64_PROFILE_EVENT_CAPACITY", 262'144), 1024, 4'194'304));
++                }
++                newState->attachments.maximumBytes = std::clamp<uint64_t>(
++                    parsePositiveInteger("RT64_PROFILE_ATTACHMENT_BYTES", 256ull * 1024 * 1024),
++                    4096, 4ull * 1024 * 1024 * 1024);
+                 newState->accepting.store(true, std::memory_order_release);
+                 std::fprintf(
+                     stderr,
+                     "RT64_PROFILE enabled=1 mode=%s output=%s summary=%s journal=%s budget_ms=%.3f max_events=%llu warmup_frames=%llu cooldown_frames=%llu min_duration_us=%llu slow_duration_us=%llu duration_interval=%llu counter_interval=%llu low_overhead_min_duration_us=%llu gpu_instrumentation=%d journal_interval_ms=%llu checkpoint_interval_ms=%llu\n",
+-                    newState->lowOverhead ? "low_overhead" : "detailed",
++                    newState->captureMode == PerformanceCaptureMode::Passive ? "passive" :
++                    newState->captureMode == PerformanceCaptureMode::SparseGPU ? "gpu" : "detailed",
+                     newState->outputPath.string().c_str(),
+                     newState->summaryPath.string().c_str(),
+                     newState->journalPath.string().c_str(),
+@@ -530,6 +882,7 @@
+                 );
+                 std::fflush(stderr);
+                 std::atexit([]() { PerformanceProfiler::finish(); });
++                std::at_quick_exit([]() { PerformanceProfiler::finish(); });
+                 return newState;
+             }();
+             if (instance->accepting.load(std::memory_order_acquire) &&
+@@ -537,9 +890,27 @@
+                     true,
+                     std::memory_order_acq_rel
+                 )) {
+-                startCheckpointObservation(*instance);
++                if (!instance->passiveRing) startCheckpointObservation(*instance);
++                if (!instance->controlPath.empty()) startControlObservation(*instance);
+             }
+             return *instance;
++        }
++
++        uint32_t passiveThreadId(ProfilerState &profiler) {
++            thread_local uint32_t id = profiler.nextPassiveThread.fetch_add(1, std::memory_order_relaxed) + 1;
++            return id;
++        }
++
++        uint64_t nativeThreadId() {
++            thread_local const uint64_t id =
++#ifdef _WIN32
++                GetCurrentThreadId();
++#elif defined(__linux__)
++                uint64_t(syscall(SYS_gettid));
++#else
++                0;
++#endif
++            return id;
+         }
+ 
+         ThreadBuffer *threadBuffer() {
+@@ -548,19 +919,45 @@
+                 return nullptr;
+             }
+ 
+-            thread_local ThreadBuffer *buffer = nullptr;
++            struct Registration {
++                ThreadBuffer *buffer = nullptr;
++                ~Registration() { if (buffer) buffer->retired.store(true, std::memory_order_release); }
++            };
++            thread_local Registration registration;
++            ThreadBuffer *&buffer = registration.buffer;
+             if (buffer == nullptr) {
+-                buffer = new ThreadBuffer(profiler.maximumEvents);
+-                buffer->name = "Thread";
+                 const std::scoped_lock lock(profiler.registryMutex);
+-                buffer->id = uint32_t(profiler.threadBuffers.size() + 1);
+-                profiler.threadBuffers.emplace_back(buffer);
++                for (ThreadBuffer *candidate : profiler.threadBuffers) {
++                    if (candidate->retired.exchange(false, std::memory_order_acq_rel)) {
++                        buffer = candidate;
++                        return buffer;
++                    }
++                }
++                if (profiler.threadBuffers.size() >= profiler.maximumThreads) {
++                    return nullptr;
++                }
++                try {
++                    const uint64_t remaining = profiler.maximumStreamBytes - profiler.allocatedStreamBytes.load();
++                    const uint64_t capacity = std::min(profiler.maximumStreamedEvents, remaining / sizeof(Event));
++                    if (capacity < 64) return nullptr;
++                    auto created = std::make_unique<ThreadBuffer>(profiler.maximumEvents, capacity);
++                    created->name = "Thread";
++                    created->id = uint32_t(profiler.threadBuffers.size() + 1);
++                    profiler.threadBuffers.emplace_back(created.get());
++                    profiler.allocatedStreamBytes.fetch_add(capacity * sizeof(Event));
++                    buffer = created.release();
++                }
++                catch (const std::bad_alloc &) { return nullptr; }
+             }
+ 
+             return buffer;
+         }
+ 
+         void copyEventName(Event &event, std::string_view name) {
++            if (name.empty() || name.size() >= event.name.size() || !validUTF8(name, false)) {
++                event.name[0] = '\0';
++                return;
++            }
+             const size_t count = std::min(name.size(), event.name.size() - 1);
+             std::copy_n(name.data(), count, event.name.data());
+             event.name[count] = '\0';
+@@ -600,6 +997,11 @@
+                 return;
+             }
+ 
++            if (tracker.pendingSamples.size() >= 4096 &&
++                tracker.pendingSamples.find(event.correlationId) == tracker.pendingSamples.end()) {
++                profiler.invalidEvents.fetch_add(1, std::memory_order_relaxed);
++                return;
++            }
+             SubmissionIntegritySample &sample =
+                 tracker.pendingSamples[event.correlationId];
+             sample.timestampNanoseconds = std::max(
+@@ -622,6 +1024,7 @@
+             }
+ 
+             const SubmissionIntegritySample completeSample = sample;
++            ++tracker.completeSamples;
+             tracker.pendingSamples.erase(event.correlationId);
+             const bool establishedWorld =
+                 tracker.peakGameplayDrawCalls >= 128.0 &&
+@@ -691,18 +1094,18 @@
+                 return false;
+             }
+             const uint64_t timestamp = event.timestampNanoseconds;
+-            try {
+-                const std::scoped_lock lock(buffer.streamedJournalMutex);
+-                buffer.streamedJournalEvents.emplace_back(std::move(event));
+-                updateSubmissionIntegrity(
+-                    profiler,
+-                    buffer.streamedJournalEvents.back()
+-                );
+-            }
+-            catch (const std::bad_alloc &) {
++            const uint64_t write = buffer.streamWrite.load(std::memory_order_relaxed);
++            const uint64_t read = buffer.streamRead.load(std::memory_order_acquire);
++            if (write - read >= buffer.streamCapacity) {
+                 buffer.droppedEvents.fetch_add(1, std::memory_order_relaxed);
+                 return false;
+             }
++            buffer.streamEvents[write % buffer.streamCapacity] = event;
++            buffer.streamWrite.store(write + 1, std::memory_order_release);
++            uint64_t high = profiler.backlogHighWater.load(std::memory_order_relaxed);
++            const uint64_t size = write - read + 1;
++            while (size > high && !profiler.backlogHighWater.compare_exchange_weak(high, size, std::memory_order_relaxed)) {}
++            updateSubmissionIntegrity(profiler, event);
+             buffer.latestTimestampNanoseconds.store(
+                 timestamp,
+                 std::memory_order_release
+@@ -713,7 +1116,27 @@
+ 
+         void appendEvent(Event event) {
+             ProfilerState &profiler = state();
++            struct Lease {
++                ProfilerState &state;
++                explicit Lease(ProfilerState &s) : state(s) { state.activeWriters.fetch_add(1, std::memory_order_acq_rel); }
++                ~Lease() { state.activeWriters.fetch_sub(1, std::memory_order_release); }
++            } lease(profiler);
+             if (!profiler.accepting.load(std::memory_order_acquire)) {
++                return;
++            }
++            if (!std::isfinite(event.value) || event.name[0] == '\0') {
++                profiler.invalidEvents.fetch_add(1, std::memory_order_relaxed);
++                profiler.droppedEvents.fetch_add(1, std::memory_order_relaxed);
++                return;
++            }
++            if (!profiler.recording.load(std::memory_order_acquire)) return;
++            thread_local uint64_t producerSequence = 0;
++            event.producerSequence = ++producerSequence;
++            if (profiler.passiveRing) {
++                const uint32_t id = passiveThreadId(profiler);
++                event.threadId = id;
++                event.osThreadId = nativeThreadId();
++                profiler.passiveRing->append(event);
+                 return;
+             }
+ 
+@@ -723,6 +1146,10 @@
+                 return;
+             }
+ 
++            // Identity belongs to the producer, not the retention destination.
++            event.threadId = passiveThreadId(profiler);
++            event.osThreadId = nativeThreadId();
++            if (profiler.incidentRing) profiler.incidentRing->append(event);
+             if (buffer->retentionExhausted) {
+                 appendStreamedJournalEvent(
+                     profiler,
+@@ -801,7 +1229,6 @@
+                 }
+             }
+ 
+-            event.threadId = buffer->id;
+             Event *chunk = buffer->eventChunks[chunkIndex].load(
+                 std::memory_order_acquire
+             );
+@@ -1508,14 +1935,161 @@
+                 << event.threadCpuDurationNanoseconds << ",\"correlation_id\":"
+                 << event.correlationId << ",\"argument0\":"
+                 << event.argument0 << ",\"argument1\":"
+-                << event.argument1 << ",\"gpu_start_ns\":"
++                << event.argument1 << ",\"producer_sequence\":" << event.producerSequence
++                << ",\"producer_thread_id\":" << event.threadId << ",\"gpu_start_ns\":"
+                 << event.gpuStartNanoseconds << ",\"gpu_end_ns\":"
+                 << event.gpuEndNanoseconds << ",\"value\":"
+                 << std::setprecision(17) << event.value << ",\"thread_id\":"
+-                << event.threadId << ",\"gpu_clock\":"
++                << event.threadId << ",\"os_thread_id\":" << event.osThreadId << ",\"thread_name\":\"";
++            const auto &profiler = state();
++            if (event.threadId > 0 && event.threadId <= profiler.maximumThreads &&
++                profiler.threadNamesReady[event.threadId - 1].load(std::memory_order_acquire))
++                output << jsonEscape(profiler.passiveThreadNames[event.threadId - 1].data());
++            output << "\",\"gpu_clock\":"
+                 << (event.gpuClock ? "true" : "false")
+                 << ",\"thread_cpu_measured\":"
+-                << (event.threadCpuMeasured ? "true" : "false") << "}\n";
++                << (event.threadCpuMeasured ? "true" : "false")
++                << ",\"thread_scope\":" << (event.threadScope ? "true" : "false") << "}\n";
++        }
++
++        bool writeIncidentSnapshot(ProfilerState &profiler, uint64_t generation) {
++            if (generation > profiler.maximumIncidents) return false;
++            auto *ring = profiler.passiveRing ? profiler.passiveRing.get() : profiler.incidentRing.get();
++            if (!ring) return false;
++            uint64_t busy = 0;
++            const auto events = ring->snapshot(busy);
++            std::filesystem::path base = profiler.outputPath;
++            base += ".snapshot-" + std::to_string(generation) + ".json";
++            const std::filesystem::path journalPath = base.string() + ".journal.jsonl";
++            const std::filesystem::path summaryPath = base.string() + ".summary.json";
++            if (std::filesystem::exists(journalPath) || std::filesystem::exists(summaryPath)) return false;
++            if (profiler.snapshotBytes >= profiler.maximumSnapshotBytes) return false;
++            std::ofstream journalFile(journalPath, std::ios::binary);
++            if (!journalFile) return false;
++            const uint64_t available = profiler.maximumSnapshotBytes - profiler.snapshotBytes;
++            LimitedOutput limited(journalFile.rdbuf(), available);
++            std::ostream journal(&limited);
++            journal << "{\"record\":\"header\",\"schema\":\"rt64-performance-journal-v1\"}\n";
++            std::map<std::string, std::string> metadata;
++            { const std::scoped_lock lock(profiler.metadataMutex); metadata = profiler.metadata; }
++            for (const auto &entry : metadata) journal << "{\"record\":\"metadata\",\"key\":\""
++                << jsonEscape(entry.first) << "\",\"value\":\"" << jsonEscape(entry.second) << "\"}\n";
++            for (const auto &event : events) writeJournalEvent(journal, event);
++            journal.flush();
++            const bool healthy = journal.good();
++            journalFile.close();
++            profiler.snapshotBytes += available - limited.unused();
++            if (!healthy || journalFile.fail()) return false;
++            std::ofstream summary(summaryPath, std::ios::binary);
++            summary << "{\"schema\":\"n64profiler-snapshot-v1\",\"analysis_scope\":\"ROLLING_EVENT_WINDOW\",\"budget_ms\":"
++                << profiler.budgetMilliseconds << ",\"durability\":{\"journal_healthy\":true,\"journal_events_written\":"
++                << events.size() << ",\"events_dropped\":" << busy + ring->dropped()
++                << ",\"events_streamed_only\":0},\"snapshot_generation\":" << generation << "}\n";
++            summary.flush();
++            const bool written = summary.good();
++            summary.close();
++            return written && !summary.fail();
++        }
++
++        void startControlObservation(ProfilerState &profiler) {
++            std::error_code error;
++            std::filesystem::create_directories(profiler.controlPath, error);
++            if (error) { profiler.invalidEvents.fetch_add(1); return; }
++            profiler.controlRunning.store(true);
++            profiler.controlThread = std::thread([&profiler]() {
++                uint64_t lastRequest = 0, generation = 0;
++                std::string result = "ready";
++                const auto requestPath = profiler.controlPath / "command.txt";
++                const auto processingPath = profiler.controlPath / "processing.txt";
++                const auto statusPath = profiler.controlPath / "status.json";
++                const auto statusTemporary = profiler.controlPath / "status.json.tmp";
++                while (profiler.controlRunning.load(std::memory_order_acquire)) {
++                    try {
++                        std::error_code error;
++                        if (std::filesystem::exists(requestPath) && !std::filesystem::exists(processingPath)) {
++                            std::filesystem::rename(requestPath, processingPath, error);
++                            if (!error) {
++                                if (std::filesystem::file_size(processingPath) > 512) result = "rejected_oversized_command";
++                                else {
++                                    std::ifstream request(processingPath);
++                                    uint64_t identity = 0;
++                                    std::string command;
++                                    request >> identity >> command;
++                                    if (!request || identity <= lastRequest) result = "rejected_stale_or_invalid_command";
++                                    else {
++                                        lastRequest = identity;
++                                        result = "ok";
++                                        if (command == "start") {
++                                            profiler.resumeTimestamp.store(PerformanceProfiler::nowNanoseconds(), std::memory_order_release);
++                                            profiler.recording.store(true, std::memory_order_release);
++                                            PerformanceProfiler::recordCriticalInstant(PerformanceCategory::CPU, "Recorder.CaptureStarted", identity);
++                                        }
++                                        else if (command == "stop") {
++                                            PerformanceProfiler::recordCriticalInstant(PerformanceCategory::CPU, "Recorder.CaptureStopped", identity);
++                                            profiler.recording.store(false, std::memory_order_release);
++                                            result = writeIncidentSnapshot(profiler, ++generation) ? "snapshot_written" : "snapshot_failed";
++                                        }
++                                        else if (command == "mark") {
++                                            if (!profiler.recording.load()) result = "rejected_not_recording";
++                                            else {
++                                                PerformanceProfiler::recordCriticalInstant(PerformanceCategory::CPU, "Recorder.Marker", identity);
++                                                profiler.incidentDeadline.store(PerformanceProfiler::nowNanoseconds() + profiler.incidentPostNanoseconds);
++                                            }
++                                        }
++                                        else if (command == "snapshot") result = writeIncidentSnapshot(profiler, ++generation) ? "snapshot_written" : "snapshot_failed";
++                                        else if (command != "status") result = "rejected_unknown_command";
++                                    }
++                                }
++                                std::filesystem::remove(processingPath, error);
++                            }
++                        }
++                        const uint64_t deadline = profiler.incidentDeadline.load(std::memory_order_acquire);
++                        if (deadline && PerformanceProfiler::nowNanoseconds() >= deadline) {
++                            result = writeIncidentSnapshot(profiler, ++generation) ? "snapshot_written" : "snapshot_failed";
++                            profiler.incidentDeadline.store(0, std::memory_order_release);
++                        }
++                        std::ofstream status(statusTemporary, std::ios::binary);
++                        status << "{\"schema\":\"n64profiler-control-v1\",\"pid\":" << profiler.processId
++                            << ",\"capture\":\"" << jsonEscape(profiler.outputPath.u8string())
++                            << "\",\"recording\":" << (profiler.recording.load() ? "true" : "false")
++                            << ",\"gpu_configured\":" << (profiler.gpuInstrumentation ? "true" : "false")
++                            << ",\"gpu_active\":" << (PerformanceProfiler::gpuInstrumentationEnabled() ? "true" : "false")
++                            << ",\"last_request\":" << lastRequest << ",\"result\":\"" << result
++                            << "\",\"snapshot_generation\":" << generation << ",\"heartbeat_ns\":" << PerformanceProfiler::nowNanoseconds()
++                            << ",\"dropped\":" << profiler.droppedEvents.load()
++                            << ",\"invalid_events\":" << profiler.invalidEvents.load()
++                            << ",\"ring_rejected\":" << (profiler.passiveRing ? profiler.passiveRing->dropped() : 0)
++                            << ",\"ring_submitted\":" << (profiler.passiveRing ? profiler.passiveRing->submitted() : 0)
++                            << ",\"ring_capacity\":" << (profiler.passiveRing ? profiler.maximumEvents : 0)
++                            << ",\"aggregate_storage_bytes\":" << sizeof(profiler.aggregates)
++                            << ",\"stream_high_water_per_thread\":" << profiler.backlogHighWater.load()
++                            << ",\"journal_running\":" << (profiler.checkpointRunning.load() ? "true" : "false")
++                            << ",\"journal_healthy\":" << (profiler.journalHealthy.load() ? "true" : "false")
++                            << ",\"journal_events_written\":" << profiler.journalEventsWritten.load()
++                            << ",\"snapshot_bytes\":" << profiler.snapshotBytes
++                            << ",\"attachment_rejected\":" << profiler.attachments.rejected.load()
++                            << ",\"attachment_failed\":" << profiler.attachments.failed.load()
++                            << ",\"attachment_written_bytes\":" << profiler.attachments.written.load() << "}\n";
++                        status.flush();
++                        const bool good = status.good();
++                        status.close();
++                        if (good && !status.fail()) replaceFileAtomically(statusTemporary, statusPath);
++                    }
++                    catch (const std::exception &) { result = "control_io_failure"; }
++                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++                }
++                // Publish terminal control state without implying final files succeeded.
++                std::ofstream terminal(statusTemporary, std::ios::binary);
++                terminal << "{\"schema\":\"n64profiler-control-v1\",\"pid\":" << profiler.processId
++                    << ",\"capture\":\"" << jsonEscape(profiler.outputPath.u8string())
++                    << "\",\"recording\":false,\"last_request\":" << lastRequest
++                    << ",\"result\":\"finalizing\",\"snapshot_generation\":" << generation
++                    << ",\"heartbeat_ns\":" << PerformanceProfiler::nowNanoseconds() << "}\n";
++                terminal.flush();
++                const bool good = terminal.good();
++                terminal.close();
++                if (good && !terminal.fail()) replaceFileAtomically(statusTemporary, statusPath);
++            });
+         }
+ 
+         bool writeLiveCheckpoint(
+@@ -1547,6 +2121,7 @@
+             bool submissionCollapseDetected = false;
+             uint64_t submissionCollapseTimestamp = 0u;
+             uint64_t collapsedSubmissionSamples = 0u;
++            uint64_t observedSubmissionSamples = 0u;
+             {
+                 const std::scoped_lock lock(
+                     profiler.submissionIntegrityMutex
+@@ -1557,12 +2132,13 @@
+                     profiler.submissionIntegrity.detectedCollapseTimestamp;
+                 collapsedSubmissionSamples =
+                     profiler.submissionIntegrity.collapsedSampleCount;
++                observedSubmissionSamples = profiler.submissionIntegrity.completeSamples;
+             }
+             output << "{\n"
+                 << "  \"schema\": \"rt64-performance-live-v1\",\n"
+                 << "  \"generation\": " << generation << ",\n"
+                 << "  \"journal\": \""
+-                << jsonEscape(profiler.journalPath.string()) << "\",\n"
++                << jsonEscape(profiler.journalPath.u8string()) << "\",\n"
+                 << "  \"journal_healthy\": "
+                 << (profiler.journalHealthy.load(std::memory_order_acquire)
+                     ? "true" : "false") << ",\n"
+@@ -1585,7 +2161,9 @@
+                 << "  \"submission_integrity\": {\"status\":\""
+                 << (submissionCollapseDetected
+                     ? "WORLD_SUBMISSION_COLLAPSE"
+-                    : "NO_SUSTAINED_GAMEPLAY_COLLAPSE")
++                    : (observedSubmissionSamples == 0
++                        ? "UNOBSERVED_REQUIRED_PRODUCERS"
++                        : "NO_SUSTAINED_GAMEPLAY_COLLAPSE"))
+                 << "\",\"detected\":"
+                 << (submissionCollapseDetected ? "true" : "false")
+                 << ",\"collapsed_sample_count\":"
+@@ -1615,7 +2193,7 @@
+                 profiler.metadata["capture_durability"] =
+                     "incremental_jsonl_journal";
+                 profiler.metadata["journal_path"] =
+-                    profiler.journalPath.string();
++                    profiler.journalPath.u8string();
+                 profiler.metadata["journal_interval_ms"] =
+                     std::to_string(profiler.journalIntervalMilliseconds);
+                 profiler.metadata["live_checkpoint_interval_ms"] =
+@@ -1623,11 +2201,11 @@
+             }
+             profiler.checkpointRunning.store(true, std::memory_order_release);
+             profiler.checkpointThread = std::thread([&profiler]() {
+-                std::ofstream journal(
++                std::ofstream journalFile(
+                     profiler.journalPath,
+                     std::ios::binary | std::ios::trunc
+                 );
+-                if (!journal.is_open()) {
++                if (!journalFile.is_open()) {
+                     std::fprintf(
+                         stderr,
+                         "RT64_PROFILE journal_open_failed=1 path=%s\n",
+@@ -1641,6 +2219,8 @@
+                     return;
+                 }
+ 
++                LimitedOutput limited(journalFile.rdbuf(), profiler.maximumJournalBytes);
++                std::ostream journal(&limited);
+                 journal << "{\"record\":\"header\",\"schema\":\"rt64-performance-journal-v1\",\"clock\":\"steady_clock_nanoseconds\"}\n";
+                 journal.flush();
+                 profiler.journalHealthy.store(
+@@ -1653,6 +2233,10 @@
+                 std::map<std::string, std::string> writtenMetadata;
+                 auto nextLiveCheckpoint = Clock::now();
+                 while (true) {
++                    // Observe shutdown before snapshotting producers.
++                    const bool finalDrain = !profiler.checkpointRunning.load(
++                        std::memory_order_acquire
++                    );
+                     std::vector<ThreadBuffer *> buffers;
+                     {
+                         const std::scoped_lock registryLock(
+@@ -1691,12 +2278,12 @@
+                         const auto previousName = threadNames.find(buffer);
+                         if ((previousName == threadNames.end()) ||
+                             (previousName->second != name)) {
+-                            journal << "{\"record\":\"thread\",\"thread_id\":"
+-                                << buffer->id << ",\"name\":\""
+-                                << jsonEscape(name) << "\"}\n";
++                            // Event thread IDs survive storage-slot reuse.
+                             threadNames[buffer] = name;
+                         }
+ 
++                        // Snapshot overflow before draining producer buffers.
++                        const uint64_t streamEnd = buffer->streamWrite.load(std::memory_order_acquire);
+                         uint64_t &cursor = cursors[buffer];
+                         const uint64_t count = buffer->eventCount.load(
+                             std::memory_order_acquire
+@@ -1710,17 +2302,10 @@
+                             ++eventsWritten;
+                         }
+ 
+-                        std::deque<Event> streamedEvents;
+-                        {
+-                            const std::scoped_lock streamedLock(
+-                                buffer->streamedJournalMutex
+-                            );
+-                            streamedEvents.swap(
+-                                buffer->streamedJournalEvents
+-                            );
+-                        }
+-                        for (const Event &event : streamedEvents) {
+-                            writeJournalEvent(journal, event);
++                        uint64_t read = buffer->streamRead.load(std::memory_order_relaxed);
++                        while (read < streamEnd) {
++                            writeJournalEvent(journal, buffer->streamEvents[read % buffer->streamCapacity]);
++                            buffer->streamRead.store(++read, std::memory_order_release);
+                             ++eventsWritten;
+                         }
+                     }
+@@ -1730,10 +2315,9 @@
+                         healthy,
+                         std::memory_order_release
+                     );
+-                    profiler.journalEventsWritten.fetch_add(
+-                        eventsWritten,
+-                        std::memory_order_release
+-                    );
++                    // Count only a successfully flushed batch, never attempted writes.
++                    if (healthy) profiler.journalEventsWritten.fetch_add(
++                        eventsWritten, std::memory_order_release);
+                     profiler.journalFlushCount.fetch_add(
+                         1,
+                         std::memory_order_release
+@@ -1747,22 +2331,91 @@
+                         );
+                     }
+ 
+-                    if (!healthy ||
+-                        !profiler.checkpointRunning.load(
+-                            std::memory_order_acquire
+-                        )) {
++                    if (!healthy || finalDrain) {
+                         break;
+                     }
+-                    std::this_thread::sleep_for(std::chrono::milliseconds(
+-                        profiler.journalIntervalMilliseconds
+-                    ));
+-                }
+-                journal.close();
++                    if (profiler.checkpointRunning.load(std::memory_order_acquire)) {
++                        std::this_thread::sleep_for(std::chrono::milliseconds(
++                            profiler.journalIntervalMilliseconds
++                        ));
++                    }
++                }
++                journalFile.close();
++                if (journalFile.fail()) profiler.journalHealthy.store(false, std::memory_order_release);
+                 profiler.checkpointRunning.store(
+                     false,
+                     std::memory_order_release
+                 );
+             });
++        }
++
++        template<size_t Count> void writeNames(std::ostream &output, const std::array<const char *, Count> &names) {
++            output << '[';
++            for (size_t i = 0; i < Count; ++i) {
++                if (i) output << ',';
++                output << '\"' << jsonEscape(names[i]) << '\"';
++            }
++            output << ']';
++        }
++
++        void writeSharedContext(std::ostream &output, const ProfilerState &profiler) {
++            output << "  \"rt64_event_vocabulary_revision\":" << PerformanceProfilerContract::SchemaVersion << ",\n";
++            output << "  \"gpu_sample_interval\":" << (profiler.gpuInstrumentation ? profiler.gpuFrameSampleInterval : 0)
++                << ",\n  \"render_workers\":[";
++            const uint32_t count = std::min<uint32_t>(profiler.nextRenderWorker.load(), uint32_t(profiler.renderWorkers.size()));
++            for (uint32_t i = 0; i < count; ++i) {
++                const auto &worker = profiler.renderWorkers[i];
++                if (i) output << ',';
++                output << "{\"worker_id\":" << worker.workerId << ",\"name\":\"" << jsonEscape(worker.name.data())
++                    << "\",\"logical_queue_id\":" << worker.logicalQueueId << ",\"native_queue_id\":" << worker.nativeQueueId
++                    << ",\"command_list_type\":" << worker.commandListType << '}';
++            }
++            output << "],\n  \"render_worker_metadata_dropped\":" << profiler.droppedRenderWorkers.load()
++                << ",\n  \"observer_invariants\":{\"secondary_graphics_devices\":" << profiler.secondaryGraphicsDevices.load()
++                << ",\"gpu_query_commands\":" << profiler.gpuQueryCommands.load()
++                << ",\"backend_fence_status_queries\":" << profiler.backendFenceStatusQueries.load()
++                << ",\"frame_path_allocations\":" << profiler.framePathAllocations.load()
++                << ",\"host_sampler\":" << (profiler.hostObservationStarted.load() ? "true" : "false")
++                << ",\"external_display_sampler\":" << (profiler.displayObservationStarted.load() ? "true" : "false")
++                << ",\"control_thread_enabled\":" << (!profiler.controlPath.empty() ? "true" : "false") << "},\n";
++            output << "  \"storage\":{\"maximum_named_threads\":" << profiler.maximumThreads
++                << ",\"registered_threads\":" << profiler.nextPassiveThread.load()
++                << ",\"maximum_render_workers\":1024,\"registered_render_workers\":" << count
++                << ",\"event_capacity\":" << profiler.maximumEvents
++                << ",\"allocated_buffers\":" << (profiler.passiveRing ? 1 : profiler.threadBuffers.size())
++                << ",\"reserved_bytes\":" << (profiler.passiveRing ? profiler.passiveRing->bytes() : 0)
++                << ",\"event_bytes\":" << (profiler.passiveRing ? profiler.passiveRing->bytes() / profiler.maximumEvents : sizeof(Event))
++                << ",\"reserved_bytes_scope\":\"PASSIVE_RING_ONLY_NOT_TOTAL_PROCESS_MEMORY\"},\n";
++            output << "  \"sampled_frame_counters\":";
++            output << '[';
++            bool firstCounter = true;
++            const auto counterName = [&](const char *name) {
++                if (!firstCounter) output << ',';
++                firstCounter = false;
++                output << '\"' << jsonEscape(name) << '\"';
++            };
++            for (const char *name : PerformanceEventNames::SampledRendererFrameCounters) counterName(name);
++            for (const auto &pair : PerformanceEventNames::SampledRendererPairExtentCounters)
++                for (const char *name : pair) counterName(name);
++            output << ']';
++            output << ",\n  \"sampled_gpu_stage_counters\":";
++            writeNames(output, PerformanceEventNames::SampledRendererGPUStageCounters);
++            output << ",\n  \"interpolation_batch_counters\":";
++            writeNames(output, PerformanceEventNames::WorkloadInterpolationBatchCounters);
++            output << ",\n";
++        }
++
++        uint64_t omittedTraceEvents(const ProfilerState &profiler, const std::vector<ThreadBuffer *> &buffers) {
++            if (profiler.passiveRing || profiler.keepDrawEvents) return 0;
++            uint64_t omitted = 0;
++            for (const auto *buffer : buffers) {
++                const uint64_t count = buffer->eventCount.load(std::memory_order_acquire);
++                for (uint64_t i = 0; i < count; ++i) {
++                    const std::string_view name(eventAt(*buffer, i).name.data());
++                    if (name.substr(0, 9) == "GPU.Draw.") ++omitted;
++                }
++            }
++            return omitted;
+         }
+ 
+         bool writeTrace(
+@@ -1776,9 +2429,12 @@
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-trace-v1\",\n";
++            output << "{\n  \"schema\": \"n64profiler-trace-v1\",\n";
+             output << "  \"clock\": \"steady_clock_nanoseconds\",\n";
++            output << "  \"capture_mode\":\"" << (profiler.passiveRing ?
++                (profiler.gpuInstrumentation ? "sparse_gpu" : "passive") : "detailed") << "\",\n";
+             output << "  \"gpu_clock_alignment\": \"fence_completion_estimate\",\n";
++            writeSharedContext(output, profiler);
+             output << "  \"traceEvents\": [\n";
+             bool first = true;
+             auto separator = [&]() {
+@@ -1787,6 +2443,14 @@
+                 }
+                 first = false;
+             };
++            {
++                const uint32_t count = std::min<uint32_t>(profiler.nextPassiveThread.load(), uint32_t(profiler.maximumThreads));
++                for (uint32_t i = 0; i < count; ++i) {
++                    separator();
++                    output << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":" << i + 1
++                        << ",\"args\":{\"name\":\"" << jsonEscape(profiler.passiveThreadNames[i].data()) << "\"}}";
++                }
++            }
+ 
+             for (const ThreadBuffer *buffer : buffers) {
+                 std::string threadName;
+@@ -1794,14 +2458,18 @@
+                     const std::scoped_lock nameLock(buffer->nameMutex);
+                     threadName = buffer->name;
+                 }
+-                separator();
+-                output << "    {\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":"
+-                    << buffer->id << ",\"args\":{\"name\":\""
+-                    << jsonEscape(threadName) << "\"}}";
++                // Buffer slots are not logical thread identities.
+             }
+             separator();
+             output << "    {\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":4294967294,\"args\":{\"name\":\"RT64 GPU samples\"}}";
+ 
++            // Reuse one bounded event string.
++            std::string line;
++            line.reserve(1024);
++            const auto integer = [&](std::string_view prefix, uint64_t value) {
++                line.append(prefix);
++                appendTraceInteger(line, value);
++            };
+             for (const ThreadBuffer *buffer : buffers) {
+                 const uint64_t eventCount = buffer->eventCount.load(
+                     std::memory_order_acquire
+@@ -1812,7 +2482,7 @@
+                     const Event &event = eventAt(*buffer, eventIndex);
+                     constexpr std::string_view DrawPrefix = "GPU.Draw.";
+                     const std::string_view eventName(event.name.data());
+-                    if (!profiler.keepDrawEvents &&
++                    if (!profiler.passiveRing && !profiler.keepDrawEvents &&
+                         (eventName.size() >= DrawPrefix.size()) &&
+                         (eventName.substr(0, DrawPrefix.size()) == DrawPrefix)) {
+                         continue;
+@@ -1821,42 +2491,48 @@
+                     const uint32_t traceThread = event.gpuClock
+                         ? 4'294'967'294u
+                         : event.threadId;
+-                    output << "    {\"name\":\"" << jsonEscape(event.name.data())
+-                        << "\",\"cat\":\"" << categoryName(event.category)
+-                        << "\",\"pid\":1,\"tid\":" << traceThread
+-                        << ",\"ts\":" << std::fixed << std::setprecision(3)
+-                        << (double(event.timestampNanoseconds) / 1'000.0);
++                    line = "    {\"name\":\"";
++                    line += jsonEscape(event.name.data());
++                    line += "\",\"cat\":\"";
++                    line += categoryName(event.category);
++                    integer("\",\"pid\":1,\"tid\":", traceThread);
++                    line += ",\"ts\":";
++                    appendTraceMicroseconds(line, event.timestampNanoseconds);
+                     switch (event.kind) {
+                     case EventKind::Duration:
+-                        output << ",\"ph\":\"X\",\"dur\":"
+-                            << (double(event.durationNanoseconds) / 1'000.0);
++                        line += ",\"ph\":\"X\",\"dur\":";
++                        appendTraceMicroseconds(line, event.durationNanoseconds);
+                         break;
+                     case EventKind::Instant:
+-                        output << ",\"ph\":\"i\",\"s\":\"t\"";
++                        line += ",\"ph\":\"i\",\"s\":\"t\"";
+                         break;
+                     case EventKind::Counter:
+-                        output << ",\"ph\":\"C\"";
++                        line += ",\"ph\":\"C\"";
+                         break;
+                     }
+-                    output << ",\"args\":{\"correlation_id\":"
+-                        << event.correlationId << ",\"argument0\":"
+-                        << event.argument0 << ",\"argument1\":"
+-                        << event.argument1;
++                    integer(",\"args\":{\"correlation_id\":", event.correlationId);
++                    integer(",\"argument0\":", event.argument0);
++                    integer(",\"argument1\":", event.argument1);
++                    integer(",\"os_thread_id\":", event.osThreadId);
++                    integer(",\"producer_thread_id\":", event.threadId);
++                    integer(",\"producer_sequence\":", event.producerSequence);
++                    integer(",\"timestamp_ns\":", event.timestampNanoseconds);
++                    integer(",\"duration_ns\":", event.durationNanoseconds);
++                    line += event.threadScope ? ",\"thread_scope\":true" : ",\"thread_scope\":false";
+                     if (event.kind == EventKind::Counter) {
+-                        output << ",\"value\":" << event.value;
++                        line += ",\"value\":";
++                        appendTraceCounter(line, event.value);
+                     }
+                     if (event.threadCpuMeasured) {
+-                        output << ",\"thread_cpu_duration_ns\":"
+-                            << event.threadCpuDurationNanoseconds;
++                        integer(",\"thread_cpu_duration_ns\":", event.threadCpuDurationNanoseconds);
+                     }
+                     if (event.gpuClock) {
+-                        output << ",\"raw_gpu_start_ns\":"
+-                            << event.gpuStartNanoseconds
+-                            << ",\"raw_gpu_end_ns\":"
+-                            << event.gpuEndNanoseconds
+-                            << ",\"alignment\":\"fence_completion_estimate\"";
++                        integer(",\"raw_gpu_start_ns\":", event.gpuStartNanoseconds);
++                        integer(",\"raw_gpu_end_ns\":", event.gpuEndNanoseconds);
++                        line += ",\"alignment\":\"fence_completion_estimate\"";
+                     }
+-                    output << "}}";
++                    line += "}}";
++                    output.write(line.data(), std::streamsize(line.size()));
+                 }
+             }
+ 
+@@ -1883,7 +2559,10 @@
+                 << ",\n    \"dropped_events\": "
+                 << droppedEventCount(profiler, buffers)
+                 << "\n  }\n}\n";
+-            return output.good();
++            output.flush();
++            const bool written = output.good();
++            output.close();
++            return written && !output.fail();
+         }
+ 
+         bool isFrameContainer(std::string_view name) {
+@@ -2272,7 +2951,9 @@
+                             (eventName ==
+                                 "Workload.PresentationSetCommitWait") ||
+                             (eventName ==
+-                                "Workload.FirstPresentationQueueWait")) {
++                                "Workload.FirstPresentationQueueWait") ||
++                            (eventName ==
++                                "Renderer.PresentationQueueWait")) {
+                             presentationHandoffMilliseconds[
+                                 event.correlationId
+                             ] += milliseconds;
+@@ -3351,3 +4032,4 @@
++            uint64_t observedSubmissionSamples = 0u;
+             {
+                 const std::scoped_lock lock(
+                     profiler.submissionIntegrityMutex
+@@ -3358,6 +4040,7 @@
+                 const SubmissionIntegrityTracker &tracker =
+                     profiler.submissionIntegrity;
+                 worldSubmissionCollapseDetected = tracker.collapseDetected;
++                observedSubmissionSamples = tracker.completeSamples;
+                 collapsedSubmissionSampleCount = tracker.collapsedSampleCount;
+                 detectedCollapseTimestamp =
+                     tracker.detectedCollapseTimestamp;
+@@ -4889,10 +5572,20 @@
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v47\",\n";
++            output << "{\n  \"schema\": \"n64profiler-summary-v1\",\n";
++            writeSharedContext(output, profiler);
+             output << "  \"capture_mode\": \""
+-                << (profiler.lowOverhead ? "low_overhead" : "detailed")
++                << (profiler.passiveRing ? (profiler.gpuInstrumentation ? "sparse_gpu" : "passive") :
++                    (profiler.lowOverhead ? "low_overhead" : "detailed"))
+                 << "\",\n";
++            output << "  \"attachments\": {\"maximum_bytes\":" << profiler.attachments.maximumBytes
++                << ",\"maximum_pending_bytes\":" << AttachmentWriter::maximumPending
++                << ",\"reserved_bytes\":" << profiler.attachments.reserved.load()
++                << ",\"written_bytes\":" << profiler.attachments.written.load()
++                << ",\"pending_high_water_bytes\":" << profiler.attachments.highWater.load()
++                << ",\"completed\":" << profiler.attachments.completed.load()
++                << ",\"rejected\":" << profiler.attachments.rejected.load()
++                << ",\"failed\":" << profiler.attachments.failed.load() << "},\n";
+             output << "  \"durability\": {\"journal_schema\":\"rt64-performance-journal-v1\",\"journal_interval_ms\":"
+                 << profiler.journalIntervalMilliseconds
+                 << ",\"live_checkpoint_interval_ms\":"
+@@ -4919,7 +5612,14 @@
+                 << ",\"events_streamed_only\":"
+                 << streamedOnlyEventCount(buffers)
+                 << ",\"events_dropped\":"
+-                << droppedEventCount(profiler, buffers) << "},\n";
++                << droppedEventCount(profiler, buffers)
++                << ",\"invalid_events\":" << profiler.invalidEvents.load()
++                << ",\"trace_events_omitted\":" << omittedTraceEvents(profiler, buffers)
++                << ",\"maximum_stream_bytes\":" << profiler.maximumStreamBytes
++                << ",\"allocated_stream_bytes\":" << profiler.allocatedStreamBytes.load()
++                << ",\"stream_capacity_per_thread\":" << profiler.maximumStreamedEvents
++                << ",\"stream_high_water_per_thread\":" << profiler.backlogHighWater.load()
++                << ",\"maximum_threads\":" << profiler.maximumThreads << "},\n";
+             output << "  \"metadata\": {";
+             size_t summaryMetadataIndex = 0;
+             for (const auto &[key, value] : profiler.metadata) {
+@@ -4930,15 +5630,25 @@
+                     << jsonEscape(value) << "\"";
+             }
+             output << "},\n";
+-            output << "  \"diagnosis\": \"" << diagnosis << "\",\n";
+-            output << "  \"confidence\": \"" << confidence << "\",\n";
++            const bool completeSummary = recordedEventCount(buffers) == retainedEventCount(buffers)
++                && droppedEventCount(profiler, buffers) == 0 && profiler.invalidEvents.load() == 0
++                && profiler.attachments.rejected.load() == 0 && profiler.attachments.failed.load() == 0
++                && (!profiler.passiveRing || profiler.passiveRing->submitted() <= retainedEventCount(buffers));
++            output << "  \"analysis_scope\": \""
++                << (completeSummary ? "ALL_RECORDED_EVENTS" : (profiler.passiveRing ? "ROLLING_EVENT_WINDOW" : "RETAINED_EVENT_PREFIX_ONLY")) << "\",\n";
++            output << "  \"retained_prefix_diagnosis\": \"" << diagnosis << "\",\n";
++            output << "  \"diagnosis\": \""
++                << (completeSummary ? diagnosis : (profiler.passiveRing ? "PARTIAL_ROLLING_WINDOW" : "INCOMPLETE_SUMMARY_USE_DURABLE_JOURNAL")) << "\",\n";
++            output << "  \"confidence\": \"" << (completeSummary ? confidence : "partial") << "\",\n";
+             output << "  \"primary_stage\": \"" << jsonEscape(primaryStage) << "\",\n";
+             output << "  \"primary_stage_p95_ms\": " << std::fixed
+                 << std::setprecision(3) << primaryP95 << ",\n";
+             output << "  \"submission_integrity\": {\"status\":\""
+                 << (worldSubmissionCollapseDetected
+                     ? "WORLD_SUBMISSION_COLLAPSE"
+-                    : "NO_SUSTAINED_GAMEPLAY_COLLAPSE")
++                    : (observedSubmissionSamples == 0
++                        ? "UNOBSERVED_REQUIRED_PRODUCERS"
++                        : (!completeSummary ? "RETAINED_PREFIX_ONLY" : "NO_SUSTAINED_GAMEPLAY_COLLAPSE")))
+                 << "\",\"detected\":"
+                 << (worldSubmissionCollapseDetected ? "true" : "false")
+                 << ",\"required_consecutive_samples\":"
+@@ -5174,7 +5887,13 @@
+                 << "},\n";
+             output << "  \"thread_execution\": {\"available\":"
+                 << (!threadExecutionStatistics.empty() ? "true" : "false")
+-                << ",\"clock\":\"thread_cpu_time\",\"stages\":[";
++                << ",\"clock\":\"thread_cpu_time\""
++#ifdef _WIN32
++                << ",\"resolution_status\":\"UNSUITABLE_FOR_SUBFRAME_OFF_CPU_INFERENCE\""
++#else
++                << ",\"resolution_status\":\"PLATFORM_THREAD_CPU_CLOCK\""
++#endif
++                << ",\"stages\":[";
+             for (size_t i = 0; i < threadExecutionStatistics.size(); i++) {
+                 if (i > 0) {
+                     output << ',';
+@@ -5671,6 +6390,7 @@
+             uint64_t interpolationDecisionTargetAvailable = 0;
+             uint64_t interpolationDecisionSuperseded = 0;
+             uint64_t interpolationDecisionGenerated = 0;
++            uint64_t interpolationDecisionEnvironmentDisabled = 0;
+             for (const Event *event : interpolationDecisionEvents) {
+                 const uint64_t flags = event->argument0;
+                 interpolationDecisionMatching += (flags & (1u << 0u)) != 0;
+@@ -5679,6 +6399,7 @@
+                 interpolationDecisionTargetAvailable += (flags & (1u << 3u)) != 0;
+                 interpolationDecisionSuperseded += (flags & (1u << 4u)) != 0;
+                 interpolationDecisionGenerated += (flags & (1u << 5u)) != 0;
++                interpolationDecisionEnvironmentDisabled += (flags & (1u << 6u)) != 0;
+             }
+             output << "  \"interpolation_decisions\": {\"count\":"
+                 << interpolationDecisionEvents.size()
+@@ -5691,7 +6412,9 @@
+                 << ",\"presentation_superseded\":"
+                 << interpolationDecisionSuperseded
+                 << ",\"generated\":"
+-                << interpolationDecisionGenerated << "},\n";
++                << interpolationDecisionGenerated
++                << ",\"environment_disabled\":"
++                << interpolationDecisionEnvironmentDisabled << "},\n";
+             output << "  \"gpu_frame_p95_ms\": " << gpuFrameP95 << ",\n";
+             output << "  \"pacing_wait_p95_ms\": "
+                 << (largestPacing != nullptr
+@@ -5905,15 +6628,65 @@
+                     << percentile(entry.milliseconds, 1.0) << '}';
+             }
+             output << "]},\n";
++            std::map<std::string, uint64_t> observedNames;
++            for (const ThreadBuffer *buffer : buffers) {
++                const uint64_t count = buffer->eventCount.load(std::memory_order_acquire);
++                for (uint64_t i = 0; i < count; ++i) ++observedNames[eventAt(*buffer, i).name.data()];
++            }
++            const auto observed = [&](std::string_view prefix) {
++                for (const auto &entry : observedNames) {
++                    if (std::string_view(entry.first).substr(0, prefix.size()) == prefix) return true;
++                }
++                return false;
++            };
++            const auto categoryObserved = [&](PerformanceCategory category) {
++                for (const auto &entry : statistics) if (entry.category == category) return true;
++                return false;
++            };
++            output << "  \"producer_evidence\": {\"scope\":\"retained_events\",\"validated\":false,\"event_counts\":{";
++            bool firstEvidence = true;
++            for (const auto &entry : observedNames) {
++                if (!firstEvidence) output << ',';
++                firstEvidence = false;
++                output << '\"' << jsonEscape(entry.first) << "\":" << entry.second;
++            }
++            output << "}},\n";
++            output << "  \"whole_session_scopes\": {\"basis\":\"all_enabled_scope_calls_before_filtering_inclusive\",\"rejected_updates\":"
++                << profiler.aggregates.rejected.load() << ",\"storage_bytes\":" << sizeof(profiler.aggregates)
++                << ",\"shards_per_stage\":" << RecorderStorage::AggregateShardCount << ",\"stages\":[";
++            bool firstAggregate = true;
++            std::map<std::pair<std::string, uint8_t>, RecorderStorage::AggregateSnapshot> mergedAggregates;
++            for (const auto &entry : profiler.aggregates.entries) {
++                if (!entry.ready.load(std::memory_order_acquire)) continue;
++                const auto aggregate = entry.snapshot();
++                if (aggregate.count == 0) continue;
++                mergedAggregates[{entry.name.data(), entry.category}].merge(aggregate);
++            }
++            for (const auto &entry : mergedAggregates) {
++                const auto &aggregate = entry.second;
++                if (!firstAggregate) output << ',';
++                firstAggregate = false;
++                output << "{\"name\":\"" << jsonEscape(entry.first.first) << "\",\"category\":\""
++                    << categoryName(PerformanceCategory(entry.first.second)) << "\",\"count\":" << aggregate.count
++                    << ",\"total_ns\":" << aggregate.total << ",\"min_ns\":" << aggregate.minimum
++                    << ",\"max_ns\":" << aggregate.maximum << ",\"arithmetic_overflow\":" << (aggregate.overflow ? "true" : "false") << ",\"log2_ns_histogram\":[";
++                for (size_t bin = 0; bin < aggregate.histogram.size(); ++bin) {
++                    if (bin) output << ',';
++                    output << aggregate.histogram[bin];
++                }
++                output << "]}";
++            }
++            output << "]},\n";
+             output << "  \"coverage\": {\n"
+-                << "    \"cpu_phases\": true,\n"
++                << "    \"cpu_phases\": " << (categoryObserved(PerformanceCategory::CPU) ? "true" : "false") << ",\n"
+                 << "    \"thread_cpu_time_spans\": "
+                 << (!threadExecutionStatistics.empty() ? "true" : "false")
+                 << ",\n"
+-                << "    \"frame_production_and_backpressure\": true,\n"
+-                << "    \"buffered_queue_id_correlation\": true,\n"
+-                << "    \"output_marker_every_present\": true,\n"
+-                << "    \"critical_presentation_slow_stages_complete\": true,\n"
++                << "    \"frame_production_and_backpressure\": " << (observed("FrameProduction.") ? "true" : "false") << ",\n"
++                << "    \"buffered_queue_id_correlation\": false,\n"
++                << "    \"output_marker_every_present\": false,\n"
++                << "    \"critical_presentation_slow_stages_complete\": "
++                << "false,\n"
+                 << "    \"cadence_observations_excluded_from_causes\": true,\n"
+                 << "    \"rate_aware_interpolation_classification\": true,\n"
+                 << "    \"completed_scanout_timing\": "
+@@ -5945,9 +6718,9 @@
+                     ? "true"
+                     : "false")
+                 << ",\n"
+-                << "    \"graphics_action_queue_and_work_timing\": true,\n"
+-                << "    \"source_frame_deadline_accounting\": true,\n"
+-                << "    \"micro_stutter_and_long_short_detection\": true,\n"
++                << "    \"graphics_action_queue_and_work_timing\": " << (observed("FrameProduction.GraphicsTaskAction") ? "true" : "false") << ",\n"
++                << "    \"source_frame_deadline_accounting\": " << (observed("FrameProduction.RuntimeVI") ? "true" : "false") << ",\n"
++                << "    \"micro_stutter_and_long_short_detection\": " << (observed("Present.Submitted") ? "true" : "false") << ",\n"
+                 << "    \"aggregate_gpu_transaction_accounting\": "
+                 << (!gpuInterpolationTransactionMilliseconds.empty()
+                     ? "true"
+@@ -5955,9 +6728,9 @@
+                 << ",\n"
+                 << "    \"gpu_pass_durations\": "
+                 << (gpuFrame != nullptr ? "true" : "false") << ",\n"
+-                << "    \"queue_and_fence_waits\": true,\n"
+-                << "    \"shader_compilation_sampled\": true,\n"
+-                << "    \"resource_uploads_sampled\": true,\n"
++                << "    \"queue_and_fence_waits\": " << (categoryObserved(PerformanceCategory::Wait) ? "true" : "false") << ",\n"
++                << "    \"shader_compilation_sampled\": " << (categoryObserved(PerformanceCategory::Compile) ? "true" : "false") << ",\n"
++                << "    \"resource_uploads_sampled\": " << (categoryObserved(PerformanceCategory::Upload) ? "true" : "false") << ",\n"
+                 << "    \"fast_duration_filter_us\": "
+                 << (profiler.minimumDurationNanoseconds / 1'000) << ",\n"
+                 << "    \"slow_duration_us\": "
+@@ -5976,8 +6749,7 @@
+                 << (!hostSystemCpu.empty() ? "true" : "false") << ",\n"
+                 << "    \"host_process_gpu_sampling\": "
+                 << (hostGpuSamplingAvailable ? "true" : "false") << ",\n"
+-                << "    \"os_driver_sampling\": "
+-                << (hostGpuSamplingAvailable ? "true" : "false") << ",\n"
++                << "    \"os_driver_sampling\": false,\n"
+                 << "    \"raw_draw_events_written\": "
+                 << (profiler.keepDrawEvents ? "true" : "false") << "\n"
+                 << "  },\n";
+@@ -6031,7 +6803,10 @@
+                 << "backend exposes it. A controlled "
+                 << "before/after capture is still required to prove that a code "
+                 << "change removes the cause.\"\n}\n";
+-            return output.good();
++            output.flush();
++            const bool written = output.good();
++            output.close();
++            return written && !output.fail();
+         }
+ 
+         void startHostObservation() {
+@@ -6041,6 +6816,7 @@
+                 return;
+             }
+ #if defined(_WIN32) || defined(__linux__)
++            profiler.hostObservationStarted.store(true, std::memory_order_release);
+             profiler.hostObservationRunning.store(
+                 true,
+                 std::memory_order_release
+@@ -6168,11 +6944,50 @@
+ 
+     bool PerformanceProfiler::enabled() {
+         const ProfilerState &profiler = state();
+-        return profiler.accepting.load(std::memory_order_acquire);
++        return profiler.accepting.load(std::memory_order_acquire) && profiler.recording.load(std::memory_order_acquire);
+     }
+ 
++    PerformanceCaptureMode PerformanceProfiler::mode() { return state().captureMode; }
++    bool PerformanceProfiler::intervalInstrumentationEnabled() {
++#ifdef N64PROFILER_HAS_PLUME_INTERVAL
++        return plume::rt64ProfileIntervalInstrumentationEnabled();
++#else
++        static const uint64_t interval = parseNonNegativeInteger("RT64_PROFILE_INTERVAL", 0);
++        return interval >= 30 && interval <= 1'000'000;
++#endif
++    }
++    void PerformanceProfiler::noteGPUQueryCommand(uint64_t count) { state().gpuQueryCommands.fetch_add(count, std::memory_order_relaxed); }
++    void PerformanceProfiler::noteBackendFenceStatusQuery(uint64_t count) { state().backendFenceStatusQueries.fetch_add(count, std::memory_order_relaxed); }
++    void PerformanceProfiler::noteSecondaryGraphicsDevice(uint64_t count) { state().secondaryGraphicsDevices.fetch_add(count, std::memory_order_relaxed); }
++    void PerformanceProfiler::noteFramePathAllocation(uint64_t count) { state().framePathAllocations.fetch_add(count, std::memory_order_relaxed); }
++    void PerformanceProfiler::registerRenderWorker(uint64_t workerId, std::string_view name,
++        uint64_t logicalQueueId, uint64_t nativeQueueId, uint32_t commandListType) {
++        auto &profiler = state();
++        profiler.activeWriters.fetch_add(1, std::memory_order_acq_rel);
++        if (profiler.accepting.load(std::memory_order_acquire)) {
++            if (name.size() >= profiler.renderWorkers[0].name.size() || !validUTF8(name, false)) {
++                profiler.invalidEvents.fetch_add(1, std::memory_order_relaxed);
++                profiler.activeWriters.fetch_sub(1, std::memory_order_release);
++                return;
++            }
++            const uint32_t index = profiler.nextRenderWorker.fetch_add(1, std::memory_order_relaxed);
++            if (index < profiler.renderWorkers.size()) {
++                auto &worker = profiler.renderWorkers[index];
++                worker.workerId = workerId;
++                worker.logicalQueueId = logicalQueueId;
++                worker.nativeQueueId = nativeQueueId;
++                worker.commandListType = commandListType;
++                const size_t count = std::min(name.size(), worker.name.size() - 1);
++                std::copy_n(name.data(), count, worker.name.data());
++                worker.name[count] = '\0';
++            }
++            else profiler.droppedRenderWorkers.fetch_add(1, std::memory_order_relaxed);
++        }
++        profiler.activeWriters.fetch_sub(1, std::memory_order_release);
++    }
++
+     bool PerformanceProfiler::captureEnabled() {
+-        return state().accepting.load(std::memory_order_acquire);
++        return enabled();
+     }
+ 
+     bool PerformanceProfiler::lowOverheadEnabled() {
+@@ -6183,7 +6998,7 @@
+ 
+     bool PerformanceProfiler::shouldRecordDuration(std::string_view name) {
+         const ProfilerState &profiler = state();
+-        if (!profiler.accepting.load(std::memory_order_acquire)) {
++        if (!profiler.accepting.load(std::memory_order_acquire) || !profiler.recording.load(std::memory_order_acquire)) {
+             return false;
+         }
+         // Retain causal events and long outliers; filter short scopes to bound recording cost.
+@@ -6194,9 +7009,14 @@
+         return true;
+     }
+ 
++    bool PerformanceProfiler::gpuInstrumentationConfigured() {
++        const ProfilerState &profiler = state();
++        return profiler.accepting.load(std::memory_order_acquire) && profiler.gpuInstrumentation;
++    }
++
+     bool PerformanceProfiler::gpuInstrumentationEnabled() {
+         const ProfilerState &profiler = state();
+-        return profiler.accepting.load(std::memory_order_acquire) &&
++        return profiler.accepting.load(std::memory_order_acquire) && profiler.recording.load(std::memory_order_acquire) &&
+             profiler.gpuInstrumentation;
+     }
+ 
+@@ -6205,6 +7025,144 @@
+             state().gpuFrameSampleInterval,
+             std::numeric_limits<uint32_t>::max()
+         ));
++    }
++
++    void PerformanceProfiler::recordRuntimeVI(uint64_t wakeLatenessNanoseconds,
++        uint64_t skippedRetraces, bool wakeLatenessMeasured) {
++        static std::atomic<uint64_t> previous{0}, sequence{0};
++        static const bool declared = [wakeLatenessMeasured]() {
++            setMetadata("producer.runtime_vi.supported", "1");
++            setMetadata("producer.runtime_vi.enabled", mode() != PerformanceCaptureMode::Disabled ? "1" : "0");
++            setMetadata("runtime_vi_owner", "N64ModernRuntime host timer callback; guest consumption unobserved");
++            setMetadata("runtime_vi_wake_lateness_measured", wakeLatenessMeasured ? "1" : "0");
++            return true;
++        }();
++        (void)declared;
++        if (!captureEnabled()) { previous.store(0, std::memory_order_relaxed); return; }
++        const uint64_t now = nowNanoseconds();
++        const uint64_t before = previous.exchange(now, std::memory_order_acq_rel);
++        const uint64_t identity = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
++        recordCriticalInstant(PerformanceCategory::Frame, "FrameProduction.RuntimeVI", identity,
++            skippedRetraces, wakeLatenessMeasured ? wakeLatenessNanoseconds : 0);
++        if (before && before < now && before >= state().resumeTimestamp.load(std::memory_order_acquire)) {
++            recordDuration(PerformanceCategory::Wait, "FrameProduction.RuntimeVIInterval", before, now, identity);
++        }
++        if (wakeLatenessMeasured && wakeLatenessNanoseconds && wakeLatenessNanoseconds <= now) {
++            recordDuration(PerformanceCategory::Wait, "FrameProduction.RuntimeVIWakeDeadlineMiss",
++                now - wakeLatenessNanoseconds, now, identity, skippedRetraces);
++        }
++    }
++
++    namespace {
++        void recordRuntimeTaskBoundary(unsigned phase, uint64_t sequence, uint32_t displayList) {
++            using Profiler = PerformanceProfiler;
++            struct Slot {
++                std::atomic_flag busy = ATOMIC_FLAG_INIT;
++                uint64_t sequence = 0, submitted = 0, started = 0;
++                uint32_t displayList = 0;
++            };
++            static std::array<Slot, 256> slots;
++            static std::atomic<uint64_t> previousSubmission{0}, previousCompletion{0};
++            static const bool declared = []() {
++                Profiler::setMetadata("producer.graphics_tasks.supported", "1");
++                Profiler::setMetadata("producer.graphics_tasks.enabled", Profiler::mode() != PerformanceCaptureMode::Disabled ? "1" : "0");
++                Profiler::setMetadata("graphics_task_completion_owner", "N64ModernRuntime send_dl callback completed; not GPU retirement");
++                return true;
++            }();
++            (void)declared;
++            if (!Profiler::captureEnabled()) return;
++            const uint64_t now = Profiler::nowNanoseconds();
++            const uint64_t resume = state().resumeTimestamp.load(std::memory_order_acquire);
++            Slot &slot = slots[sequence % slots.size()];
++            if (slot.busy.test_and_set(std::memory_order_acquire)) {
++                Profiler::recordCriticalInstant(PerformanceCategory::CPU, "Recorder.GraphicsTaskTrackingOverload", sequence, displayList, phase);
++                return;
++            }
++            uint64_t start = 0;
++            bool incomplete = false;
++            if (phase == 0) {
++                incomplete = slot.sequence != 0 && slot.submitted >= resume;
++                slot.sequence = sequence;
++                slot.displayList = displayList;
++                slot.submitted = now;
++                slot.started = 0;
++            }
++            else if (!sequence || slot.sequence != sequence || slot.displayList != displayList || slot.submitted < resume) {
++                incomplete = true;
++            }
++            else if (phase == 1) {
++                incomplete = slot.started != 0;
++                start = slot.submitted;
++                slot.started = now;
++            }
++            else {
++                start = slot.started;
++                incomplete = start == 0;
++                slot.sequence = 0;
++            }
++            slot.busy.clear(std::memory_order_release);
++            if (incomplete || !sequence) {
++                Profiler::recordCriticalInstant(PerformanceCategory::CPU, "Recorder.GraphicsTaskBoundaryUnobserved", sequence, displayList, phase);
++                return;
++            }
++            if (phase == 0) {
++                const uint64_t previous = previousSubmission.exchange(now, std::memory_order_acq_rel);
++                if (previous && previous >= resume && previous < now) Profiler::recordDuration(PerformanceCategory::Wait,
++                    "FrameProduction.GuestGraphicsTaskInterval", previous, now, sequence, displayList);
++                const uint64_t completed = previousCompletion.exchange(0, std::memory_order_acq_rel);
++                if (completed && completed >= resume && completed < now) Profiler::recordDuration(PerformanceCategory::Wait,
++                    "FrameProduction.GuestGraphicsWaitAfterCompletion", completed, now, sequence, displayList);
++                Profiler::recordCriticalInstant(PerformanceCategory::Frame, "FrameProduction.GraphicsTaskSubmitted", sequence, displayList);
++            }
++            else if (phase == 1 && start && start <= now) {
++                Profiler::recordDuration(PerformanceCategory::Wait, "FrameProduction.GraphicsActionQueueDelay", start, now, sequence, displayList);
++            }
++            else if (phase == 2 && start && start <= now) {
++                Profiler::recordCriticalInstant(PerformanceCategory::Frame, "FrameProduction.GraphicsTaskCompleted", sequence, displayList, now - start);
++                Profiler::recordDuration(PerformanceCategory::CPU, "FrameProduction.GraphicsTaskActionWork", start, now, sequence, displayList);
++                previousCompletion.store(now, std::memory_order_release);
++            }
++        }
++    }
++
++    void PerformanceProfiler::recordRuntimeGraphicsTaskSubmitted(uint64_t sequence, uint32_t displayList) {
++        recordRuntimeTaskBoundary(0, sequence, displayList);
++    }
++    void PerformanceProfiler::recordRuntimeGraphicsTaskStarted(uint64_t sequence, uint32_t displayList) {
++        recordRuntimeTaskBoundary(1, sequence, displayList);
++    }
++    void PerformanceProfiler::recordRuntimeGraphicsTaskCompleted(uint64_t sequence, uint32_t displayList) {
++        recordRuntimeTaskBoundary(2, sequence, displayList);
++    }
++
++    void PerformanceProfiler::recordRuntimeGraphicsActionDequeued(bool screenUpdate,
++        uint64_t queuedNanoseconds, uint64_t dequeuedNanoseconds, uint64_t sequence) {
++        if (!captureEnabled() || !queuedNanoseconds || dequeuedNanoseconds <= queuedNanoseconds) return;
++        const uint64_t duration = dequeuedNanoseconds - queuedNanoseconds;
++        const uint64_t now = nowNanoseconds();
++        if (duration > now || now - duration < state().resumeTimestamp.load(std::memory_order_acquire)) return;
++        recordDuration(PerformanceCategory::Wait, screenUpdate ? "FrameProduction.ScreenUpdateActionQueueDelay" :
++            "FrameProduction.GraphicsTaskActionQueueDelay", now - duration, now, sequence);
++    }
++
++    void PerformanceProfiler::recordRuntimeGraphicsActionCompleted(bool screenUpdate,
++        uint64_t dequeuedNanoseconds, uint64_t completedNanoseconds, uint64_t sequence) {
++        static const bool declared = []() {
++            setMetadata("producer.graphics_tasks.supported", "1");
++            setMetadata("producer.graphics_tasks.enabled", mode() != PerformanceCaptureMode::Disabled ? "1" : "0");
++            setMetadata("runtime_action_alignment", "Native-clock duration ending at observer callback; not a calibrated native timestamp");
++            setMetadata("graphics_task_completion_owner", "Host send_dl action returned; not GPU completion or guest simulation correctness");
++            return true;
++        }();
++        (void)declared;
++        if (!captureEnabled() || !dequeuedNanoseconds || completedNanoseconds <= dequeuedNanoseconds) return;
++        const uint64_t duration = completedNanoseconds - dequeuedNanoseconds;
++        const uint64_t now = nowNanoseconds();
++        if (duration > now || now - duration < state().resumeTimestamp.load(std::memory_order_acquire)) return;
++        recordDuration(PerformanceCategory::CPU, screenUpdate ? "FrameProduction.ScreenUpdateActionWork" :
++            "FrameProduction.GraphicsTaskActionWork", now - duration, now, sequence);
++        if (!screenUpdate) recordCriticalInstant(PerformanceCategory::Frame,
++            "FrameProduction.GraphicsTaskCompleted", sequence, 0, duration);
+     }
+ 
+     void PerformanceProfiler::startDisplayObservation(
+@@ -6215,7 +7173,8 @@
+         if (!profiler.accepting.load(std::memory_order_acquire)) {
+             return;
+         }
+-        startHostObservation();
++        if (profiler.passiveRing) return;
++        if (parseEnabledFlag("RT64_PROFILE_HOST_OBSERVATION")) startHostObservation();
+ #ifdef _WIN32
+         if (nativeWindow == nullptr) {
+             return;
+@@ -6227,5 +7186,4 @@
+-        if (profiler.lowOverhead &&
+-            !parseEnabledFlag("RT64_PROFILE_EXTERNAL_DISPLAY_OBSERVATION")) {
++        if (!parseEnabledFlag("RT64_PROFILE_EXTERNAL_DISPLAY_OBSERVATION")) {
+             PerformanceProfiler::setMetadata(
+                 "desktop_output_observation",
+                 "disabled_in_low_overhead"
+@@ -6247,6 +7205,7 @@
+             return;
+         }
+ 
++        profiler.displayObservationStarted.store(true, std::memory_order_release);
+         profiler.displayObservationRunning.store(
+             true,
+             std::memory_order_release
+@@ -6353,6 +7312,7 @@
+                         );
+                     }
+                 }
++                if (device != nullptr) PerformanceProfiler::noteSecondaryGraphicsDevice();
+                 if (SUCCEEDED(result) && selectedOutput != nullptr) {
+                     result = selectedOutput->QueryInterface(
+                         __uuidof(IDXGIOutput1),
+@@ -6722,19 +7682,39 @@
+     }
+ 
+     bool PerformanceProfiler::shouldMeasureThreadCpu(std::string_view name) {
++        if (state().passiveRing) return false;
++#ifdef _WIN32
++        // GetThreadTimes expresses units of 100 ns, not per-scope accuracy.
++        return false;
++#else
+         return (name == "Application.ProcessDisplayLists") ||
+             (name == "State.FullSync") ||
+             (name == "Workload.InterpolationBatch") ||
+             (name == "Renderer.Frame") ||
+             (name == "Present.CommandBuildAndSubmit");
++#endif
+     }
+ 
+     void PerformanceProfiler::setThreadName(std::string_view name) {
+-        ThreadBuffer *buffer = threadBuffer();
+-        if (buffer != nullptr) {
+-            const std::scoped_lock nameLock(buffer->nameMutex);
+-            buffer->name.assign(name.data(), name.size());
+-        }
++        auto &profiler = state();
++        profiler.activeWriters.fetch_add(1, std::memory_order_acq_rel);
++        if (profiler.accepting.load(std::memory_order_acquire)) {
++            if (name.size() >= profiler.passiveThreadNames[0].size() || !validUTF8(name, false)) {
++                profiler.invalidEvents.fetch_add(1, std::memory_order_relaxed);
++                profiler.activeWriters.fetch_sub(1, std::memory_order_release);
++                return;
++            }
++            const uint32_t id = passiveThreadId(profiler);
++            if (id <= profiler.maximumThreads && !profiler.threadNamesReady[id - 1].load(std::memory_order_acquire)) {
++                auto &storage = profiler.passiveThreadNames[id - 1];
++                const size_t count = std::min(name.size(), storage.size() - 1);
++                std::copy_n(name.data(), count, storage.data());
++                storage[count] = '\0';
++                // The first published name is immutable so live readers never race a rename.
++                profiler.threadNamesReady[id - 1].store(true, std::memory_order_release);
++            }
++        }
++        profiler.activeWriters.fetch_sub(1, std::memory_order_release);
+     }
+ 
+     void PerformanceProfiler::setMetadata(
+@@ -6747,6 +7732,12 @@
+         }
+ 
+         const std::scoped_lock lock(profiler.metadataMutex);
++        if (!profiler.accepting.load(std::memory_order_acquire)) return;
++        if (key.size() > 256 || value.size() > 4096 || !validUTF8(key) || !validUTF8(value) ||
++            (profiler.metadata.size() >= 2048 && profiler.metadata.find(std::string(key)) == profiler.metadata.end())) {
++            profiler.invalidEvents.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
+         profiler.metadata[std::string(key)] = std::string(value);
+     }
+ 
+@@ -6783,7 +7774,8 @@
+         uint64_t argument0,
+         uint64_t argument1,
+         uint64_t threadCpuDurationNanoseconds,
+-        bool threadCpuMeasured
++        bool threadCpuMeasured,
++        bool threadScope
+     ) {
+         if (endNanoseconds < startNanoseconds) {
+             return;
+@@ -6792,6 +7784,23 @@
+         const uint64_t durationNanoseconds =
+             endNanoseconds - startNanoseconds;
+         ProfilerState &profiler = state();
++        if (!profiler.accepting.load(std::memory_order_acquire)) return;
++        if (!profiler.recording.load(std::memory_order_acquire)) return;
++        if (startNanoseconds < profiler.resumeTimestamp.load(std::memory_order_acquire)) {
++            profiler.interruptedScopes.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
++        if (name.empty() || name.size() >= Event{}.name.size() || !validUTF8(name, false)) {
++            profiler.invalidEvents.fetch_add(1, std::memory_order_relaxed);
++            profiler.droppedEvents.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
++        profiler.aggregates.observe(name, uint8_t(category), durationNanoseconds);
++        if (!profiler.controlPath.empty() && profiler.spikeNanoseconds && durationNanoseconds >= profiler.spikeNanoseconds &&
++            category != PerformanceCategory::Wait && category != PerformanceCategory::Pacing) {
++            uint64_t empty = 0;
++            profiler.incidentDeadline.compare_exchange_strong(empty, nowNanoseconds() + profiler.incidentPostNanoseconds);
++        }
+         if (profiler.lowOverhead) {
+             const bool retainEverySample =
+                 (name == "FrameProduction.ScreenUpdateActionWork") ||
+@@ -6822,6 +7831,7 @@
+             event.threadCpuDurationNanoseconds =
+                 threadCpuDurationNanoseconds;
+             event.threadCpuMeasured = threadCpuMeasured;
++            event.threadScope = threadScope;
+             event.correlationId = correlationId;
+             event.argument0 = argument0;
+             event.argument1 = argument1;
+@@ -6886,6 +7896,7 @@
+         event.durationNanoseconds = durationNanoseconds;
+         event.threadCpuDurationNanoseconds = threadCpuDurationNanoseconds;
+         event.threadCpuMeasured = threadCpuMeasured;
++        event.threadScope = threadScope;
+         event.correlationId = correlationId;
+         event.argument0 = argument0;
+         event.argument1 = argument1;
+@@ -6903,12 +7914,20 @@
+         uint64_t argument0,
+         uint64_t argument1
+     ) {
+-        if (!gpuInstrumentationEnabled() ||
+-            (gpuEndNanoseconds < gpuStartNanoseconds)) {
++        auto &profiler = state();
++        struct Lease {
++            ProfilerState &state;
++            explicit Lease(ProfilerState &value) : state(value) { state.activeWriters.fetch_add(1, std::memory_order_acq_rel); }
++            ~Lease() { state.activeWriters.fetch_sub(1, std::memory_order_release); }
++        } lease(profiler);
++        if (!profiler.accepting.load(std::memory_order_acquire) || !profiler.recording.load(std::memory_order_acquire) || !profiler.gpuInstrumentation) return;
++        if (gpuEndNanoseconds < gpuStartNanoseconds) {
++            profiler.invalidEvents.fetch_add(1); profiler.droppedEvents.fetch_add(1);
+             return;
+         }
+ 
+         const uint64_t duration = gpuEndNanoseconds - gpuStartNanoseconds;
++        profiler.aggregates.observe(name, uint8_t(PerformanceCategory::GPU), duration);
+         Event event;
+         copyEventName(event, name);
+         event.timestampNanoseconds = cpuCompletionNanoseconds > duration
+@@ -7000,7 +8019,9 @@
+     void PerformanceProfiler::recordCounter(
+         std::string_view name,
+         double value,
+-        uint64_t correlationId
++        uint64_t correlationId,
++        uint64_t argument0,
++        uint64_t argument1
+     ) {
+         if (!enabled()) {
+             return;
+@@ -7017,9 +8038,33 @@
+         event.timestampNanoseconds = nowNanoseconds();
+         event.correlationId = correlationId;
+         event.value = value;
++        event.argument0 = argument0;
++        event.argument1 = argument1;
+         event.category = PerformanceCategory::Counter;
+         event.kind = EventKind::Counter;
+         appendEvent(std::move(event));
++    }
++
++    bool PerformanceProfiler::writeAttachment(std::string_view suffix, const void *data, size_t bytes,
++            std::string_view completionEvent, uint64_t correlationId, uint64_t argument0, uint64_t argument1) {
++        auto &profiler = state();
++        const bool safeSuffix = !suffix.empty() && suffix.size() <= 160 && suffix.front() == '.' &&
++            suffix.find("..") == std::string_view::npos &&
++            std::all_of(suffix.begin(), suffix.end(), [](char c) {
++                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                    (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_';
++            });
++        if (!captureEnabled() || !data || !safeSuffix || completionEvent.empty() ||
++            completionEvent.size() >= 80 || completionEvent.find('\0') != std::string_view::npos) {
++            profiler.attachments.rejected.fetch_add(1); return false;
++        }
++        return profiler.attachments.enqueue(
++            std::filesystem::u8path(profiler.outputPath.u8string() + std::string(suffix)), data, bytes,
++            [name = std::string(completionEvent), correlationId, argument0, argument1](bool success) {
++                recordCriticalInstant(PerformanceCategory::Counter,
++                    success ? std::string_view(name) : std::string_view("Attachment.WriteFailed"),
++                    correlationId, argument0, argument1);
++            });
+     }
+ 
+     void PerformanceProfiler::finish() {
+@@ -7028,6 +8073,14 @@
+             profiler.finished.exchange(true, std::memory_order_acq_rel)) {
+             return;
+         }
++        // Use the internal clock after closing the public event gate.
++        const auto finalizeClock = [&]() {
++            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - profiler.origin).count());
++        };
++        const uint64_t finalizeStart = finalizeClock();
++        const uint64_t finalizeCpuStart = currentThreadCpuNanoseconds();
++        profiler.controlRunning.store(false, std::memory_order_release);
++        if (profiler.controlThread.joinable()) profiler.controlThread.join();
+ 
+         profiler.hostObservationRunning.store(
+             false,
+@@ -7055,8 +8110,11 @@
+             }
+         }
+ #endif
++        // Drain attachment completion events before closing the event gate.
++        profiler.attachments.stop();
+         // Close the producer gate before the journal thread drains.
+         profiler.accepting.store(false, std::memory_order_release);
++        while (profiler.activeWriters.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+         profiler.checkpointRunning.store(false, std::memory_order_release);
+         {
+             const std::scoped_lock checkpointLock(
+@@ -7073,22 +8132,57 @@
+             const std::scoped_lock lock(profiler.registryMutex);
+             buffers = profiler.threadBuffers;
+         }
++        const std::scoped_lock finalMetadataLock(profiler.metadataMutex);
++        std::unique_ptr<ThreadBuffer> passiveSnapshot;
++        if (profiler.passiveRing) {
++            uint64_t busy = 0;
++            const auto events = profiler.passiveRing->snapshot(busy);
++            passiveSnapshot = std::make_unique<ThreadBuffer>(profiler.maximumEvents);
++            passiveSnapshot->name = "RT64 passive events";
++            passiveSnapshot->id = 1;
++            for (size_t i = 0; i < events.size(); ++i) {
++                const size_t chunkIndex = i / EventChunkSize;
++                if (i % EventChunkSize == 0) {
++                    auto chunk = std::make_unique<Event[]>(EventChunkSize);
++                    passiveSnapshot->eventChunks[chunkIndex].store(chunk.get());
++                    passiveSnapshot->eventChunkOwners.push_back(std::move(chunk));
++                }
++                passiveSnapshot->eventChunks[chunkIndex].load()[i % EventChunkSize] = events[i];
++            }
++            passiveSnapshot->eventCount.store(events.size());
++            buffers.push_back(passiveSnapshot.get());
++            profiler.droppedEvents.fetch_add(profiler.passiveRing->dropped() + busy);
++            profiler.metadata["ring_events_submitted"] = std::to_string(profiler.passiveRing->submitted());
++            profiler.metadata["ring_storage_bytes"] = std::to_string(profiler.passiveRing->bytes());
++            profiler.metadata["ring_history_evicted"] = std::to_string(
++                profiler.passiveRing->submitted() > events.size() ? profiler.passiveRing->submitted() - events.size() : 0);
++        }
++        profiler.metadata["observer_gpu_query_commands"] = std::to_string(profiler.gpuQueryCommands.load());
++        profiler.metadata["observer_backend_fence_status_queries"] = std::to_string(profiler.backendFenceStatusQueries.load());
++        profiler.metadata["observer_secondary_graphics_devices"] = std::to_string(profiler.secondaryGraphicsDevices.load());
++        profiler.metadata["observer_frame_path_allocations"] = std::to_string(profiler.framePathAllocations.load());
++        profiler.metadata["interrupted_scopes"] = std::to_string(profiler.interruptedScopes.load());
+         {
+-            const std::scoped_lock lock(profiler.metadataMutex);
+             std::filesystem::path summaryTemporary = profiler.summaryPath;
+             summaryTemporary += ".final.tmp";
+             std::filesystem::path traceTemporary = profiler.outputPath;
+             traceTemporary += ".final.tmp";
++            const uint64_t summaryStart = finalizeClock();
++            const uint64_t summaryCpuStart = currentThreadCpuNanoseconds();
+             const bool summarySerialized = writeSummary(
+                 profiler,
+                 buffers,
+                 summaryTemporary
+             );
++            const uint64_t traceStart = finalizeClock();
++            const uint64_t traceCpuStart = currentThreadCpuNanoseconds();
+             const bool traceSerialized = writeTrace(
+                 profiler,
+                 buffers,
+                 traceTemporary
+             );
++            const uint64_t publishStart = finalizeClock();
++            const uint64_t publishCpuStart = currentThreadCpuNanoseconds();
+             const bool summaryWritten = summarySerialized &&
+                 replaceFileAtomically(
+                     summaryTemporary,
+@@ -7099,14 +8193,55 @@
+                     traceTemporary,
+                     profiler.outputPath
+                 );
++            const auto completionPath = std::filesystem::path(profiler.outputPath.string() + ".completion.json");
++            const auto completionTemporary = std::filesystem::path(completionPath.string() + ".tmp");
++            std::error_code sizeError;
++            const uint64_t traceBytes = traceWritten ? std::filesystem::file_size(profiler.outputPath, sizeError) : 0;
++            const bool traceSized = traceWritten && !sizeError;
++            sizeError.clear();
++            const uint64_t summaryBytes = summaryWritten ? std::filesystem::file_size(profiler.summaryPath, sizeError) : 0;
++            const bool summarySized = summaryWritten && !sizeError;
++            const uint64_t finalizeMeasuredEnd = finalizeClock();
++            const uint64_t finalizeCpuEnd = currentThreadCpuNanoseconds();
++            std::ofstream completion(completionTemporary, std::ios::binary);
++            completion << "{\"schema\":\"n64profiler-completion-v1\",\"pid\":" << profiler.processId
++                << ",\"trace_written\":" << (traceSized ? "true" : "false")
++                << ",\"summary_written\":" << (summarySized ? "true" : "false")
++                << ",\"trace_bytes\":" << (traceSized ? traceBytes : 0)
++                << ",\"summary_bytes\":" << (summarySized ? summaryBytes : 0)
++                << ",\"finalization\":{\"window_ns\":[" << finalizeStart << ',' << finalizeMeasuredEnd
++                << "],\"scope\":\"CALLER_CPU_AND_WALL_PREFIX_EXCLUDES_COMPLETION_RECEIPT_AND_WORKER_CPU\",\"phases\":[";
++            const auto writeFinalizePhase = [&](const char *name, uint64_t start, uint64_t end,
++                uint64_t cpuStart, uint64_t cpuEnd) {
++                completion << "{\"name\":\"" << name << "\",\"wall_ns\":" << (end - start)
++                    << ",\"caller_cpu_ns\":";
++                if (cpuStart && cpuEnd >= cpuStart) completion << (cpuEnd - cpuStart);
++                else completion << "null";
++                completion << '}';
++            };
++            writeFinalizePhase("drain_and_snapshot", finalizeStart, summaryStart, finalizeCpuStart, summaryCpuStart);
++            completion << ',';
++            writeFinalizePhase("summary_analysis_and_write", summaryStart, traceStart, summaryCpuStart, traceCpuStart);
++            completion << ',';
++            writeFinalizePhase("trace_write", traceStart, publishStart, traceCpuStart, publishCpuStart);
++            completion << ',';
++            writeFinalizePhase("publish_and_size", publishStart, finalizeMeasuredEnd, publishCpuStart, finalizeCpuEnd);
++            completion << "]}}\n";
++            completion.flush();
++            const bool completionGood = completion.good();
++            completion.close();
++            const bool completionWritten = completionGood && !completion.fail() &&
++                replaceFileAtomically(completionTemporary, completionPath);
+             const bool completeFinalProducts =
+-                streamedOnlyEventCount(buffers) == 0u;
+-            if (summaryWritten && traceWritten && completeFinalProducts) {
++                streamedOnlyEventCount(buffers) == 0u &&
++                omittedTraceEvents(profiler, buffers) == 0u &&
++                droppedEventCount(profiler, buffers) == 0u &&
++                profiler.invalidEvents.load() == 0u;
++            if (summaryWritten && traceWritten && completionWritten && completeFinalProducts &&
++                (profiler.passiveRing || profiler.journalHealthy.load(std::memory_order_acquire))) {
+                 std::error_code removeError;
+-                std::filesystem::remove(
+-                    profiler.journalPath,
+-                    removeError
+-                );
++                if (std::filesystem::is_regular_file(profiler.journalPath, removeError))
++                    std::filesystem::remove(profiler.journalPath, removeError);
+                 removeError.clear();
+                 std::filesystem::remove(profiler.livePath, removeError);
+             }
+@@ -7155,6 +8290,7 @@
+           argument1(argument1),
+           active(PerformanceProfiler::shouldRecordDuration(name)) {
+         if (active) {
++            startThreadId = passiveThreadId(state());
+             startNanoseconds = PerformanceProfiler::nowNanoseconds();
+             measureThreadCpu =
+                 PerformanceProfiler::shouldMeasureThreadCpu(name);
+@@ -7173,6 +8309,8 @@
+ 
+     void PerformanceScope::end() {
+         if (active) {
++            const bool sameThread = startThreadId != 0 && startThreadId == passiveThreadId(state());
++            if (!sameThread) threadCpuMeasurementAvailable = false;
+             uint64_t threadCpuDurationNanoseconds = 0;
+             if (threadCpuMeasurementAvailable) {
+                 const uint64_t endThreadCpuNanoseconds =
+@@ -7197,7 +8335,8 @@
+                 argument0,
+                 argument1,
+                 threadCpuDurationNanoseconds,
+-                threadCpuMeasurementAvailable
++                threadCpuMeasurementAvailable,
++                sameThread
+             );
+             active = false;
+         }
+diff --git a/src/common/rt64_profiler_ring.h b/src/common/rt64_profiler_ring.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/rt64_profiler_ring.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++namespace RT64::RecorderStorage {
++    // Fixed memory; O(1) producer work.
++    template<class Event> class Ring {
++        struct Slot {
++            std::atomic_flag owned = ATOMIC_FLAG_INIT;
++            uint64_t sequence = 0;
++            Event event{};
++        };
++        std::unique_ptr<Slot[]> slots;
++        uint64_t capacity;
++        std::atomic<uint64_t> next{0};
++        std::atomic<uint64_t> lost{0};
++    public:
++        explicit Ring(uint64_t count) : slots(new Slot[count]), capacity(count) {}
++
++        void append(const Event &event) {
++            const uint64_t ticket = next.fetch_add(1, std::memory_order_relaxed) + 1;
++            Slot &slot = slots[(ticket - 1) % capacity];
++            if (slot.owned.test_and_set(std::memory_order_acquire)) {
++                lost.fetch_add(1, std::memory_order_relaxed);
++                return;
++            }
++            if (slot.sequence < ticket) {
++                slot.event = event;
++                slot.sequence = ticket;
++            }
++            else lost.fetch_add(1, std::memory_order_relaxed);
++            slot.owned.clear(std::memory_order_release);
++        }
++
++        std::vector<Event> snapshot(uint64_t &busy) {
++            struct Copy { uint64_t sequence; Event event; };
++            std::vector<Copy> copies;
++            copies.reserve(size_t(capacity));
++            const uint64_t end = next.load(std::memory_order_acquire);
++            const uint64_t begin = end > capacity ? end - capacity : 0;
++            for (uint64_t i = 0; i < capacity; ++i) {
++                Slot &slot = slots[i];
++                if (slot.owned.test_and_set(std::memory_order_acquire)) { ++busy; continue; }
++                if (slot.sequence > begin && slot.sequence <= end) copies.push_back({slot.sequence, slot.event});
++                slot.owned.clear(std::memory_order_release);
++            }
++            std::sort(copies.begin(), copies.end(), [](const Copy &a, const Copy &b) { return a.sequence < b.sequence; });
++            std::vector<Event> events;
++            events.reserve(copies.size());
++            for (const auto &copy : copies) events.push_back(copy.event);
++            return events;
++        }
++        uint64_t submitted() const { return next.load(std::memory_order_acquire); }
++        uint64_t dropped() const { return lost.load(std::memory_order_acquire); }
++        uint64_t bytes() const { return capacity * sizeof(Slot); }
++    };
++}
+diff --git a/src/common/rt64_profiler_aggregates.h b/src/common/rt64_profiler_aggregates.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/rt64_profiler_aggregates.h
+@@ -0,0 +1,103 @@
++#pragma once
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++#include <string_view>
++
++namespace RT64::RecorderStorage {
++#ifndef N64PROFILER_AGGREGATE_SHARDS
++#define N64PROFILER_AGGREGATE_SHARDS 8
++#endif
++    constexpr size_t AggregateShardCount = N64PROFILER_AGGREGATE_SHARDS;
++    static_assert(AggregateShardCount == 1 || AggregateShardCount == 8);
++    // CPU-scope aggregates survive event eviction and filtering.
++    struct alignas(64) AggregateShard {
++        std::atomic<uint64_t> count{0}, total{0}, maximum{0}, minimum{UINT64_MAX};
++        std::array<std::atomic<uint64_t>, 64> histogram{};
++    };
++    struct AggregateSnapshot {
++        uint64_t count = 0, total = 0, maximum = 0, minimum = UINT64_MAX;
++        std::array<uint64_t, 64> histogram{};
++        bool overflow = false;
++        void merge(const AggregateSnapshot &other) {
++            const auto add = [&](uint64_t &target, uint64_t amount) {
++                if (amount > UINT64_MAX - target) { target = UINT64_MAX; overflow = true; }
++                else target += amount;
++            };
++            add(count, other.count);
++            add(total, other.total);
++            if (other.minimum < minimum) minimum = other.minimum;
++            if (other.maximum > maximum) maximum = other.maximum;
++            overflow = overflow || other.overflow;
++            for (size_t i = 0; i < histogram.size(); ++i) add(histogram[i], other.histogram[i]);
++        }
++    };
++    struct Aggregate {
++        std::atomic<uint64_t> identity{0};
++        std::atomic<bool> ready{false};
++        std::array<char, 80> name{};
++        uint8_t category = 0;
++        // Separate cache lines for concurrent producers.
++        std::array<AggregateShard, AggregateShardCount> shards{};
++        AggregateSnapshot snapshot() const {
++            AggregateSnapshot value;
++            const auto add = [&](uint64_t &target, uint64_t amount) {
++                if (amount > UINT64_MAX - target) { target = UINT64_MAX; value.overflow = true; }
++                else target += amount;
++            };
++            for (const auto &shard : shards) {
++                add(value.count, shard.count.load(std::memory_order_relaxed));
++                add(value.total, shard.total.load(std::memory_order_relaxed));
++                const uint64_t minimum = shard.minimum.load(std::memory_order_relaxed);
++                const uint64_t maximum = shard.maximum.load(std::memory_order_relaxed);
++                if (minimum < value.minimum) value.minimum = minimum;
++                if (maximum > value.maximum) value.maximum = maximum;
++                for (size_t i = 0; i < value.histogram.size(); ++i) add(value.histogram[i], shard.histogram[i].load(std::memory_order_relaxed));
++            }
++            return value;
++        }
++    };
++    struct Aggregates {
++        std::array<Aggregate, 1024> entries{};
++        std::atomic<uint64_t> rejected{0};
++        void observe(std::string_view name, uint8_t category, uint64_t duration) {
++            static std::atomic<uint64_t> nextShard{0};
++            static thread_local const size_t shardIndex = nextShard.fetch_add(1, std::memory_order_relaxed) % AggregateShardCount;
++            if (name.empty() || name.size() >= 80) { ++rejected; return; }
++            uint64_t key = 14695981039346656037ULL;
++            for (unsigned char c : name) { key ^= c; key *= 1099511628211ULL; }
++            key ^= category;
++            if (key == 0) key = 1;
++            for (size_t probe = 0; probe < 32; ++probe) {
++                Aggregate &entry = entries[(key + probe) % entries.size()];
++                uint64_t empty = 0;
++                if (entry.identity.load(std::memory_order_acquire) == 0 &&
++                    entry.identity.compare_exchange_strong(empty, key, std::memory_order_acq_rel)) {
++                    std::memcpy(entry.name.data(), name.data(), name.size());
++                    entry.category = category;
++                    entry.ready.store(true, std::memory_order_release);
++                }
++                if (entry.identity.load(std::memory_order_acquire) != key) continue;
++                // Initialization may be descheduled; wait for publication.
++                if (!entry.ready.load(std::memory_order_acquire)) continue;
++                if (entry.category != category || std::string_view(entry.name.data()) != name) continue;
++                auto &shard = entry.shards[shardIndex];
++                uint64_t total = shard.total.load(std::memory_order_relaxed);
++                do {
++                    if (duration > UINT64_MAX - total) { ++rejected; return; }
++                } while (!shard.total.compare_exchange_weak(total, total + duration, std::memory_order_relaxed));
++                shard.count.fetch_add(1, std::memory_order_relaxed);
++                uint64_t minimum = shard.minimum.load(std::memory_order_relaxed);
++                while (duration < minimum && !shard.minimum.compare_exchange_weak(minimum, duration, std::memory_order_relaxed)) {}
++                uint64_t maximum = shard.maximum.load(std::memory_order_relaxed);
++                while (duration > maximum && !shard.maximum.compare_exchange_weak(maximum, duration, std::memory_order_relaxed)) {}
++                unsigned bin = 0;
++                for (uint64_t v = duration; v > 1; v >>= 1) ++bin;
++                shard.histogram[bin].fetch_add(1, std::memory_order_relaxed);
++                return;
++            }
++            ++rejected;
++        }
++    };
++}
+diff --git a/src/common/rt64_performance_profiler.h b/src/common/rt64_performance_profiler.h
+--- a/src/common/rt64_performance_profiler.h
++++ b/src/common/rt64_performance_profiler.h
+@@ -6,8 +6,10 @@
+ 
+ #include <cstdint>
+ #include <string_view>
++#include "rt64_performance_events.h"
+ 
+ namespace RT64 {
++    enum class PerformanceCaptureMode : uint8_t { Disabled, Passive, SparseGPU, Detailed };
+     enum class PerformanceCategory : uint8_t {
+         Frame,
+         CPU,
+@@ -25,13 +27,33 @@
+     struct PerformanceProfiler {
+         friend class PerformanceScope;
+ 
+-        // Detailed instrumentation is the default capture mode.
++        // Passive is the default: bounded memory, no journal/host/GPU observer.
+         static bool enabled();
++        static PerformanceCaptureMode mode();
++        static bool intervalInstrumentationEnabled();
++        static void registerRenderWorker(uint64_t workerId, std::string_view name,
++            uint64_t logicalQueueId, uint64_t nativeQueueId, uint32_t commandListType);
++        static void noteGPUQueryCommand(uint64_t count = 1);
++        static void noteBackendFenceStatusQuery(uint64_t count = 1);
++        static void noteSecondaryGraphicsDevice(uint64_t count = 1);
++        static void noteFramePathAllocation(uint64_t count = 1);
+         static bool captureEnabled();
+         static bool lowOverheadEnabled();
+         static bool shouldRecordDuration(std::string_view name);
++        // Resource setup uses configured; each submitted frame uses enabled.
++        static bool gpuInstrumentationConfigured();
+         static bool gpuInstrumentationEnabled();
+         static uint32_t gpuFrameSampleInterval();
++        // Shared N64ModernRuntime callback adapters.
++        static void recordRuntimeVI(uint64_t wakeLatenessNanoseconds = 0,
++            uint64_t skippedRetraces = 0, bool wakeLatenessMeasured = false);
++        static void recordRuntimeGraphicsActionDequeued(bool screenUpdate,
++            uint64_t queuedNanoseconds, uint64_t dequeuedNanoseconds, uint64_t sequence);
++        static void recordRuntimeGraphicsActionCompleted(bool screenUpdate,
++            uint64_t dequeuedNanoseconds, uint64_t completedNanoseconds, uint64_t sequence);
++        static void recordRuntimeGraphicsTaskSubmitted(uint64_t sequence, uint32_t displayList);
++        static void recordRuntimeGraphicsTaskStarted(uint64_t sequence, uint32_t displayList);
++        static void recordRuntimeGraphicsTaskCompleted(uint64_t sequence, uint32_t displayList);
+         static void startDisplayObservation(
+             void *nativeWindow,
+             uint32_t presentationQueueCapacity
+@@ -42,6 +68,7 @@
+         static uint64_t nowNanoseconds();
+         static void setThreadName(std::string_view name);
+         static void setMetadata(std::string_view key, std::string_view value);
++        // A supplied interval need not belong to the emitting thread.
+         static void recordDuration(
+             PerformanceCategory category,
+             std::string_view name,
+@@ -80,8 +108,14 @@
+         static void recordCounter(
+             std::string_view name,
+             double value,
+-            uint64_t correlationId = 0
++            uint64_t correlationId = 0,
++            uint64_t argument0 = 0,
++            uint64_t argument1 = 0
+         );
++        // Explicit detailed readback only.
++        static bool writeAttachment(std::string_view suffix, const void *data, size_t bytes,
++            std::string_view completionEvent, uint64_t correlationId = 0,
++            uint64_t argument0 = 0, uint64_t argument1 = 0);
+         static void finish();
+ 
+     private:
+@@ -96,7 +133,8 @@
+             uint64_t argument0,
+             uint64_t argument1,
+             uint64_t threadCpuDurationNanoseconds = 0,
+-            bool threadCpuMeasured = false
++            bool threadCpuMeasured = false,
++            bool threadScope = false
+         );
+     };
+ 
+@@ -123,6 +161,7 @@
+         uint64_t correlationId = 0;
+         uint64_t argument0 = 0;
+         uint64_t argument1 = 0;
++        uint32_t startThreadId = 0;
+         bool measureThreadCpu = false;
+         bool threadCpuMeasurementAvailable = false;
+         bool active = false;
+diff --git a/src/common/rt64_performance_events.h b/src/common/rt64_performance_events.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/rt64_performance_events.h
+@@ -0,0 +1,601 @@
++#pragma once
++#include <array>
++#include <cstdint>
++
++// RT64 shared producer vocabulary; imported from JFC v61, preserving MIT provenance.
++namespace RT64 {
++    namespace PerformanceProfilerContract {
++    inline constexpr uint32_t SchemaVersion = 61;
++    }
++
++    namespace PerformanceEventNames {
++        inline constexpr char WorkloadInterpolationRequested[] =
++            "Workload.Interpolation.Requested";
++        inline constexpr char WorkloadInterpolationRendered[] =
++            "Workload.Interpolation.Rendered";
++        inline constexpr char WorkloadInterpolationTimeSkipped[] =
++            "Workload.Interpolation.TimeSkipped";
++        inline constexpr char WorkloadInterpolationQueueSkipped[] =
++            "Workload.Interpolation.QueueSkipped";
++        inline constexpr std::array<const char *, 4>
++            WorkloadInterpolationBatchCounters = {
++                WorkloadInterpolationRequested,
++                WorkloadInterpolationRendered,
++                WorkloadInterpolationTimeSkipped,
++                WorkloadInterpolationQueueSkipped,
++            };
++
++        inline constexpr char RendererFrameWorkloads[] =
++            "Renderer.Context.Workloads";
++        inline constexpr char RendererFrameGameCalls[] =
++            "Renderer.SampledWorkload.SourceGameCalls";
++        inline constexpr char RendererFrameRawTriVertices[] =
++            "Renderer.SampledWorkload.RawTriVertices";
++        inline constexpr char RendererFrameFramebufferPairs[] =
++            "Renderer.SampledWorkload.RenderedFramebufferPairs";
++        inline constexpr char RendererFrameSourceFramebufferPairs[] =
++            "Renderer.SampledWorkload.SourceFramebufferPairs";
++        inline constexpr char RendererFrameRenderedGameCalls[] =
++            "Renderer.SampledWorkload.RenderedGameCalls";
++        inline constexpr char RendererFrameUnrenderedGameCalls[] =
++            "Renderer.SampledWorkload.UnrenderedGameCalls";
++        inline constexpr char RendererFrameTargetPixelWork[] =
++            "Renderer.SampledWorkload.TargetPixelWork";
++        inline constexpr char RendererFrameMaxTargetPixels[] =
++            "Renderer.SampledWorkload.MaxTargetPixels";
++        inline constexpr char RendererFrameMSAASamples[] =
++            "Renderer.SampledWorkload.MSAASamples";
++        inline constexpr char RendererFrameCurrentWeight[] =
++            "Renderer.SampledWorkload.CurrentWeight";
++        inline constexpr char RendererFrameModernLightingCalls[] =
++            "Renderer.SampledWorkload.ModernLightingCalls";
++        inline constexpr char RendererFrameOriginalTextureTiles[] =
++            "Renderer.SampledWorkload.OriginalTextureTiles";
++        inline constexpr char RendererFrameReplacementTextureTiles[] =
++            "Renderer.SampledWorkload.ReplacementTextureTiles";
++        inline constexpr char RendererFrameFramebufferCopyTiles[] =
++            "Renderer.SampledWorkload.FramebufferCopyTiles";
++        inline constexpr char RendererFrameMissingTextureTiles[] =
++            "Renderer.SampledWorkload.MissingTextureTiles";
++        inline constexpr char RendererFrameRasterDrawCalls[] =
++            "Renderer.SampledWorkload.RasterDrawCalls";
++        inline constexpr char RendererFrameRasterVertices[] =
++            "Renderer.SampledWorkload.RasterVertices";
++        inline constexpr char RendererFrameDitherExtraDrawCalls[] =
++            "Renderer.SampledWorkload.DitherExtraDrawCalls";
++        inline constexpr char RendererFrameDitherExtraVertices[] =
++            "Renderer.SampledWorkload.DitherExtraVertices";
++        inline constexpr char RendererFrameFillRectClears[] =
++            "Renderer.SampledWorkload.FillRectClears";
++        inline constexpr char RendererFrameVertexTestDispatches[] =
++            "Renderer.SampledWorkload.VertexTestDispatches";
++        inline constexpr char RendererPair0Valid[] =
++            "Renderer.Pair0.Valid";
++        inline constexpr char RendererPair0SourceIndex[] =
++            "Renderer.Pair0.SourceIndex";
++        inline constexpr char RendererPair0TargetPixels[] =
++            "Renderer.Pair0.TargetPixels";
++        inline constexpr char RendererPair0GameCalls[] =
++            "Renderer.Pair0.GameCalls";
++        inline constexpr char RendererPair0RasterScenes[] =
++            "Renderer.Pair0.RasterScenes";
++        inline constexpr char RendererPair0RasterDrawCalls[] =
++            "Renderer.Pair0.RasterDrawCalls";
++        inline constexpr char RendererPair0RasterVertices[] =
++            "Renderer.Pair0.RasterVertices";
++        inline constexpr char RendererPair0SpecializedDrawCalls[] =
++            "Renderer.Pair0.SpecializedDrawCalls";
++        inline constexpr char RendererPair0SpecializedVertices[] =
++            "Renderer.Pair0.SpecializedVertices";
++        inline constexpr char RendererPair0UbershaderDrawCalls[] =
++            "Renderer.Pair0.UbershaderDrawCalls";
++        inline constexpr char RendererPair0UbershaderVertices[] =
++            "Renderer.Pair0.UbershaderVertices";
++        inline constexpr char RendererPair0IndexedDrawCalls[] =
++            "Renderer.Pair0.IndexedDrawCalls";
++        inline constexpr char RendererPair0RawTriangleDrawCalls[] =
++            "Renderer.Pair0.RawTriangleDrawCalls";
++        inline constexpr char RendererPair0RectangleDrawCalls[] =
++            "Renderer.Pair0.RectangleDrawCalls";
++        inline constexpr char RendererPair0RasterPipelineBinds[] =
++            "Renderer.Pair0.RasterPipelineBinds";
++        inline constexpr char RendererPair0ScissorBinds[] =
++            "Renderer.Pair0.ScissorBinds";
++        inline constexpr char RendererPair0DepthTransitions[] =
++            "Renderer.Pair0.DepthTransitions";
++        inline constexpr char RendererPair0DitherExtraDrawCalls[] =
++            "Renderer.Pair0.DitherExtraDrawCalls";
++        inline constexpr char RendererPair0DitherExtraVertices[] =
++            "Renderer.Pair0.DitherExtraVertices";
++        inline constexpr char RendererPair0FillRectClears[] =
++            "Renderer.Pair0.FillRectClears";
++        inline constexpr char RendererPair0VertexTestDispatches[] =
++            "Renderer.Pair0.VertexTestDispatches";
++        inline constexpr char RendererPair1Valid[] =
++            "Renderer.Pair1.Valid";
++        inline constexpr char RendererPair1SourceIndex[] =
++            "Renderer.Pair1.SourceIndex";
++        inline constexpr char RendererPair1TargetPixels[] =
++            "Renderer.Pair1.TargetPixels";
++        inline constexpr char RendererPair1GameCalls[] =
++            "Renderer.Pair1.GameCalls";
++        inline constexpr char RendererPair1RasterScenes[] =
++            "Renderer.Pair1.RasterScenes";
++        inline constexpr char RendererPair1RasterDrawCalls[] =
++            "Renderer.Pair1.RasterDrawCalls";
++        inline constexpr char RendererPair1RasterVertices[] =
++            "Renderer.Pair1.RasterVertices";
++        inline constexpr char RendererPair1SpecializedDrawCalls[] =
++            "Renderer.Pair1.SpecializedDrawCalls";
++        inline constexpr char RendererPair1SpecializedVertices[] =
++            "Renderer.Pair1.SpecializedVertices";
++        inline constexpr char RendererPair1UbershaderDrawCalls[] =
++            "Renderer.Pair1.UbershaderDrawCalls";
++        inline constexpr char RendererPair1UbershaderVertices[] =
++            "Renderer.Pair1.UbershaderVertices";
++        inline constexpr char RendererPair1IndexedDrawCalls[] =
++            "Renderer.Pair1.IndexedDrawCalls";
++        inline constexpr char RendererPair1RawTriangleDrawCalls[] =
++            "Renderer.Pair1.RawTriangleDrawCalls";
++        inline constexpr char RendererPair1RectangleDrawCalls[] =
++            "Renderer.Pair1.RectangleDrawCalls";
++        inline constexpr char RendererPair1RasterPipelineBinds[] =
++            "Renderer.Pair1.RasterPipelineBinds";
++        inline constexpr char RendererPair1ScissorBinds[] =
++            "Renderer.Pair1.ScissorBinds";
++        inline constexpr char RendererPair1DepthTransitions[] =
++            "Renderer.Pair1.DepthTransitions";
++        inline constexpr char RendererPair1DitherExtraDrawCalls[] =
++            "Renderer.Pair1.DitherExtraDrawCalls";
++        inline constexpr char RendererPair1DitherExtraVertices[] =
++            "Renderer.Pair1.DitherExtraVertices";
++        inline constexpr char RendererPair1FillRectClears[] =
++            "Renderer.Pair1.FillRectClears";
++        inline constexpr char RendererPair1VertexTestDispatches[] =
++            "Renderer.Pair1.VertexTestDispatches";
++        inline constexpr char RendererPair2Valid[] =
++            "Renderer.Pair2.Valid";
++        inline constexpr char RendererPair2SourceIndex[] =
++            "Renderer.Pair2.SourceIndex";
++        inline constexpr char RendererPair2TargetPixels[] =
++            "Renderer.Pair2.TargetPixels";
++        inline constexpr char RendererPair2GameCalls[] =
++            "Renderer.Pair2.GameCalls";
++        inline constexpr char RendererPair2RasterScenes[] =
++            "Renderer.Pair2.RasterScenes";
++        inline constexpr char RendererPair2RasterDrawCalls[] =
++            "Renderer.Pair2.RasterDrawCalls";
++        inline constexpr char RendererPair2RasterVertices[] =
++            "Renderer.Pair2.RasterVertices";
++        inline constexpr char RendererPair2SpecializedDrawCalls[] =
++            "Renderer.Pair2.SpecializedDrawCalls";
++        inline constexpr char RendererPair2SpecializedVertices[] =
++            "Renderer.Pair2.SpecializedVertices";
++        inline constexpr char RendererPair2UbershaderDrawCalls[] =
++            "Renderer.Pair2.UbershaderDrawCalls";
++        inline constexpr char RendererPair2UbershaderVertices[] =
++            "Renderer.Pair2.UbershaderVertices";
++        inline constexpr char RendererPair2IndexedDrawCalls[] =
++            "Renderer.Pair2.IndexedDrawCalls";
++        inline constexpr char RendererPair2RawTriangleDrawCalls[] =
++            "Renderer.Pair2.RawTriangleDrawCalls";
++        inline constexpr char RendererPair2RectangleDrawCalls[] =
++            "Renderer.Pair2.RectangleDrawCalls";
++        inline constexpr char RendererPair2RasterPipelineBinds[] =
++            "Renderer.Pair2.RasterPipelineBinds";
++        inline constexpr char RendererPair2ScissorBinds[] =
++            "Renderer.Pair2.ScissorBinds";
++        inline constexpr char RendererPair2DepthTransitions[] =
++            "Renderer.Pair2.DepthTransitions";
++        inline constexpr char RendererPair2DitherExtraDrawCalls[] =
++            "Renderer.Pair2.DitherExtraDrawCalls";
++        inline constexpr char RendererPair2DitherExtraVertices[] =
++            "Renderer.Pair2.DitherExtraVertices";
++        inline constexpr char RendererPair2FillRectClears[] =
++            "Renderer.Pair2.FillRectClears";
++        inline constexpr char RendererPair2VertexTestDispatches[] =
++            "Renderer.Pair2.VertexTestDispatches";
++        inline constexpr char RendererPair3Valid[] =
++            "Renderer.Pair3.Valid";
++        inline constexpr char RendererPair3SourceIndex[] =
++            "Renderer.Pair3.SourceIndex";
++        inline constexpr char RendererPair3TargetPixels[] =
++            "Renderer.Pair3.TargetPixels";
++        inline constexpr char RendererPair3GameCalls[] =
++            "Renderer.Pair3.GameCalls";
++        inline constexpr char RendererPair3RasterScenes[] =
++            "Renderer.Pair3.RasterScenes";
++        inline constexpr char RendererPair3RasterDrawCalls[] =
++            "Renderer.Pair3.RasterDrawCalls";
++        inline constexpr char RendererPair3RasterVertices[] =
++            "Renderer.Pair3.RasterVertices";
++        inline constexpr char RendererPair3SpecializedDrawCalls[] =
++            "Renderer.Pair3.SpecializedDrawCalls";
++        inline constexpr char RendererPair3SpecializedVertices[] =
++            "Renderer.Pair3.SpecializedVertices";
++        inline constexpr char RendererPair3UbershaderDrawCalls[] =
++            "Renderer.Pair3.UbershaderDrawCalls";
++        inline constexpr char RendererPair3UbershaderVertices[] =
++            "Renderer.Pair3.UbershaderVertices";
++        inline constexpr char RendererPair3IndexedDrawCalls[] =
++            "Renderer.Pair3.IndexedDrawCalls";
++        inline constexpr char RendererPair3RawTriangleDrawCalls[] =
++            "Renderer.Pair3.RawTriangleDrawCalls";
++        inline constexpr char RendererPair3RectangleDrawCalls[] =
++            "Renderer.Pair3.RectangleDrawCalls";
++        inline constexpr char RendererPair3RasterPipelineBinds[] =
++            "Renderer.Pair3.RasterPipelineBinds";
++        inline constexpr char RendererPair3ScissorBinds[] =
++            "Renderer.Pair3.ScissorBinds";
++        inline constexpr char RendererPair3DepthTransitions[] =
++            "Renderer.Pair3.DepthTransitions";
++        inline constexpr char RendererPair3DitherExtraDrawCalls[] =
++            "Renderer.Pair3.DitherExtraDrawCalls";
++        inline constexpr char RendererPair3DitherExtraVertices[] =
++            "Renderer.Pair3.DitherExtraVertices";
++        inline constexpr char RendererPair3FillRectClears[] =
++            "Renderer.Pair3.FillRectClears";
++        inline constexpr char RendererPair3VertexTestDispatches[] =
++            "Renderer.Pair3.VertexTestDispatches";
++        inline constexpr std::array<std::array<const char *, 21>, 4>
++            SampledRendererPairCounters = {{
++                {{
++                    RendererPair0Valid,
++                    RendererPair0SourceIndex,
++                    RendererPair0TargetPixels,
++                    RendererPair0GameCalls,
++                    RendererPair0RasterScenes,
++                    RendererPair0RasterDrawCalls,
++                    RendererPair0RasterVertices,
++                    RendererPair0SpecializedDrawCalls,
++                    RendererPair0SpecializedVertices,
++                    RendererPair0UbershaderDrawCalls,
++                    RendererPair0UbershaderVertices,
++                    RendererPair0IndexedDrawCalls,
++                    RendererPair0RawTriangleDrawCalls,
++                    RendererPair0RectangleDrawCalls,
++                    RendererPair0RasterPipelineBinds,
++                    RendererPair0ScissorBinds,
++                    RendererPair0DepthTransitions,
++                    RendererPair0DitherExtraDrawCalls,
++                    RendererPair0DitherExtraVertices,
++                    RendererPair0FillRectClears,
++                    RendererPair0VertexTestDispatches,
++                }},
++                {{
++                    RendererPair1Valid,
++                    RendererPair1SourceIndex,
++                    RendererPair1TargetPixels,
++                    RendererPair1GameCalls,
++                    RendererPair1RasterScenes,
++                    RendererPair1RasterDrawCalls,
++                    RendererPair1RasterVertices,
++                    RendererPair1SpecializedDrawCalls,
++                    RendererPair1SpecializedVertices,
++                    RendererPair1UbershaderDrawCalls,
++                    RendererPair1UbershaderVertices,
++                    RendererPair1IndexedDrawCalls,
++                    RendererPair1RawTriangleDrawCalls,
++                    RendererPair1RectangleDrawCalls,
++                    RendererPair1RasterPipelineBinds,
++                    RendererPair1ScissorBinds,
++                    RendererPair1DepthTransitions,
++                    RendererPair1DitherExtraDrawCalls,
++                    RendererPair1DitherExtraVertices,
++                    RendererPair1FillRectClears,
++                    RendererPair1VertexTestDispatches,
++                }},
++                {{
++                    RendererPair2Valid,
++                    RendererPair2SourceIndex,
++                    RendererPair2TargetPixels,
++                    RendererPair2GameCalls,
++                    RendererPair2RasterScenes,
++                    RendererPair2RasterDrawCalls,
++                    RendererPair2RasterVertices,
++                    RendererPair2SpecializedDrawCalls,
++                    RendererPair2SpecializedVertices,
++                    RendererPair2UbershaderDrawCalls,
++                    RendererPair2UbershaderVertices,
++                    RendererPair2IndexedDrawCalls,
++                    RendererPair2RawTriangleDrawCalls,
++                    RendererPair2RectangleDrawCalls,
++                    RendererPair2RasterPipelineBinds,
++                    RendererPair2ScissorBinds,
++                    RendererPair2DepthTransitions,
++                    RendererPair2DitherExtraDrawCalls,
++                    RendererPair2DitherExtraVertices,
++                    RendererPair2FillRectClears,
++                    RendererPair2VertexTestDispatches,
++                }},
++                {{
++                    RendererPair3Valid,
++                    RendererPair3SourceIndex,
++                    RendererPair3TargetPixels,
++                    RendererPair3GameCalls,
++                    RendererPair3RasterScenes,
++                    RendererPair3RasterDrawCalls,
++                    RendererPair3RasterVertices,
++                    RendererPair3SpecializedDrawCalls,
++                    RendererPair3SpecializedVertices,
++                    RendererPair3UbershaderDrawCalls,
++                    RendererPair3UbershaderVertices,
++                    RendererPair3IndexedDrawCalls,
++                    RendererPair3RawTriangleDrawCalls,
++                    RendererPair3RectangleDrawCalls,
++                    RendererPair3RasterPipelineBinds,
++                    RendererPair3ScissorBinds,
++                    RendererPair3DepthTransitions,
++                    RendererPair3DitherExtraDrawCalls,
++                    RendererPair3DitherExtraVertices,
++                    RendererPair3FillRectClears,
++                    RendererPair3VertexTestDispatches,
++                }},
++            }};
++        inline constexpr std::array<std::array<const char *, 24>, 4>
++            SampledRendererPairExtentCounters = {{
++                {{
++                    "Renderer.Pair0.NativeWidth",
++                    "Renderer.Pair0.NativeDrawHeight",
++                    "Renderer.Pair0.TrackedHeight",
++                    "Renderer.Pair0.RequestedWidth",
++                    "Renderer.Pair0.RequestedHeight",
++                    "Renderer.Pair0.AllocatedWidth",
++                    "Renderer.Pair0.AllocatedHeight",
++                    "Renderer.Pair0.VIWidth",
++                    "Renderer.Pair0.VIHeight",
++                    "Renderer.Pair0.DrawLeft",
++                    "Renderer.Pair0.DrawTop",
++                    "Renderer.Pair0.DrawRight",
++                    "Renderer.Pair0.DrawBottom",
++                    "Renderer.Pair0.ScissorLeft",
++                    "Renderer.Pair0.ScissorTop",
++                    "Renderer.Pair0.ScissorRight",
++                    "Renderer.Pair0.ScissorBottom",
++                    "Renderer.Pair0.ColorAddress",
++                    "Renderer.Pair0.EarlyPresentCandidate",
++                    "Renderer.Pair0.InterpolationTarget",
++                    "Renderer.Pair0.ResolutionScaleX",
++                    "Renderer.Pair0.ResolutionScaleY",
++                    "Renderer.Pair0.DownsampleMultiplier",
++                    "Renderer.Pair0.TargetMisalignment",
++                }},
++                {{
++                    "Renderer.Pair1.NativeWidth",
++                    "Renderer.Pair1.NativeDrawHeight",
++                    "Renderer.Pair1.TrackedHeight",
++                    "Renderer.Pair1.RequestedWidth",
++                    "Renderer.Pair1.RequestedHeight",
++                    "Renderer.Pair1.AllocatedWidth",
++                    "Renderer.Pair1.AllocatedHeight",
++                    "Renderer.Pair1.VIWidth",
++                    "Renderer.Pair1.VIHeight",
++                    "Renderer.Pair1.DrawLeft",
++                    "Renderer.Pair1.DrawTop",
++                    "Renderer.Pair1.DrawRight",
++                    "Renderer.Pair1.DrawBottom",
++                    "Renderer.Pair1.ScissorLeft",
++                    "Renderer.Pair1.ScissorTop",
++                    "Renderer.Pair1.ScissorRight",
++                    "Renderer.Pair1.ScissorBottom",
++                    "Renderer.Pair1.ColorAddress",
++                    "Renderer.Pair1.EarlyPresentCandidate",
++                    "Renderer.Pair1.InterpolationTarget",
++                    "Renderer.Pair1.ResolutionScaleX",
++                    "Renderer.Pair1.ResolutionScaleY",
++                    "Renderer.Pair1.DownsampleMultiplier",
++                    "Renderer.Pair1.TargetMisalignment",
++                }},
++                {{
++                    "Renderer.Pair2.NativeWidth",
++                    "Renderer.Pair2.NativeDrawHeight",
++                    "Renderer.Pair2.TrackedHeight",
++                    "Renderer.Pair2.RequestedWidth",
++                    "Renderer.Pair2.RequestedHeight",
++                    "Renderer.Pair2.AllocatedWidth",
++                    "Renderer.Pair2.AllocatedHeight",
++                    "Renderer.Pair2.VIWidth",
++                    "Renderer.Pair2.VIHeight",
++                    "Renderer.Pair2.DrawLeft",
++                    "Renderer.Pair2.DrawTop",
++                    "Renderer.Pair2.DrawRight",
++                    "Renderer.Pair2.DrawBottom",
++                    "Renderer.Pair2.ScissorLeft",
++                    "Renderer.Pair2.ScissorTop",
++                    "Renderer.Pair2.ScissorRight",
++                    "Renderer.Pair2.ScissorBottom",
++                    "Renderer.Pair2.ColorAddress",
++                    "Renderer.Pair2.EarlyPresentCandidate",
++                    "Renderer.Pair2.InterpolationTarget",
++                    "Renderer.Pair2.ResolutionScaleX",
++                    "Renderer.Pair2.ResolutionScaleY",
++                    "Renderer.Pair2.DownsampleMultiplier",
++                    "Renderer.Pair2.TargetMisalignment",
++                }},
++                {{
++                    "Renderer.Pair3.NativeWidth",
++                    "Renderer.Pair3.NativeDrawHeight",
++                    "Renderer.Pair3.TrackedHeight",
++                    "Renderer.Pair3.RequestedWidth",
++                    "Renderer.Pair3.RequestedHeight",
++                    "Renderer.Pair3.AllocatedWidth",
++                    "Renderer.Pair3.AllocatedHeight",
++                    "Renderer.Pair3.VIWidth",
++                    "Renderer.Pair3.VIHeight",
++                    "Renderer.Pair3.DrawLeft",
++                    "Renderer.Pair3.DrawTop",
++                    "Renderer.Pair3.DrawRight",
++                    "Renderer.Pair3.DrawBottom",
++                    "Renderer.Pair3.ScissorLeft",
++                    "Renderer.Pair3.ScissorTop",
++                    "Renderer.Pair3.ScissorRight",
++                    "Renderer.Pair3.ScissorBottom",
++                    "Renderer.Pair3.ColorAddress",
++                    "Renderer.Pair3.EarlyPresentCandidate",
++                    "Renderer.Pair3.InterpolationTarget",
++                    "Renderer.Pair3.ResolutionScaleX",
++                    "Renderer.Pair3.ResolutionScaleY",
++                    "Renderer.Pair3.DownsampleMultiplier",
++                    "Renderer.Pair3.TargetMisalignment",
++                }},
++            }};
++        inline constexpr char RendererGPUDurationMs[] =
++            "Renderer.GPU.DurationMs";
++        inline constexpr char RendererGPUSetupMs[] =
++            "Renderer.GPU.SetupMs";
++        inline constexpr char RendererGPUFramebuffersMs[] =
++            "Renderer.GPU.FramebuffersMs";
++        inline constexpr char RendererGPUPair0RasterMs[] =
++            "Renderer.GPU.Pair0RasterMs";
++        inline constexpr char RendererGPUPair0PostMs[] =
++            "Renderer.GPU.Pair0PostMs";
++        inline constexpr char RendererGPUPair1RasterMs[] =
++            "Renderer.GPU.Pair1RasterMs";
++        inline constexpr char RendererGPUPair1PostMs[] =
++            "Renderer.GPU.Pair1PostMs";
++        inline constexpr char RendererGPUPair2RasterMs[] =
++            "Renderer.GPU.Pair2RasterMs";
++        inline constexpr char RendererGPUPair2PostMs[] =
++            "Renderer.GPU.Pair2PostMs";
++        inline constexpr char RendererGPUPair3RasterMs[] =
++            "Renderer.GPU.Pair3RasterMs";
++        inline constexpr char RendererGPUPair3PostMs[] =
++            "Renderer.GPU.Pair3PostMs";
++        inline constexpr char RendererGPUFramebufferRemainderMs[] =
++            "Renderer.GPU.FramebufferRemainderMs";
++        inline constexpr std::array<std::array<const char *, 2>, 4>
++            SampledRendererPairGPUStageCounters = {{
++                {{ RendererGPUPair0RasterMs, RendererGPUPair0PostMs }},
++                {{ RendererGPUPair1RasterMs, RendererGPUPair1PostMs }},
++                {{ RendererGPUPair2RasterMs, RendererGPUPair2PostMs }},
++                {{ RendererGPUPair3RasterMs, RendererGPUPair3PostMs }},
++            }};
++
++        inline constexpr std::array<const char *, 106>
++            SampledRendererFrameCounters = {
++                RendererFrameWorkloads,
++                RendererFrameGameCalls,
++                RendererFrameRawTriVertices,
++                RendererFrameFramebufferPairs,
++                RendererFrameSourceFramebufferPairs,
++                RendererFrameRenderedGameCalls,
++                RendererFrameUnrenderedGameCalls,
++                RendererFrameTargetPixelWork,
++                RendererFrameMaxTargetPixels,
++                RendererFrameMSAASamples,
++                RendererFrameCurrentWeight,
++                RendererFrameModernLightingCalls,
++                RendererFrameOriginalTextureTiles,
++                RendererFrameReplacementTextureTiles,
++                RendererFrameFramebufferCopyTiles,
++                RendererFrameMissingTextureTiles,
++                RendererFrameRasterDrawCalls,
++                RendererFrameRasterVertices,
++                RendererFrameDitherExtraDrawCalls,
++                RendererFrameDitherExtraVertices,
++                RendererFrameFillRectClears,
++                RendererFrameVertexTestDispatches,
++                RendererPair0Valid,
++                RendererPair0SourceIndex,
++                RendererPair0TargetPixels,
++                RendererPair0GameCalls,
++                RendererPair0RasterScenes,
++                RendererPair0RasterDrawCalls,
++                RendererPair0RasterVertices,
++                RendererPair0SpecializedDrawCalls,
++                RendererPair0SpecializedVertices,
++                RendererPair0UbershaderDrawCalls,
++                RendererPair0UbershaderVertices,
++                RendererPair0IndexedDrawCalls,
++                RendererPair0RawTriangleDrawCalls,
++                RendererPair0RectangleDrawCalls,
++                RendererPair0RasterPipelineBinds,
++                RendererPair0ScissorBinds,
++                RendererPair0DepthTransitions,
++                RendererPair0DitherExtraDrawCalls,
++                RendererPair0DitherExtraVertices,
++                RendererPair0FillRectClears,
++                RendererPair0VertexTestDispatches,
++                RendererPair1Valid,
++                RendererPair1SourceIndex,
++                RendererPair1TargetPixels,
++                RendererPair1GameCalls,
++                RendererPair1RasterScenes,
++                RendererPair1RasterDrawCalls,
++                RendererPair1RasterVertices,
++                RendererPair1SpecializedDrawCalls,
++                RendererPair1SpecializedVertices,
++                RendererPair1UbershaderDrawCalls,
++                RendererPair1UbershaderVertices,
++                RendererPair1IndexedDrawCalls,
++                RendererPair1RawTriangleDrawCalls,
++                RendererPair1RectangleDrawCalls,
++                RendererPair1RasterPipelineBinds,
++                RendererPair1ScissorBinds,
++                RendererPair1DepthTransitions,
++                RendererPair1DitherExtraDrawCalls,
++                RendererPair1DitherExtraVertices,
++                RendererPair1FillRectClears,
++                RendererPair1VertexTestDispatches,
++                RendererPair2Valid,
++                RendererPair2SourceIndex,
++                RendererPair2TargetPixels,
++                RendererPair2GameCalls,
++                RendererPair2RasterScenes,
++                RendererPair2RasterDrawCalls,
++                RendererPair2RasterVertices,
++                RendererPair2SpecializedDrawCalls,
++                RendererPair2SpecializedVertices,
++                RendererPair2UbershaderDrawCalls,
++                RendererPair2UbershaderVertices,
++                RendererPair2IndexedDrawCalls,
++                RendererPair2RawTriangleDrawCalls,
++                RendererPair2RectangleDrawCalls,
++                RendererPair2RasterPipelineBinds,
++                RendererPair2ScissorBinds,
++                RendererPair2DepthTransitions,
++                RendererPair2DitherExtraDrawCalls,
++                RendererPair2DitherExtraVertices,
++                RendererPair2FillRectClears,
++                RendererPair2VertexTestDispatches,
++                RendererPair3Valid,
++                RendererPair3SourceIndex,
++                RendererPair3TargetPixels,
++                RendererPair3GameCalls,
++                RendererPair3RasterScenes,
++                RendererPair3RasterDrawCalls,
++                RendererPair3RasterVertices,
++                RendererPair3SpecializedDrawCalls,
++                RendererPair3SpecializedVertices,
++                RendererPair3UbershaderDrawCalls,
++                RendererPair3UbershaderVertices,
++                RendererPair3IndexedDrawCalls,
++                RendererPair3RawTriangleDrawCalls,
++                RendererPair3RectangleDrawCalls,
++                RendererPair3RasterPipelineBinds,
++                RendererPair3ScissorBinds,
++                RendererPair3DepthTransitions,
++                RendererPair3DitherExtraDrawCalls,
++                RendererPair3DitherExtraVertices,
++                RendererPair3FillRectClears,
++                RendererPair3VertexTestDispatches,
++            };
++
++        inline constexpr std::array<const char *, 12>
++            SampledRendererGPUStageCounters = {
++                RendererGPUDurationMs,
++                RendererGPUSetupMs,
++                RendererGPUFramebuffersMs,
++                RendererGPUPair0RasterMs,
++                RendererGPUPair0PostMs,
++                RendererGPUPair1RasterMs,
++                RendererGPUPair1PostMs,
++                RendererGPUPair2RasterMs,
++                RendererGPUPair2PostMs,
++                RendererGPUPair3RasterMs,
++                RendererGPUPair3PostMs,
++                RendererGPUFramebufferRemainderMs,
++            };
++    }
++
++}
+diff --git a/src/render/rt64_profiler_worker_identity.h b/src/render/rt64_profiler_worker_identity.h
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_profiler_worker_identity.h
+@@ -0,0 +1,71 @@
++#pragma once
++
++// Include after rt64_render_worker.h.
++#include "common/rt64_performance_profiler.h"
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <mutex>
++
++namespace RT64::ProfilerWorkerIdentity {
++    struct Registry {
++        std::mutex mutex;
++        std::array<RenderWorker *, 64> roots{};
++        std::atomic<uint64_t> nextWorker{1};
++        uint64_t nextLogical = 1, nextNative = 1;
++    };
++
++    inline Registry &registry() {
++        // Keep the registry alive through static renderer teardown.
++        static Registry *value = new Registry();
++        return *value;
++    }
++
++    inline void assign(RenderWorker *worker, RenderWorker *sharedQueueWorker) {
++        auto &state = registry();
++        worker->profilerWorkerId = state.nextWorker.fetch_add(1, std::memory_order_relaxed);
++        bool untracked = false;
++        if (sharedQueueWorker) {
++            worker->profilerLogicalQueueId = sharedQueueWorker->profilerLogicalQueueId;
++            worker->profilerNativeQueueId = sharedQueueWorker->profilerNativeQueueId;
++        }
++        else {
++            const std::scoped_lock lock(state.mutex);
++            worker->profilerLogicalQueueId = state.nextLogical++;
++            worker->profilerNativeQueueId = 0;
++            for (RenderWorker *root : state.roots) {
++                if (root && root->device == worker->device && worker->commandQueue->sharesNativeQueue(root->commandQueue)) {
++                    worker->profilerNativeQueueId = root->profilerNativeQueueId;
++                    break;
++                }
++            }
++            auto slot = std::find(state.roots.begin(), state.roots.end(), nullptr);
++            if (slot == state.roots.end()) {
++                // Do not invent identities for untracked native objects.
++                untracked = true;
++                worker->profilerNativeQueueId = 0;
++            }
++            else {
++                if (!worker->profilerNativeQueueId) worker->profilerNativeQueueId = state.nextNative++;
++                *slot = worker;
++            }
++        }
++        PerformanceProfiler::registerRenderWorker(worker->profilerWorkerId, worker->name,
++            worker->profilerLogicalQueueId, worker->profilerNativeQueueId, static_cast<uint32_t>(worker->commandListType));
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::CPU, "RenderWorker.IdentityRegistered",
++            worker->profilerWorkerId, worker->profilerLogicalQueueId, worker->profilerNativeQueueId);
++        if (untracked) PerformanceProfiler::recordCriticalInstant(PerformanceCategory::CPU,
++            "Recorder.WorkerIdentityCapacityExceeded", worker->profilerWorkerId);
++    }
++
++    inline void retire(RenderWorker *worker) {
++        if (worker->ownedCommandQueue) {
++            auto &state = registry();
++            const std::scoped_lock lock(state.mutex);
++            auto slot = std::find(state.roots.begin(), state.roots.end(), worker);
++            if (slot != state.roots.end()) *slot = nullptr;
++        }
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::CPU, "RenderWorker.IdentityRetired",
++            worker->profilerWorkerId, worker->profilerLogicalQueueId, worker->profilerNativeQueueId);
++    }
++}
+diff --git a/src/render/rt64_profiler_gpu_queries.h b/src/render/rt64_profiler_gpu_queries.h
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_profiler_gpu_queries.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include "common/rt64_performance_profiler.h"
++#include <atomic>
++
++namespace RT64::ProfilerGpuQueries {
++    inline uint64_t nextFailureIdentity() {
++        static std::atomic<uint64_t> next{1};
++        return next.fetch_add(1, std::memory_order_relaxed);
++    }
++    // A sampled output may execute several serial workload command lists.
++    struct FrameSpan {
++        uint64_t begin = 0, end = 0;
++        uint32_t parts = 0;
++        bool valid = true;
++        bool include(uint64_t first, uint64_t last) {
++            if (!valid || first > last || (parts && first < end) || parts == UINT32_MAX) {
++                valid = false;
++                return false;
++            }
++            if (!parts) begin = first;
++            end = last;
++            ++parts;
++            return true;
++        }
++        void unavailable() { valid = false; }
++        bool complete() const { return valid && parts != 0; }
++    };
++
++    // Call after fence retirement and queryResults.
++    template<class QueryPool> bool validRead(const QueryPool *pool,
++        uint32_t first, uint32_t count, uint64_t owner, bool sequential = false) {
++        if (!pool || !pool->queryResultsValid(first, count)) {
++            PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU,
++                "Recorder.GPUQueryReadUnavailable", owner, first, count);
++            return false;
++        }
++        const uint64_t *values = pool->getResults();
++        if (!values) {
++            PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU,
++                "Recorder.GPUQueryReadUnavailable", owner, first, count);
++            return false;
++        }
++        // Draw ranges can contain nested begin/end pairs.
++        for (uint32_t i = 1; i < count; i += sequential ? 1 : 2) {
++            if (values[first + i] < values[first + i - 1]) {
++                // Keep the actual rejected values.
++                const uint64_t failure = nextFailureIdentity();
++                PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU,
++                    "GPU.QueryOrderFailureOwner", failure, owner,
++                    (uint64_t(first + i - 1) << 32) | (first + i));
++                PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU,
++                    "GPU.QueryOrderFailureValues", failure, values[first + i - 1], values[first + i]);
++                PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU,
++                    "Recorder.GPUQueryTimestampOrderInvalid", owner, first + i - 1, first + i);
++                return false;
++            }
++        }
++        return true;
++    }
++}
+diff --git a/src/render/rt64_profiler_gpu_clocks.h b/src/render/rt64_profiler_gpu_clocks.h
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_profiler_gpu_clocks.h
+@@ -0,0 +1,83 @@
++#pragma once
++// Include after rt64_render_worker.h.
++#include "common/rt64_performance_profiler.h"
++#include <atomic>
++#include <cmath>
++#include <limits>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <time.h>
++#endif
++
++namespace RT64::ProfilerGpuClocks {
++    inline void recordFrame(RenderWorker *worker, uint64_t frame, uint64_t workload) {
++        if (!PerformanceProfiler::gpuInstrumentationEnabled() || !worker || !worker->commandQueue) return;
++        static std::atomic<bool> declared{false};
++        if (!declared.exchange(true, std::memory_order_relaxed)) {
++            PerformanceProfiler::setMetadata("producer.gpu_clock_calibration.supported", "1");
++            PerformanceProfiler::setMetadata("producer.gpu_clock_calibration.enabled", "1");
++        }
++        const uint64_t queue = worker->profilerNativeQueueId;
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU, "GPU.FrameQueue", frame, workload, queue);
++        PerformanceScope overhead(PerformanceCategory::CPU, "Recorder.GPUClockCalibration", queue);
++        plume::ProfileClockCalibration sample;
++        auto unavailable = [&](uint64_t reason) {
++            PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU,
++                "GPU.ClockCalibrationUnavailable", queue, reason);
++        };
++        if (!queue || !worker->commandQueue->getProfileClockCalibration(sample)) {
++            unavailable(0);
++            return;
++        }
++        uint64_t host = 0;
++        const uint64_t before = PerformanceProfiler::nowNanoseconds();
++#ifdef _WIN32
++        LARGE_INTEGER ticks;
++        if (sample.hostClock != plume::ProfileHostClock::QueryPerformanceCounter || !QueryPerformanceCounter(&ticks)) {
++            unavailable(1);
++            return;
++        }
++        host = uint64_t(ticks.QuadPart);
++#else
++        timespec ticks;
++        if (sample.hostClock != plume::ProfileHostClock::Monotonic || clock_gettime(CLOCK_MONOTONIC, &ticks) != 0) {
++            unavailable(1);
++            return;
++        }
++        host = uint64_t(ticks.tv_sec) * 1000000000 + uint64_t(ticks.tv_nsec);
++#endif
++        const uint64_t after = PerformanceProfiler::nowNanoseconds();
++        const uint64_t deltaTicks = host >= sample.hostTicks ? host - sample.hostTicks : sample.hostTicks - host;
++        const long double delta = sample.hostFrequency ?
++            static_cast<long double>(deltaTicks) * 1000000000.0L / sample.hostFrequency : -1;
++        if (!(delta >= 0 && delta <= 60000000000.0L) || after < before ||
++                !(sample.queryScaleErrorPartsPerBillion >= 0 && sample.queryScaleErrorPartsPerBillion <= 1000000000.0)) {
++            unavailable(2);
++            return;
++        }
++        const uint64_t middle = before + (after - before) / 2;
++        if ((host >= sample.hostTicks && uint64_t(delta) > middle) ||
++                (host < sample.hostTicks && uint64_t(delta) > UINT64_MAX - middle)) {
++            unavailable(2);
++            return;
++        }
++        const uint64_t cpu = host >= sample.hostTicks ? middle - uint64_t(delta) : middle + uint64_t(delta);
++        const uint64_t bridgeError = (after - before + 1) / 2 +
++            uint64_t(std::ceil(1000000000.0 / sample.hostFrequency)) + 2;
++        uint64_t error = UINT64_MAX;
++        if (sample.maximumDeviationKnown && sample.maximumDeviationNanoseconds < UINT64_MAX - bridgeError) {
++            error = sample.maximumDeviationNanoseconds + bridgeError;
++        }
++        static std::atomic<uint64_t> next{1};
++        const uint64_t identity = next.fetch_add(1, std::memory_order_relaxed);
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU, "GPU.ClockPair", identity,
++            sample.gpuNanoseconds, cpu);
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU, "GPU.ClockQueue", identity,
++            queue, uint64_t(sample.timestampValidBits) | (uint64_t(sample.hostClock) << 32));
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU, "GPU.ClockQuality", identity,
++            error, uint64_t(std::ceil(sample.queryScaleErrorPartsPerBillion)));
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::GPU, "GPU.ClockWrap", identity,
++            sample.gpuWrapNanoseconds);
++    }
++}
+diff --git a/src/common/n64profiler_sources.json b/src/common/n64profiler_sources.json
+new file mode 100644
+--- /dev/null
++++ b/src/common/n64profiler_sources.json
+@@ -0,0 +1,16 @@
++{
++  "schema": "n64profiler-source-manifest-v1",
++  "revision": "n64profiler-0.2",
++  "license": "MIT",
++  "files": {
++    "src/common/rt64_performance_profiler.cpp": "6abb95a863b9bde1bff6b4131dd1adab67dfb7df4a144e9d9e31fda9e4dc077f",
++    "src/common/rt64_profiler_ring.h": "150ee447327f81bb78464d8aaae1197d47315ec0d9d5689734e2d87b506636c8",
++    "src/common/rt64_profiler_aggregates.h": "63ed7f9a8c98b90e58b8288dafbd51ae64fe4b5e79a81dfcb9782cd2b5d6004f",
++    "src/common/rt64_performance_profiler.h": "110c426dd897310b75b19a62b286cc0e76e44971d0f2c2418e93cbd437505014",
++    "src/common/rt64_performance_events.h": "70120d426fe447221cf2f135c5345ce8bea6b3971e33ffcf7bc745ec88e587b3",
++    "src/render/rt64_profiler_worker_identity.h": "959f91337f6e38dc18f58318864cf9206da0d3d57394d0fc9f076e12e8f3b4eb",
++    "src/render/rt64_profiler_gpu_queries.h": "3a664e49698bd2b90a034147113dd9b9de9ab0879a8aed5f6e66e232396e6f1d",
++    "src/render/rt64_profiler_gpu_clocks.h": "7b089ca8ff2648f56264181d7fb2ac5fc15b3e1aa4f5efa039e59db47ff9f6a9"
++  },
++  "hash_basis": "sha256-lf-normalized"
++}

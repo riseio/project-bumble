@@ -1,0 +1,224 @@
+diff --git a/src/rhi/rt64_render_hooks.h b/src/rhi/rt64_render_hooks.h
+index 12fdf55..9318a63 100644
+--- a/src/rhi/rt64_render_hooks.h
++++ b/src/rhi/rt64_render_hooks.h
+@@ -19,10 +19,14 @@ namespace RT64 {
+     using RenderHookDrawComplete = void(uint64_t submissionId);
+     using RenderHookPresent = void();
+     using RenderHookDeinit = void();
+     // Optional diagnostic capture hooks.
+-    using RenderHookCapturePrepare = void(
++    // open and returns true only when it actually queued that copy. The
++    // complete callback must be attached to that exact submission after its
++    // fence has completed, so an unrelated in-flight frame can never retire
++    // the readback early.
++    using RenderHookCapturePrepare = bool(
+         RenderDevice *device,
+         RenderCommandList *list,
+         RenderTexture *swapChainTexture,
+         uint32_t width,
+         uint32_t height
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 2aee5fe..de06c4e 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -585,10 +585,17 @@ namespace RT64 {
+             }
+             ext.sharedResources->interpolatedCondition.notify_all();
+         }
+ 
+         if (slot.captureComplete != nullptr) {
++            PerformanceProfiler::recordInstant(
++                PerformanceCategory::Frame,
++                "Present.DiagnosticCaptureCompleted",
++                slot.presentId,
++                slot.workloadId,
++                slot.targetSetId
++            );
+             slot.captureComplete();
+         }
+         if (slot.renderHookSubmissionId != 0u) {
+             RenderHookDrawComplete *drawComplete =
+                 GetRenderHookDrawComplete();
+@@ -1409,10 +1416,11 @@ namespace RT64 {
+                     ? std::chrono::nanoseconds(
+                         1'000'000'000 / targetRate
+                     )
+                     : std::chrono::nanoseconds(0);
+             RenderHookCaptureComplete *captureComplete = nullptr;
++            bool captureQueued = false;
+             uint64_t drawHookSubmissionId = 0;
+             bool presentWorkSubmitted = false;
+             if (presentFrame && consumesInterpolationSequence) {
+                 ensurePresentationSlots();
+                 assert(!presentationSlots.empty());
+@@ -1595,11 +1603,11 @@ namespace RT64 {
+                     if (capturePrepare != nullptr) {
+                         presentThreadStage.store(
+                             "render_hook_capture_prepare",
+                             std::memory_order_release
+                         );
+-                        capturePrepare(
++                        captureQueued = capturePrepare(
+                             ext.device,
+                             commandList,
+                             swapChainTexture,
+                             ext.swapChain->getWidth(),
+                             ext.swapChain->getHeight()
+@@ -1639,12 +1647,23 @@ namespace RT64 {
+                         1
+                     );
+                     if (recordingOrderLock.owns_lock()) {
+                         recordingOrderLock.unlock();
+                     }
+-                    captureComplete = GetRenderHookCaptureComplete();
++                    captureComplete = captureQueued
++                        ? GetRenderHookCaptureComplete()
++                        : nullptr;
+                     presentWorkSubmitted = true;
++                    if (captureQueued) {
++                        PerformanceProfiler::recordInstant(
++                            PerformanceCategory::Frame,
++                            "Present.DiagnosticCaptureQueued",
++                            present.presentId,
++                            present.workloadId,
++                            selectedTargetSetId
++                        );
++                    }
+                 }
+                 if (consumesInterpolationSequence && presentWorkSubmitted) {
+                     {
+                         const std::scoped_lock<std::mutex> interpolatedLock(
+                             ext.sharedResources->interpolatedMutex
+@@ -1971,10 +1990,17 @@ namespace RT64 {
+                             gpuWaitProfiler.average(),
+                             std::memory_order_relaxed
+                         );
+                     }
+                     if (captureComplete != nullptr) {
++                        PerformanceProfiler::recordInstant(
++                            PerformanceCategory::Frame,
++                            "Present.DiagnosticCaptureCompleted",
++                            present.presentId,
++                            present.workloadId,
++                            selectedTargetSetId
++                        );
+                         captureComplete();
+                         captureComplete = nullptr;
+                     }
+                 }
+                 presentWorkSubmitted = false;
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+index 50c7fad..bbb3f74 100644
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -2140,10 +2140,12 @@ namespace RT64 {
+             uint64_t interpolationFramebufferMismatchPresentedCount = 0;
+             uint64_t interpolationFramebufferMismatchRejectedCount = 0;
+             uint64_t presentationFramebufferInventoryCount = 0;
+             uint64_t presentationFramebufferOwnerMatchedCount = 0;
+             uint64_t presentationFramebufferOwnerMissingCount = 0;
++            uint64_t diagnosticCaptureQueuedCount = 0;
++            uint64_t diagnosticCaptureCompletedCount = 0;
+             uint64_t earlyPresentDecisionCount = 0;
+             uint64_t earlyPresentEnabledCount = 0;
+             uint64_t earlyPresentCandidateCount = 0;
+             uint64_t earlyPresentSubmittedCount = 0;
+             uint64_t earlyPresentSubmissionMissCount = 0;
+@@ -2413,10 +2415,18 @@ namespace RT64 {
+                                 workloadFramebufferInventory &&
+                                     !workloadFramebufferOwnerMatched
+                                 ? 1u
+                                 : 0u;
+                         }
++                        else if (eventName ==
++                            "Present.DiagnosticCaptureQueued") {
++                            diagnosticCaptureQueuedCount++;
++                        }
++                        else if (eventName ==
++                            "Present.DiagnosticCaptureCompleted") {
++                            diagnosticCaptureCompletedCount++;
++                        }
+                         else if (eventName ==
+                             "State.FullSyncEarlyPresentDecision") {
+                             const uint64_t flags = event.argument0 & 0xFFu;
+                             const bool enabled = (flags & 1u) != 0u;
+                             const bool candidate =
+@@ -4642,11 +4652,20 @@ namespace RT64 {
+                 (presentationSlotCompletionP95 > budget);
+             const bool presentedInterpolationFramebufferMismatch =
+                 interpolationFramebufferMismatchPresentedCount > 0u;
+             const bool presentationFramebufferOwnerMissing =
+                 presentationFramebufferOwnerMissingCount > 0u;
+-            if (presentationFramebufferOwnerMissing) {
++            const bool diagnosticCaptureCompletionMissing =
++                diagnosticCaptureCompletedCount <
++                    diagnosticCaptureQueuedCount;
++            if (diagnosticCaptureCompletionMissing) {
++                diagnosis = "DIAGNOSTIC_CAPTURE_COMPLETION_MISSING";
++                confidence = "high";
++                primaryStage = "Present.DiagnosticCaptureCompleted";
++                primaryP95 = 0.0;
++            }
++            else if (presentationFramebufferOwnerMissing) {
+                 diagnosis =
+                     "PRESENT_FRAMEBUFFER_WORKLOAD_OWNERSHIP_MISSING";
+                 confidence = "high";
+                 primaryStage = "Present.InterpolationResolved";
+                 primaryP95 = 0.0;
+@@ -4717,10 +4736,11 @@ namespace RT64 {
+                 (interpolationDynamicVertexChangedVertices >= 100u) &&
+                 (interpolationDynamicVertexSkippedVertices * 100u >=
+                     interpolationDynamicVertexChangedVertices);
+             if (observedCadenceWithinTolerance &&
+                 !hardInterpolationFailure &&
++                !diagnosticCaptureCompletionMissing &&
+                 !presentedInterpolationFramebufferMismatch &&
+                 !presentationFramebufferOwnerMissing &&
+                 !observedOutputContradiction) {
+                 if (dynamicVertexCoverageGap) {
+                     diagnosis =
+@@ -4756,8 +4776,9 @@ namespace RT64 {
+                 }
+                 else if (fifoBacklogContinuouslyAvailable &&
+                     !hardInterpolationFailure &&
+                     !gpuIdleClockMaintenanceStarved &&
+                     !threadSchedulingDeadlineMiss &&
++                    !diagnosticCaptureCompletionMissing &&
+                     !presentedInterpolationFramebufferMismatch &&
+                     !presentationFramebufferOwnerMissing &&
+                     (earlyPresentSubmissionMissCount <= 2u)) {
+@@ -4841,11 +4862,11 @@ namespace RT64 {
+             std::ofstream output(summaryPath, std::ios::binary);
+             if (!output.is_open()) {
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v44\",\n";
++            output << "{\n  \"schema\": \"rt64-performance-summary-v45\",\n";
+             output << "  \"capture_mode\": \""
+                 << (profiler.lowOverhead ? "low_overhead" : "detailed")
+                 << "\",\n";
+             output << "  \"durability\": {\"journal_schema\":\"rt64-performance-journal-v1\",\"journal_interval_ms\":"
+                 << profiler.journalIntervalMilliseconds
+@@ -5185,10 +5206,20 @@ namespace RT64 {
+                 << presentationFramebufferInventoryCount
+                 << ",\"workload_framebuffer_owner_matched_count\":"
+                 << presentationFramebufferOwnerMatchedCount
+                 << ",\"workload_framebuffer_owner_missing_count\":"
+                 << presentationFramebufferOwnerMissingCount
++                << ",\"diagnostic_capture_queued_count\":"
++                << diagnosticCaptureQueuedCount
++                << ",\"diagnostic_capture_completed_count\":"
++                << diagnosticCaptureCompletedCount
++                << ",\"diagnostic_capture_completion_missing_count\":"
++                << (diagnosticCaptureQueuedCount >
++                        diagnosticCaptureCompletedCount
++                    ? diagnosticCaptureQueuedCount -
++                        diagnosticCaptureCompletedCount
++                    : 0u)
+                 << ",\"early_present_decision_count\":"
+                 << earlyPresentDecisionCount
+                 << ",\"early_present_enabled_count\":"
+                 << earlyPresentEnabledCount
+                 << ",\"early_present_candidate_count\":"

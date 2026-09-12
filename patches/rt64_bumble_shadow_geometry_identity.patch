@@ -1,0 +1,142 @@
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index d90b542..cb6e414 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include "rt64_descriptor_sets.h"
+ #include "rt64_bumble_environment.h"
++#include "rt64_bumble_shadow_geometry.h"
+ #include "rt64_render_worker.h"
+ 
+ // TODO: Move to shared.
+@@ -565,9 +566,10 @@ namespace RT64 {
+     }
+ 
+     static bool bumbleDynamicShadowCaster(
+-        const DrawData &drawData,
++        const Workload &workload,
+         const GameCall &call
+     ) {
++        const DrawData &drawData = workload.drawData;
+         const uint32_t first = call.callDesc.minWorldMatrix;
+         const uint32_t last = call.callDesc.maxWorldMatrix;
+         if (first > last || last >= drawData.worldTransformGroups.size()) {
+@@ -603,7 +605,23 @@ namespace RT64 {
+                 return true;
+             }
+         }
+-        return false;
++        thread_local const Workload *cachedWorkload = nullptr;
++        thread_local uint64_t cachedSubmission = UINT64_MAX;
++        thread_local uint64_t cachedWorkloadId = UINT64_MAX;
++        thread_local std::unordered_map<const GameCall *, bool> motion;
++        if (cachedWorkload != &workload || cachedSubmission != workload.submissionFrame ||
++            cachedWorkloadId != workload.workloadId) {
++            motion.clear();
++            cachedWorkload = &workload;
++            cachedSubmission = workload.submissionFrame;
++            cachedWorkloadId = workload.workloadId;
++        }
++        const auto found = motion.find(&call);
++        if (found != motion.end()) return found->second;
++        const bool moving = bumbleShadowGeometryMoving(drawData, call.meshDesc.faceIndicesStart,
++            uint64_t(call.callDesc.triangleCount) * 3);
++        motion.emplace(&call, moving);
++        return moving;
+     }
+ 
+     static bool bumbleMaterialShadersDisabled() {
+@@ -1112,7 +1133,7 @@ namespace RT64 {
+                     }
+                     const GameCall &call = projection.gameCalls[drawIndex];
+                     if (!bumbleShadowCasterEligible(projection, call) ||
+-                        bumbleDynamicShadowCaster(workload.drawData, call)) {
++                        bumbleDynamicShadowCaster(workload, call)) {
+                         continue;
+                     }
+                     const uint32_t materialClass = bumbleCachedMaterialClass(
+@@ -1126,6 +1147,9 @@ namespace RT64 {
+                         continue;
+                     }
+                     ++casterCount;
++                    hash = bumbleShadowHashMix(hash, bumbleShadowGeometryKey(
++                        workload.drawData, call.meshDesc.faceIndicesStart,
++                        uint64_t(call.callDesc.triangleCount) * 3));
+                     hash = bumbleShadowHashMix(hash, pairIndex);
+                     hash = bumbleShadowHashMix(hash, projectionIndex);
+                     hash = bumbleShadowHashMix(
+@@ -3871,7 +3895,7 @@ namespace RT64 {
+                     const GameCall &call = projection.gameCalls[drawIndex];
+                     if (!bumbleShadowCasterEligible(projection, call) ||
+                         !bumbleDynamicShadowCaster(
+-                            p.curWorkload->drawData,
++                            *p.curWorkload,
+                             call
+                         )) {
+                         continue;
+@@ -6072,7 +6096,7 @@ namespace RT64 {
+                             casterMaterialClass !=
+                                 BumbleMaterialLegacyWaterOverlay) {
+                             BumbleShadowRenderer *casterRenderer =
+-                                bumbleDynamicShadowCaster(drawData, call)
++                                bumbleDynamicShadowCaster(*p.curWorkload, call)
+                                     ? bumbleDynamicShadowRenderer.get()
+                                     : bumbleShadowRenderer.get();
+                             casterRenderer->addCasterRange(
+@@ -6345,7 +6369,7 @@ namespace RT64 {
+                         BumbleMaterialLegacyWaterOverlay &&
+                     bumbleShadowRenderer->framePrepared) {
+                     BumbleShadowRenderer *casterRenderer =
+-                        bumbleDynamicShadowCaster(drawData, call)
++                        bumbleDynamicShadowCaster(*p.curWorkload, call)
+                             ? bumbleDynamicShadowRenderer.get()
+                             : bumbleShadowRenderer.get();
+                     casterRenderer->addCasterRange(
+
+diff --git a/src/render/rt64_bumble_shadow_geometry.h b/src/render/rt64_bumble_shadow_geometry.h
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_bumble_shadow_geometry.h
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include "hle/rt64_workload.h"
++#include "xxHash/xxh3.h"
++#include <stdexcept>
++
++namespace RT64 {
++    // Source geometry is immutable within a workload, not across workloads.
++    inline uint64_t bumbleShadowGeometryKey(const DrawData &data,
++        uint64_t first, uint64_t count) {
++        if (first > data.faceIndices.size() || count > data.faceIndices.size() - first)
++            throw std::runtime_error("Invalid shadow caster index range");
++        XXH3_state_t state{};
++        XXH3_64bits_reset(&state);
++        for (uint64_t i = first; i < first + count; ++i) {
++            const uint32_t vertex = data.faceIndices[i];
++            const uint64_t position = uint64_t(vertex) * 3;
++            if (vertex >= data.worldIndices.size() || position + 3 > data.posFloats.size())
++                throw std::runtime_error("Invalid shadow caster vertex");
++            XXH3_64bits_update(&state, &vertex, sizeof(vertex));
++            XXH3_64bits_update(&state, &data.worldIndices[vertex], sizeof(data.worldIndices[vertex]));
++            XXH3_64bits_update(&state, &data.posFloats[position], 3 * sizeof(float));
++        }
++        return XXH3_64bits_digest(&state);
++    }
++
++    inline bool bumbleShadowGeometryMoving(const DrawData &data,
++        uint64_t first, uint64_t count) {
++        if (first > data.faceIndices.size() || count > data.faceIndices.size() - first)
++            throw std::runtime_error("Invalid shadow caster index range");
++        for (uint64_t i = first; i < first + count; ++i) {
++            const uint64_t position = uint64_t(data.faceIndices[i]) * 3;
++            if (position + 3 > data.velFloats.size())
++                throw std::runtime_error("Invalid shadow caster velocity");
++            if (data.velFloats[position] != 0 || data.velFloats[position + 1] != 0 ||
++                data.velFloats[position + 2] != 0)
++                return true;
++        }
++        return false;
++    }
++}

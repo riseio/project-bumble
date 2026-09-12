@@ -1,0 +1,158 @@
+diff --git a/include/rt64_extended_gbi.h b/include/rt64_extended_gbi.h
+--- a/include/rt64_extended_gbi.h
++++ b/include/rt64_extended_gbi.h
+@@ -95,6 +95,8 @@
+ // Arc marker carrying lightning source/contact pairs and world projection.
+ #define G_EX_BUMBLE_ELECTRIC_MARKER_V1  0x000038
+-#define G_EX_MAX                        0x000039
++// Zero-geometry ordering boundary before perspective or rectangle HUD draws.
++#define G_EX_BUMBLE_HUD_BEGIN_V1       0x000039
++#define G_EX_MAX                        0x00003A
+ 
+ #define G_EX_ORIGIN_NONE            0x800
+ #define G_EX_ORIGIN_LEFT            0x0
+diff --git a/src/gbi/rt64_gbi_extended.cpp b/src/gbi/rt64_gbi_extended.cpp
+--- a/src/gbi/rt64_gbi_extended.cpp
++++ b/src/gbi/rt64_gbi_extended.cpp
+@@ -351,7 +351,11 @@
+             state->rsp->bumbleElectricPass((*dl)->w1);
+         }
+ 
+-        void noOpHook(State *state, DisplayList **dl) {
++        void bumbleHudBeginV1(State *state, DisplayList **dl) {
++            state->rsp->bumbleHudBegin();
++        }
++
++        void noOpHook(State *state, DisplayList **dl) {
+             uint32_t magicNumber = (*dl)->p0(0, 24);
+             if (magicNumber == RT64_HOOK_MAGIC_NUMBER) {
+                 uint32_t hookValue = (*dl)->p1(0, 28);
+@@ -466,7 +470,8 @@
+                 &bumbleCollisionMarkerV1;
+             Map[G_EX_BUMBLE_ELECTRIC_MARKER_V1] =
+                 &bumbleElectricMarkerV1;
+-            MapInitialized = true;
++            Map[G_EX_BUMBLE_HUD_BEGIN_V1] = &bumbleHudBeginV1;
++            MapInitialized = true;
+         }
+     }
+ };
+diff --git a/src/hle/rt64_draw_call.h b/src/hle/rt64_draw_call.h
+--- a/src/hle/rt64_draw_call.h
++++ b/src/hle/rt64_draw_call.h
+@@ -52,7 +52,8 @@
+         BumbleGrassPass,
+         BumbleSkyPass,
+         BumbleCollisionDebugPass,
+-        BumbleElectricPass
++        BumbleElectricPass,
++        BumbleHudBegin
+     };
+ 
+     struct DrawVertexTestZ {
+diff --git a/src/hle/rt64_rsp.h b/src/hle/rt64_rsp.h
+--- a/src/hle/rt64_rsp.h
++++ b/src/hle/rt64_rsp.h
+@@ -305,7 +305,8 @@
+         void bumbleGrassPass(uint32_t snapshotTicket);
+         void bumbleSkyPass(uint32_t snapshotTicket);
+         void bumbleCollisionDebugPass(uint32_t snapshotTicket);
+-        void bumbleElectricPass(uint32_t snapshotTicket);
++        void bumbleElectricPass(uint32_t snapshotTicket);
++        void bumbleHudBegin();
+         void matrixId(uint32_t id, bool push, bool proj, bool decompose, uint8_t pos, uint8_t rot, uint8_t scale, uint8_t skew, uint8_t persp, uint8_t vpos, uint8_t vtc, uint8_t tile, uint8_t lookat, uint8_t order, uint8_t aspect, uint8_t editable, bool idIsAddress, bool editGroup);
+         void popMatrixId(uint8_t count, bool proj);
+         void forceBranch(bool force);
+diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
+--- a/src/hle/rt64_rsp.cpp
++++ b/src/hle/rt64_rsp.cpp
+@@ -1238,7 +1238,29 @@
+         state->updateDrawStatusAttribute(DrawAttribute::ExtendedType);
+     }
+ 
+-    void RSP::bumbleGrassPass(uint32_t snapshotTicket) {
++    void RSP::bumbleHudBegin() {
++        state->rdp->checkFramebufferPair();
++        Workload &workload = state->ext.workloadQueue->workloads[
++            state->ext.workloadQueue->writeCursor];
++        FramebufferPair &fbPair =
++            workload.fbPairs[workload.currentFramebufferPairIndex()];
++        const Projection::Type projectionType = getCurrentProjectionType();
++        if (!fbPair.inProjection(curViewProjIndex, projectionType)) {
++            state->flush();
++            addCurrentProjection(projectionType);
++        }
++
++        extended.drawExtendedType = DrawExtendedType::BumbleHudBegin;
++        state->updateDrawStatusAttribute(DrawAttribute::ExtendedType);
++        if (state->checkDrawState()) {
++            state->loadDrawState();
++        }
++        state->recordZeroGeometryExtendedGameCall();
++        extended.drawExtendedType = DrawExtendedType::None;
++        state->updateDrawStatusAttribute(DrawAttribute::ExtendedType);
++    }
++
++    void RSP::bumbleGrassPass(uint32_t snapshotTicket) {
+         const int workloadCursor = state->ext.workloadQueue->writeCursor;
+         Workload &workload =
+             state->ext.workloadQueue->workloads[workloadCursor];
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -452,8 +452,9 @@
+             workload.fbPairs[workload.currentFramebufferPairIndex()];
+         assert(fbPair.projectionCount > 0);
+         assert(
+-            fbPair.projections[fbPair.projectionCount - 1].type ==
+-            Projection::Type::Perspective
++            drawCall.extendedType == DrawExtendedType::BumbleHudBegin ||
++            fbPair.projections[fbPair.projectionCount - 1].type ==
++            Projection::Type::Perspective
+         );
+ 
+         // A host-owned extended pass has no guest mesh or raster state.
+@@ -539,8 +540,9 @@
+         case DrawExtendedType::BumbleGrassPass:
+         case DrawExtendedType::BumbleSkyPass:
+         case DrawExtendedType::BumbleCollisionDebugPass:
+-        case DrawExtendedType::BumbleElectricPass:
+-            break;
++        case DrawExtendedType::BumbleElectricPass:
++        case DrawExtendedType::BumbleHudBegin:
++            break;
+         default:
+             if (extended.vertexTestZActive) {
+                 workload.extended.testZIndexCount += drawCall.triangleCount * 3;
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -5919,8 +5919,16 @@
+                 bumbleLightingGrade(environment.profile);
+ 
+             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
+-                const GameCall &call = proj.gameCalls[d];
+-                const interop::OtherMode &lightingOtherMode =
++                const GameCall &call = proj.gameCalls[d];
++                if (call.callDesc.extendedType == DrawExtendedType::BumbleHudBegin) {
++                    // HUD models also use perspective projections.
++                    emitPendingSky();
++                    emitPendingGrass();
++                    emitDeferredWater();
++                    emitPendingElectric();
++                    emitPendingCollisionDebug();
++                }
++                const interop::OtherMode &lightingOtherMode =
+                     call.callDesc.otherMode;
+                 const uint32_t cycleType = lightingOtherMode.cycleType();
+                 const bool perspectiveTriangles =
+@@ -6389,5 +6401,8 @@
+                         instanceDrawCall.type = InstanceDrawCall::Type::Unknown;
+                         vertexTestZCallIndex = -1;
+                         break;
+-                    case DrawExtendedType::BumbleGrassPass: {
++                    case DrawExtendedType::BumbleHudBegin:
++                        instanceDrawCall.type = InstanceDrawCall::Type::Unknown;
++                        break;
++                    case DrawExtendedType::BumbleGrassPass: {
+                         // The complete-workload prescan above owns the project enhancement.

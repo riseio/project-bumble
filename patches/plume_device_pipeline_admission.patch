@@ -1,0 +1,179 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -8,12 +8,14 @@
+ #include "plume_d3d12.h"
+ 
+ #include <cstring>
++#include <cstdlib>
+ #include <cstdio>
+ #include <cwchar>
+ #include <fstream>
+ #include <unordered_set>
+ 
+ #include <dxgi1_5.h>
++#include <d3d12sdklayers.h>
+ 
+ #ifdef __clang__
+ #pragma clang diagnostic push
+@@ -4015,12 +4017,33 @@
+         HRESULT res;
+         UINT adapterIndex = 0;
+         IDXGIAdapter1 *adapterOption = nullptr;
+-        while (renderInterface->dxgiFactory->EnumAdapters1(adapterIndex++, &adapterOption) != DXGI_ERROR_NOT_FOUND) {
++        // Explicit validation adapter only; never a production fallback.
++        const char *warpSetting = std::getenv("BUMBLE_D3D12_VALIDATION_WARP");
++        const char *ownedInput = std::getenv("BUMBLE_RT64_VALIDATION_SYNTHETIC_INPUT");
++        const bool validationWarp = warpSetting && std::strcmp(warpSetting, "1") == 0 &&
++            ownedInput && std::strcmp(ownedInput, "1") == 0;
++        auto nextAdapter = [&]() -> HRESULT {
++            adapterOption = nullptr;
++            if (validationWarp) {
++                if (adapterIndex++ != 0) return DXGI_ERROR_NOT_FOUND;
++                IDXGIFactory4 *factory4 = nullptr;
++                HRESULT hr = renderInterface->dxgiFactory->QueryInterface(IID_PPV_ARGS(&factory4));
++                if (FAILED(hr)) return hr;
++                hr = factory4->EnumWarpAdapter(IID_PPV_ARGS(&adapterOption));
++                factory4->Release();
++                return hr;
++            }
++            return renderInterface->dxgiFactory->EnumAdapters1(adapterIndex++, &adapterOption);
++        };
++        while (SUCCEEDED(res = nextAdapter())) {
+             DXGI_ADAPTER_DESC1 adapterDesc;
+-            adapterOption->GetDesc1(&adapterDesc);
++            if (FAILED(adapterOption->GetDesc1(&adapterDesc))) {
++                adapterOption->Release();
++                continue;
++            }
+ 
+             // Ignore remote or software adapters.
+-            if (adapterDesc.Flags & (DXGI_ADAPTER_FLAG_REMOTE | DXGI_ADAPTER_FLAG_SOFTWARE)) {
++            if (!validationWarp && (adapterDesc.Flags & (DXGI_ADAPTER_FLAG_REMOTE | DXGI_ADAPTER_FLAG_SOFTWARE))) {
+                 adapterOption->Release();
+                 continue;
+             }
+@@ -4032,25 +4055,19 @@
+                 continue;
+             }
+ 
+-            // Determine the shader model supported by the device.
+-#       if SM_5_1_SUPPORTED
+-            const D3D_SHADER_MODEL supportedShaderModels[] = { D3D_SHADER_MODEL_6_0, D3D_SHADER_MODEL_5_1 };
+-#       else
+-            const D3D_SHADER_MODEL supportedShaderModels[] = { D3D_SHADER_MODEL_6_0 };
+-#       endif
+-            D3D12_FEATURE_DATA_SHADER_MODEL dataShaderModel = {};
+-            for (uint32_t i = 0; i < _countof(supportedShaderModels); i++) {
+-                dataShaderModel.HighestShaderModel = supportedShaderModels[i];
+-                res = deviceOption->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &dataShaderModel, sizeof(dataShaderModel));
+-                if (res != E_INVALIDARG) {
+-                    if (FAILED(res)) {
+-                        deviceOption->Release();
+-                        adapterOption->Release();
+-                        continue;
+-                    }
+-
+-                    break;
+-                }
++            // Admit the actual embedded shader and bindless-SRV contract.
++            D3D12_FEATURE_DATA_SHADER_MODEL dataShaderModel = { D3D_SHADER_MODEL_6_3 };
++            res = deviceOption->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &dataShaderModel, sizeof(dataShaderModel));
++            D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
++            HRESULT optionsResult = deviceOption->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
++            if (FAILED(res) || dataShaderModel.HighestShaderModel < D3D_SHADER_MODEL_6_3 ||
++                FAILED(optionsResult) || options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_2) {
++                std::fprintf(stderr, "PLUME_D3D12 stage=adapter_rejected shader_model=0x%X shader_hr=0x%08lX binding_tier=%u binding_hr=0x%08lX required=sm6.3_tier2\n",
++                    unsigned(dataShaderModel.HighestShaderModel), static_cast<unsigned long>(res),
++                    unsigned(options.ResourceBindingTier), static_cast<unsigned long>(optionsResult));
++                deviceOption->Release();
++                adapterOption->Release();
++                continue;
+             }
+ 
+             // Determine if the device supports sample locations.
+@@ -4276,11 +4295,15 @@
+     }
+ 
+     std::unique_ptr<RenderPipeline> D3D12Device::createComputePipeline(const RenderComputePipelineDesc &desc) {
+-        return std::make_unique<D3D12ComputePipeline>(this, desc);
++        auto pipeline = std::make_unique<D3D12ComputePipeline>(this, desc);
++        if (pipeline->d3d == nullptr) throw std::runtime_error("D3D12 compute pipeline creation failed");
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> D3D12Device::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
+-        return std::make_unique<D3D12GraphicsPipeline>(this, desc);
++        auto pipeline = std::make_unique<D3D12GraphicsPipeline>(this, desc);
++        if (pipeline->d3d == nullptr) throw std::runtime_error("D3D12 graphics pipeline creation failed");
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> D3D12Device::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
+@@ -4322,7 +4345,9 @@
+     }
+ 
+     std::unique_ptr<RenderPipelineLayout> D3D12Device::createPipelineLayout(const RenderPipelineLayoutDesc &desc) {
+-        return std::make_unique<D3D12PipelineLayout>(this, desc);
++        auto layout = std::make_unique<D3D12PipelineLayout>(this, desc);
++        if (layout->rootSignature == nullptr) throw std::runtime_error("D3D12 root signature creation failed");
++        return layout;
+     }
+ 
+     std::unique_ptr<RenderCommandFence> D3D12Device::createCommandFence() {
+@@ -4692,6 +4717,27 @@
+     }
+ 
+     void D3D12Device::release() {
++        const char *validation = std::getenv("BUMBLE_D3D12_VALIDATION");
++        if (d3d && validation && std::strcmp(validation, "1") == 0) {
++            ID3D12InfoQueue *queue = nullptr;
++            if (SUCCEEDED(d3d->QueryInterface(IID_PPV_ARGS(&queue)))) {
++                uint64_t errors = 0;
++                const uint64_t count = queue->GetNumStoredMessagesAllowedByRetrievalFilter();
++                for (uint64_t i = 0; i < count; ++i) {
++                    SIZE_T size = 0;
++                    if (FAILED(queue->GetMessage(i, nullptr, &size))) continue;
++                    std::vector<uint8_t> bytes(size);
++                    auto *message = reinterpret_cast<D3D12_MESSAGE *>(bytes.data());
++                    if (SUCCEEDED(queue->GetMessage(i, message, &size)) && message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
++                        if (++errors <= 20) std::fprintf(stderr, "PLUME_D3D12 validation_error=%s\n", message->pDescription);
++                    }
++                }
++                std::fprintf(stderr, "PLUME_D3D12 validation_messages=%llu errors=%llu discarded=%llu\n",
++                    static_cast<unsigned long long>(count), static_cast<unsigned long long>(errors),
++                    static_cast<unsigned long long>(queue->GetNumMessagesDiscardedByMessageCountLimit()));
++                queue->Release();
++            }
++        }
+         if (pipelineLibrary != nullptr) {
+             savePipelineCache();
+             pipelineLibrary->Release();
+@@ -4728,6 +4774,19 @@
+     D3D12Interface::D3D12Interface() {
+         // Create DXGI Factory.
+         UINT dxgiFactoryFlags = 0;
++        const char *validation = std::getenv("BUMBLE_D3D12_VALIDATION");
++        if (validation && std::strcmp(validation, "1") == 0) {
++            ID3D12Debug *validationController = nullptr;
++            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&validationController)))) {
++                validationController->EnableDebugLayer();
++                validationController->Release();
++                dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
++                std::fprintf(stderr, "PLUME_D3D12 validation_layer=enabled\n");
++            }
++            else {
++                std::fprintf(stderr, "PLUME_D3D12 validation_layer=unavailable\n");
++            }
++        }
+ 
+ #   ifdef D3D12_DEBUG_LAYER_ENABLED
+         ID3D12Debug1 *debugController;
+@@ -4754,6 +4813,7 @@
+         if (SUCCEEDED(dxgiFactory->QueryInterface(IID_PPV_ARGS(&dxgiFactory5)))) {
+             res = dxgiFactory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearingBool, sizeof(allowTearingBool));
+             allowTearing = SUCCEEDED(res) && allowTearingBool;
++            dxgiFactory5->Release();
+         }
+ 
+         // Fill capabilities.

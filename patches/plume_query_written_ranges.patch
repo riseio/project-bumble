@@ -1,0 +1,107 @@
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -346,6 +346,10 @@
+         bool queryResultsValid() const { return queryResultsValid(0, getCount()); }
+         virtual ~RenderQueryPool() { }
+         virtual void queryResults() = 0;
++        virtual void queryResults(uint32_t first, uint32_t count) {
++            queryReadState.invalidate();
++            if (first == 0 && count == getCount()) queryResults();
++        }
+         virtual const uint64_t *getResults() const = 0;
+         virtual uint32_t getCount() const = 0;
+     };
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -302,6 +302,7 @@
+         VulkanQueryPool(VulkanDevice *device, uint32_t queryCount);
+         virtual ~VulkanQueryPool() override;
+         virtual void queryResults() override;
++        virtual void queryResults(uint32_t firstQuery, uint32_t queryCount) override;
+         virtual const uint64_t *getResults() const override;
+         virtual uint32_t getCount() const override;
+     };
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -3032,9 +3032,14 @@
+     }
+ 
+     void VulkanQueryPool::queryResults() {
++        queryResults(0, getCount());
++    }
++
++    void VulkanQueryPool::queryResults(uint32_t firstQuery, uint32_t queryCount) {
+         queryReadState.invalidate();
+-
+-	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
++        if (firstQuery > results.size() || queryCount > results.size() - firstQuery || queryCount == 0) return;
++
++	    VkResult res = vkGetQueryPoolResults(device->vk, vk, firstQuery, queryCount, sizeof(uint64_t) * queryCount, results.data() + firstQuery, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkGetQueryPoolResults failed with error code 0x%X.\n", res);
+             return;
+@@ -3066,13 +3071,14 @@
+         double timestampPeriod = double(device->physicalDeviceProperties.limits.timestampPeriod);
+         if (!(timestampPeriod >= 1.0 / 65536.0 && timestampPeriod < 281474976710656.0)) return;
+         uint64_t h = 0, l = 0;
+-        for (uint64_t &result : results) {
++        for (uint32_t queryIndex = firstQuery; queryIndex < firstQuery + queryCount; ++queryIndex) {
++            uint64_t &result = results[queryIndex];
+             mult64to128(result, uint64_t(timestampPeriod * double(1 << shift_bits)), h, l);
+             result = l;
+             result >>= shift_bits;
+             result |= h << (64 - shift_bits);
+         }
+-        queryReadState.completed(0, uint32_t(results.size()));
++        queryReadState.completed(firstQuery, queryCount);
+     }
+ 
+     const uint64_t *VulkanQueryPool::getResults() const {
+diff --git a/plume_d3d12.h b/plume_d3d12.h
+--- a/plume_d3d12.h
++++ b/plume_d3d12.h
+@@ -165,6 +165,7 @@
+         D3D12QueryPool(D3D12Device *device, uint32_t queryCount);
+         virtual ~D3D12QueryPool() override;
+         virtual void queryResults() override;
++        virtual void queryResults(uint32_t firstQuery, uint32_t queryCount) override;
+         virtual const uint64_t *getResults() const override;
+         virtual uint32_t getCount() const override;
+     };
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -1906,21 +1906,27 @@
+     }
+ 
+     void D3D12QueryPool::queryResults() {
++        queryResults(0, getCount());
++    }
++
++    void D3D12QueryPool::queryResults(uint32_t firstQuery, uint32_t queryCount) {
+         queryReadState.invalidate();
++        if (firstQuery > results.size() || queryCount > results.size() - firstQuery || queryCount == 0) return;
+ 
+         if (device->timestampFrequency == 0) return;
+         void *readbackData = readbackBuffer->map();
+         if (readbackData == nullptr) return;
+-        memcpy(results.data(), readbackData, sizeof(uint64_t) * results.size());
++        memcpy(results.data() + firstQuery, static_cast<const uint64_t *>(readbackData) + firstQuery, sizeof(uint64_t) * queryCount);
+         readbackBuffer->unmap();
+ 
+-        for (uint64_t &result : results) {
++        for (uint32_t queryIndex = firstQuery; queryIndex < firstQuery + queryCount; ++queryIndex) {
++            uint64_t &result = results[queryIndex];
+             const double nanoseconds = double(result) / double(device->timestampFrequency) * 1000000000.0;
+             // Range comparison also rejects NaN without converting it to an integer.
+             if (!(nanoseconds >= 0.0 && nanoseconds < 18446744073709551616.0)) return;
+             result = uint64_t(nanoseconds);
+         }
+-        queryReadState.completed(0, uint32_t(results.size()));
++        queryReadState.completed(firstQuery, queryCount);
+     }
+ 
+     const uint64_t *D3D12QueryPool::getResults() const {

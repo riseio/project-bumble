@@ -1,0 +1,158 @@
+diff --git a/include/rt64_extended_gbi.h b/include/rt64_extended_gbi.h
+--- a/include/rt64_extended_gbi.h
++++ b/include/rt64_extended_gbi.h
+@@ -95,6 +95,6 @@
+ // Arc marker carrying lightning source/contact pairs and world projection.
+ #define G_EX_BUMBLE_ELECTRIC_MARKER_V1  0x000038
+-// Zero-geometry ordering boundary before perspective or rectangle HUD draws.
++// Paired zero-geometry HUD scope: w1 bit 0 is 0 on entry, 1 on return.
+ #define G_EX_BUMBLE_HUD_BEGIN_V1       0x000039
+ #define G_EX_MAX                        0x00003A
+ 
+diff --git a/src/gbi/rt64_gbi_extended.cpp b/src/gbi/rt64_gbi_extended.cpp
+--- a/src/gbi/rt64_gbi_extended.cpp
++++ b/src/gbi/rt64_gbi_extended.cpp
+@@ -352,7 +352,7 @@ namespace RT64 {
+         }
+ 
+         void bumbleHudBeginV1(State *state, DisplayList **dl) {
+-            state->rsp->bumbleHudBegin();
++            state->rsp->bumbleHudBegin(((*dl)->w1 & 1u) == 0u);
+         }
+ 
+         void noOpHook(State *state, DisplayList **dl) {
+diff --git a/src/hle/rt64_draw_call.h b/src/hle/rt64_draw_call.h
+--- a/src/hle/rt64_draw_call.h
++++ b/src/hle/rt64_draw_call.h
+@@ -75,6 +75,7 @@ namespace RT64 {
+         uint32_t forceTrueBilerp : 2;
+         uint32_t forceScaleLOD : 1;
+         uint32_t bumbleTeleportDisabledTint : 1;
++        uint32_t bumbleHud : 1;
+     };
+ 
+     struct DrawCall {
+diff --git a/src/hle/rt64_rsp.h b/src/hle/rt64_rsp.h
+--- a/src/hle/rt64_rsp.h
++++ b/src/hle/rt64_rsp.h
+@@ -306,7 +306,7 @@ namespace RT64 {
+         void bumbleSkyPass(uint32_t snapshotTicket);
+         void bumbleCollisionDebugPass(uint32_t snapshotTicket);
+         void bumbleElectricPass(uint32_t snapshotTicket);
+-        void bumbleHudBegin();
++        void bumbleHudBegin(bool active);
+         void matrixId(uint32_t id, bool push, bool proj, bool decompose, uint8_t pos, uint8_t rot, uint8_t scale, uint8_t skew, uint8_t persp, uint8_t vpos, uint8_t vtc, uint8_t tile, uint8_t lookat, uint8_t order, uint8_t aspect, uint8_t editable, bool idIsAddress, bool editGroup);
+         void popMatrixId(uint8_t count, bool proj);
+         void forceBranch(bool force);
+diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
+--- a/src/hle/rt64_rsp.cpp
++++ b/src/hle/rt64_rsp.cpp
+@@ -1238,7 +1238,7 @@ namespace RT64 {
+         state->updateDrawStatusAttribute(DrawAttribute::ExtendedType);
+     }
+ 
+-    void RSP::bumbleHudBegin() {
++    void RSP::bumbleHudBegin(bool active) {
+         state->rdp->checkFramebufferPair();
+         Workload &workload = state->ext.workloadQueue->workloads[
+             state->ext.workloadQueue->writeCursor];
+@@ -1257,6 +1257,8 @@ namespace RT64 {
+         if (state->checkDrawState()) {
+             state->loadDrawState();
+         }
++        // checkDrawState flushed the preceding scope above.
++        workload.extended.bumbleHudActive = active;
+         state->recordZeroGeometryExtendedGameCall();
+         extended.drawExtendedType = DrawExtendedType::None;
+         state->updateDrawStatusAttribute(DrawAttribute::ExtendedType);
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -463,5 +463,6 @@ namespace RT64 {
+         DrawCall markerCall = drawCall;
+         markerCall.callIndex = workload.gameCallCount++;
++        markerCall.extendedFlags.bumbleHud = workload.extended.bumbleHudActive;
+         markerCall.minWorldMatrix = 1;
+         markerCall.maxWorldMatrix = 0;
+         markerCall.triangleCount = 0;
+@@ -504,6 +505,7 @@ namespace RT64 {
+         // Add the draw call to the FB pair.
+         GameCall gameCall;
+         gameCall.callDesc = drawCall;
++        gameCall.callDesc.extendedFlags.bumbleHud = workload.extended.bumbleHudActive;
+         fbPair.addGameCall(gameCall);
+ 
+         // Assign the indices or increase the count of the active sprite command if it exists.
+diff --git a/src/hle/rt64_workload.h b/src/hle/rt64_workload.h
+--- a/src/hle/rt64_workload.h
++++ b/src/hle/rt64_workload.h
+@@ -253,6 +253,7 @@ namespace RT64 {
+ 
+         struct {
+             uint32_t testZIndexCount = 0;
++            bool bumbleHudActive = false;
+             float ditherNoiseStrength = 1.0f;
+             hlslpp::float2 texcoordWrapPoint = {};
+             std::vector<BumbleGrassSnapshot> bumbleGrassSnapshots;
+diff --git a/src/hle/rt64_workload.cpp b/src/hle/rt64_workload.cpp
+--- a/src/hle/rt64_workload.cpp
++++ b/src/hle/rt64_workload.cpp
+@@ -32,6 +32,7 @@ namespace RT64 {
+         viOriginalRate = 0;
+         workloadId = 0;
+         extended.testZIndexCount = 0;
++        extended.bumbleHudActive = false;
+         extended.ditherNoiseStrength = 1.0f;
+         extended.bumbleGrassSnapshots.clear();
+         extended.bumbleSkySnapshots.clear();
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -455,9 +455,7 @@ namespace RT64 {
+         const interop::OtherMode &otherMode = call.callDesc.otherMode;
+         const uint32_t cycleType = otherMode.cycleType();
+         const bool perspectiveTriangles =
+-            projection.type == Projection::Type::Perspective &&
+-            call.callDesc.extendedType == DrawExtendedType::None &&
+-            call.callDesc.triangleCount > 0;
++            bumbleWorldPerspectiveGeometry(projection, call);
+         const bool opaqueBlendState =
+             cycleType != G_CYC_COPY &&
+             cycleType != G_CYC_FILL &&
+@@ -481,6 +479,4 @@ namespace RT64 {
+-        return projection.type == Projection::Type::Perspective &&
+-            call.callDesc.extendedType == DrawExtendedType::None &&
+-            call.callDesc.triangleCount > 0u &&
++        return bumbleWorldPerspectiveGeometry(projection, call) &&
+             cycleType != G_CYC_COPY && cycleType != G_CYC_FILL &&
+             otherMode.zMode() != ZMODE_XLU &&
+             otherMode.zMode() != ZMODE_DEC &&
+@@ -5949,9 +5945,7 @@ namespace RT64 {
+                 const bool opaqueDepthState =
+                     lightingOtherMode.zCmp() && lightingOtherMode.zUpd();
+                 const bool modernLightingEligible =
+-                    perspectiveTriangles &&
+-                    opaqueBlendState &&
+-                    opaqueDepthState;
++                    bumbleModernLightingEligible(proj, call);
+                 if (pendingSkyValid && pr == skyMarkerProjectionIndex) {
+                     if (modernLightingEligible) {
+                         skyOpaqueWorldSeen = true;
+diff --git a/src/render/rt64_bumble_shadow_geometry.h b/src/render/rt64_bumble_shadow_geometry.h
+--- a/src/render/rt64_bumble_shadow_geometry.h
++++ b/src/render/rt64_bumble_shadow_geometry.h
+@@ -6,6 +6,14 @@
+ #include <cstring>
+ 
+ namespace RT64 {
++    inline bool bumbleWorldPerspectiveGeometry(const Projection &projection,
++        const GameCall &call) {
++        return projection.type == Projection::Type::Perspective &&
++            !call.callDesc.extendedFlags.bumbleHud &&
++            call.callDesc.extendedType == DrawExtendedType::None &&
++            call.callDesc.triangleCount > 0;
++    }
++
+     inline bool bumbleShadowTransformChanged(const interop::float4x4 &previous,
+         const interop::float4x4 &current) {
+         return std::memcmp(&previous, &current, sizeof(current)) != 0;

@@ -1,0 +1,661 @@
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 9f8950c..71ed802 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -510,6 +510,7 @@ namespace RT64 {
+     constexpr uint32_t BumbleShaderLightingEligible = 1u << 15u;
+     constexpr uint32_t BumbleShaderAuthoredNormal = 1u << 16u;
+     constexpr uint32_t BumbleShaderReflectionPass = 1u << 17u;
++    constexpr uint32_t BumbleShaderShorelineOverlay = 1u << 18u;
+ 
+     constexpr bool bumbleWaterMaterialClass(uint32_t materialClass) {
+         return materialClass == BumbleMaterialWater ||
+@@ -666,6 +667,5 @@ namespace RT64 {
+         switch (hash) {
+         case 0x9A352851EB157BA9ull: // blue water waves
+-        case 0xCC7485594FD45B51ull: // shallow blue water
+             return BumbleMaterialWater;
+         case 0x84A4BEEECB821765ull: // toxic green water waves
+         case 0x1445CFB7CDC44CEEull: // bright green fluid waves
+@@ -918,6 +918,43 @@ namespace RT64 {
+             bumbleLegacyWaterRibbonContract(tile, call);
+     }
+ 
++    static bool bumbleShorelineDraw(const DrawData &drawData,
++                                    const Projection &projection, const GameCall &call) {
++        const auto &mode = call.callDesc.otherMode;
++        if (!bumbleShadowCasterEligible(projection, call) ||
++            !mode.zCmp() || !mode.zUpd() || mode.forceBlend() ||
++            mode.alphaCompare() != G_AC_NONE || mode.cvgXAlpha() ||
++            interop::Blender::usesAlphaBlend(mode) ||
++            mode.textLOD() == G_TL_LOD || !call.shaderDesc.flags.usesTexture0 ||
++            call.callDesc.tileCount == 0u ||
++            call.callDesc.tileIndex >= drawData.callTiles.size()) {
++            return false;
++        }
++        const auto &tile = drawData.callTiles[call.callDesc.tileIndex];
++        if (!tile.valid || tile.rawTMEM || tile.tileCopyUsed ||
++            tile.loadTile.fmt != G_IM_FMT_RGBA || tile.loadTile.siz != G_IM_SIZ_16b ||
++            tile.sampleWidth != 32u || tile.sampleHeight != 32u) {
++            return false;
++        }
++        // Reviewed RGBA16 blue/dry transitions.
++        switch (tile.tmemHashOrID) {
++        case 0x17E03D9C6EFD2D7Eull:
++        case 0x1DE7568065C5F9E0ull:
++        case 0x3E9B8D65B5E9EA49ull:
++        case 0x49BAC761ACB03656ull:
++        case 0x61744D81C7E07F55ull:
++        case 0x86A52D7276589BFCull:
++        case 0x8B4E0BEDEC81D28Eull:
++        case 0xB28691DC2723722Full:
++        case 0xB9C4955D260255F3ull:
++        case 0xE217A2D9D6799815ull:
++        case 0xCC7485594FD45B51ull: // shallow water with a small dry edge
++            return true;
++        default:
++            return false;
++        }
++    }
++
+     static uint32_t bumbleMaterialClass(
+         const DrawData &drawData,
+         const Projection &projection,
+@@ -932,6 +970,7 @@ namespace RT64 {
+             return BumbleMaterialNone;
+         }
+ 
++        const bool shoreline = bumbleShorelineDraw(drawData, projection, call);
+         uint32_t selected = BumbleMaterialNone;
+         for (uint32_t tile = 0; tile < call.callDesc.tileCount; ++tile) {
+             const uint64_t tileIndex =
+@@ -964,5 +1003,5 @@ namespace RT64 {
+             // Water is deliberately strongest because a mipmapped call can carry more than one tile.
+-            if (bumbleWaterMaterialClass(candidate)) {
++            if (bumbleWaterMaterialClass(candidate) && !shoreline) {
+                 return candidate;
+             }
+             if (candidate == BumbleMaterialLegacyWaterOverlay &&
+@@ -1678,12 +1717,19 @@ namespace RT64 {
+         return cache.emplace(&call, geometry).first->second;
+     }
+ 
++    struct BumbleWaterPlaneReceiver {
++        uint32_t projectionIndex;
++        uint32_t materialClass;
++        BumbleWaterDrawGeometry geometry;
++    };
++
+     static bool bumbleWaterReflectionPlane(
+         const DrawData &drawData,
+         const FramebufferPair &fbPair,
+         interop::float4 &reflectionPlane,
+         uint32_t &reflectionTransformsIndex,
+         std::vector<float> *planeHeights,
++        std::vector<BumbleWaterPlaneReceiver> &planeReceivers,
+         std::unordered_map<const GameCall *, uint32_t> &materialClassCache,
+         std::unordered_map<const GameCall *, BumbleWaterDrawGeometry>
+             &waterGeometryCache
+@@ -1747,6 +1793,7 @@ namespace RT64 {
+                 }
+ 
+                 found = true;
++                planeReceivers.push_back({projectionIndex, materialClass, geometry});
+                 if (planeHeights != nullptr &&
+                     std::none_of(
+                         planeHeights->begin(),
+@@ -3861,4 +3908,6 @@ namespace RT64 {
+         uint32_t waterReflectionTransformsIndex = 0u;
+         thread_local std::vector<float> waterReflectionPlaneHeights;
+         waterReflectionPlaneHeights.clear();
++        thread_local std::vector<BumbleWaterPlaneReceiver> waterPlaneReceivers;
++        waterPlaneReceivers.clear();
+         // Real-time planar reflection is part of the modern water contract.
+@@ -3876,6 +3925,7 @@ namespace RT64 {
+                 waterReflectionPlane,
+                 waterReflectionTransformsIndex,
+                 &waterReflectionPlaneHeights,
++                waterPlaneReceivers,
+                 bumbleMaterialClassCache,
+                 waterDrawGeometryCache
+             );
+@@ -4240,6 +4290,7 @@ namespace RT64 {
+         testZIndexBufferView = RenderIndexBufferView(testZIndexBuffer, uint32_t(outputBuffers.testZIndexBuffer.allocatedSize), RenderFormat::R32_UINT);
+ 
+         RasterScene rasterScene;
++        RasterScene shorelineAmbientScene;
+         struct DeferredWaterGroup {
+             float planeHeight = 0.0f;
+             RasterScene scene;
+@@ -4256,6 +4307,15 @@ namespace RT64 {
+             hlslpp::float2 screenOffset = { 0.0f, 0.0f };
+             bool boundsValid = false;
+         };
++        struct PendingShorelineReceiver {
++            uint32_t instanceIndex;
++            float planeHeight;
++            bool boundsValid;
++            hlslpp::float3 minimumWorld;
++            hlslpp::float3 maximumWorld;
++        };
++        thread_local std::vector<PendingShorelineReceiver> pendingShorelineReceivers;
++        pendingShorelineReceivers.clear();
+         thread_local std::vector<DeferredWaterGroup> deferredWaterGroups;
+         for (DeferredWaterGroup &waterGroup : deferredWaterGroups) {
+             waterGroup.active = false;
+@@ -4264,7 +4324,8 @@ namespace RT64 {
+             waterGroup.receiverBoundsFailOpen = false;
+         }
+         const auto deferredWaterPending = [&]() {
+-            return std::any_of(
++            return !pendingShorelineReceivers.empty() ||
++                !shorelineAmbientScene.instanceIndices.empty() || std::any_of(
+                 deferredWaterGroups.begin(),
+                 deferredWaterGroups.end(),
+                 [](const DeferredWaterGroup &waterGroup) {
+@@ -4272,6 +4333,82 @@ namespace RT64 {
+                 }
+             );
+         };
++        const auto enqueueWaterReceiver = [&](uint32_t instanceIndex, float waterPlaneHeight,
++            bool drawBoundsValid, const hlslpp::float3 &drawMinimumWorld,
++            const hlslpp::float3 &drawMaximumWorld, const auto &receiverTriangles) {
++            constexpr float WaterPlaneGroupTolerance = 4.25f;
++            auto waterGroup = std::find_if(
++                deferredWaterGroups.begin(),
++                deferredWaterGroups.end(),
++                [&](const DeferredWaterGroup &candidate) {
++                    return candidate.active && std::abs(
++                        candidate.planeHeight - waterPlaneHeight
++                    ) <= WaterPlaneGroupTolerance;
++                }
++            );
++            if (waterGroup == deferredWaterGroups.end()) {
++                waterGroup = std::find_if(
++                    deferredWaterGroups.begin(),
++                    deferredWaterGroups.end(),
++                    [](const DeferredWaterGroup &candidate) {
++                        return !candidate.active;
++                    }
++                );
++                if (waterGroup == deferredWaterGroups.end()) {
++                    deferredWaterGroups.emplace_back();
++                    waterGroup = std::prev(
++                        deferredWaterGroups.end()
++                    );
++                }
++                waterGroup->active = true;
++                waterGroup->planeHeight = waterPlaneHeight;
++                waterGroup->scene.instanceIndices.clear();
++                waterGroup->receiverBoundsValid = false;
++                waterGroup->receiverBoundsFailOpen = false;
++            }
++            waterGroup->scene.instanceIndices.push_back(
++                instanceIndex
++            );
++            // The reflection target is sampled only through these exact replacement-water receivers.
++            BumbleNdcBounds receiverDrawBounds{};
++            if (!drawBoundsValid ||
++                !bumbleProjectedNdcBounds(
++                    drawMinimumWorld,
++                    drawMaximumWorld,
++                    cameraViewProjection,
++                    ReflectionGuardScale *
++                        receiverTriangles.screenScale[0],
++                    ReflectionGuardScale *
++                        receiverTriangles.screenScale[1],
++                    receiverTriangles.screenOffset[0],
++                    receiverTriangles.screenOffset[1],
++                    receiverDrawBounds
++                )) {
++                waterGroup->receiverBoundsFailOpen = true;
++            }
++            else if (!waterGroup->receiverBoundsValid) {
++                waterGroup->receiverBounds = receiverDrawBounds;
++                waterGroup->receiverBoundsValid = true;
++            }
++            else {
++                waterGroup->receiverBounds.minimumX = std::min(
++                    waterGroup->receiverBounds.minimumX,
++                    receiverDrawBounds.minimumX
++                );
++                waterGroup->receiverBounds.minimumY = std::min(
++                    waterGroup->receiverBounds.minimumY,
++                    receiverDrawBounds.minimumY
++                );
++                waterGroup->receiverBounds.maximumX = std::max(
++                    waterGroup->receiverBounds.maximumX,
++                    receiverDrawBounds.maximumX
++                );
++                waterGroup->receiverBounds.maximumY = std::max(
++                    waterGroup->receiverBounds.maximumY,
++                    receiverDrawBounds.maximumY
++                );
++            }
++        };
+         thread_local std::vector<MirroredWorldDraw> mirroredWorldDraws;
+         mirroredWorldDraws.clear();
+         const bool reflectionGeometryAlreadyPrepared =
+@@ -4614,6 +4755,34 @@ namespace RT64 {
+             checkRtScene(rtScene);
+ #       endif
+             checkRasterScene(rasterScene);
++            // Pure water establishes every group and its exact cache anchor.
++            for (const auto &shore : pendingShorelineReceivers) {
++                const auto group = std::find_if(deferredWaterGroups.begin(), deferredWaterGroups.end(),
++                    [&](const DeferredWaterGroup &candidate) {
++                        return candidate.active && std::abs(candidate.planeHeight - shore.planeHeight) <= 4.25f;
++                    });
++                auto &shoreTriangles = instanceDrawCallVector[shore.instanceIndex].triangles;
++                if (group != deferredWaterGroups.end()) {
++                    const float establishedPlane = group->planeHeight;
++                    shoreTriangles.bumbleWaterPlaneHeight = establishedPlane;
++                    enqueueWaterReceiver(shore.instanceIndex, establishedPlane, shore.boundsValid,
++                        shore.minimumWorld, shore.maximumWorld, shoreTriangles);
++                }
++                else {
++                    // The adjacent receiver did not survive the final draw selection.
++                    shoreTriangles.shaderDesc.bumbleShaderVariant &=
++                        ~(BumbleFeatureWaterSceneReflection | BumbleFeatureWaterReflectionDebug);
++                    shoreTriangles.bumbleWaterPlaneHeight = 0.0f;
++                    shorelineAmbientScene.instanceIndices.push_back(shore.instanceIndex);
++                }
++            }
++            pendingShorelineReceivers.clear();
++            if (std::none_of(deferredWaterGroups.begin(), deferredWaterGroups.end(),
++                    [](const DeferredWaterGroup &group) { return group.active; })) {
++                // Ambient-only shore shading did not prepare any mirrored geometry.
++                checkRasterScene(shorelineAmbientScene);
++                return;
++            }
+ 
+             constexpr float WaterPlaneCacheTolerance = 0.01f;
+             auto reflectionSlotForPlane = [&](float planeHeight) -> size_t {
+@@ -5153,6 +5325,7 @@ namespace RT64 {
+             framebuffer.waterReflectionGeometrySubmissionFrame =
+                 p.submissionFrame;
+             mirroredWorldDraws.clear();
++            checkRasterScene(shorelineAmbientScene);
+         };
+ 
+         bool pendingElectricValid = false;
+@@ -6530,78 +6703,8 @@ namespace RT64 {
+ #           endif
+                 {
+                     if (deferThisWaterDraw && !mainFrustumCulled) {
+-                        constexpr float WaterPlaneGroupTolerance = 4.25f;
+-                        auto waterGroup = std::find_if(
+-                            deferredWaterGroups.begin(),
+-                            deferredWaterGroups.end(),
+-                            [&](const DeferredWaterGroup &candidate) {
+-                                return candidate.active && std::abs(
+-                                    candidate.planeHeight - waterPlaneHeight
+-                                ) <= WaterPlaneGroupTolerance;
+-                            }
+-                        );
+-                        if (waterGroup == deferredWaterGroups.end()) {
+-                            waterGroup = std::find_if(
+-                                deferredWaterGroups.begin(),
+-                                deferredWaterGroups.end(),
+-                                [](const DeferredWaterGroup &candidate) {
+-                                    return !candidate.active;
+-                                }
+-                            );
+-                            if (waterGroup == deferredWaterGroups.end()) {
+-                                deferredWaterGroups.emplace_back();
+-                                waterGroup = std::prev(
+-                                    deferredWaterGroups.end()
+-                                );
+-                            }
+-                            waterGroup->active = true;
+-                            waterGroup->planeHeight = waterPlaneHeight;
+-                            waterGroup->scene.instanceIndices.clear();
+-                            waterGroup->receiverBoundsValid = false;
+-                            waterGroup->receiverBoundsFailOpen = false;
+-                        }
+-                        waterGroup->scene.instanceIndices.push_back(
+-                            instanceIndex
+-                        );
+-                        // The reflection target is sampled only through these exact replacement-water receivers.
+-                        BumbleNdcBounds receiverDrawBounds{};
+-                        if (!drawBoundsValid ||
+-                            !bumbleProjectedNdcBounds(
+-                                drawMinimumWorld,
+-                                drawMaximumWorld,
+-                                cameraViewProjection,
+-                                ReflectionGuardScale *
+-                                    triangles.screenScale[0],
+-                                ReflectionGuardScale *
+-                                    triangles.screenScale[1],
+-                                triangles.screenOffset[0],
+-                                triangles.screenOffset[1],
+-                                receiverDrawBounds
+-                            )) {
+-                            waterGroup->receiverBoundsFailOpen = true;
+-                        }
+-                        else if (!waterGroup->receiverBoundsValid) {
+-                            waterGroup->receiverBounds = receiverDrawBounds;
+-                            waterGroup->receiverBoundsValid = true;
+-                        }
+-                        else {
+-                            waterGroup->receiverBounds.minimumX = std::min(
+-                                waterGroup->receiverBounds.minimumX,
+-                                receiverDrawBounds.minimumX
+-                            );
+-                            waterGroup->receiverBounds.minimumY = std::min(
+-                                waterGroup->receiverBounds.minimumY,
+-                                receiverDrawBounds.minimumY
+-                            );
+-                            waterGroup->receiverBounds.maximumX = std::max(
+-                                waterGroup->receiverBounds.maximumX,
+-                                receiverDrawBounds.maximumX
+-                            );
+-                            waterGroup->receiverBounds.maximumY = std::max(
+-                                waterGroup->receiverBounds.maximumY,
+-                                receiverDrawBounds.maximumY
+-                            );
+-                        }
++                        enqueueWaterReceiver(instanceIndex, waterPlaneHeight, drawBoundsValid,
++                            drawMinimumWorld, drawMaximumWorld, triangles);
+                     }
+                     else if (!mainFrustumCulled) {
+                         rasterScene.instanceIndices.push_back(instanceIndex);
+@@ -6613,6 +6712,98 @@ namespace RT64 {
+                 }
+ 
+                 instanceDrawCallVector.push_back(instanceDrawCall);
++                if (materialShadersActive && !p.rtEnabled && !mainFrustumCulled &&
++                    !triangles.vertexTestZ &&
++                    instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles &&
++                    bumbleShorelineDraw(drawData, proj, call)) {
++                    // Never infer a reflector from a sloping bank's average height.
++                    bool shorePlaneFound = false;
++                    bool shorePlaneAmbiguous = false;
++                    float shorePlane = 0.0f;
++                    if (waterSceneReflectionActive && drawBoundsValid) {
++                        constexpr float ShoreAdjacencyTolerance = 4.25f;
++                        for (const auto &receiver : waterPlaneReceivers) {
++                            const auto &geometry = receiver.geometry;
++                            if (receiver.projectionIndex != pr || receiver.materialClass != BumbleMaterialWater ||
++                                geometry.planeHeight < drawMinimumWorld[1] - ShoreAdjacencyTolerance ||
++                                geometry.planeHeight > drawMaximumWorld[1] + ShoreAdjacencyTolerance ||
++                                geometry.maximumWorld[0] < drawMinimumWorld[0] - ShoreAdjacencyTolerance ||
++                                geometry.minimumWorld[0] > drawMaximumWorld[0] + ShoreAdjacencyTolerance ||
++                                geometry.maximumWorld[2] < drawMinimumWorld[2] - ShoreAdjacencyTolerance ||
++                                geometry.minimumWorld[2] > drawMaximumWorld[2] + ShoreAdjacencyTolerance) {
++                                continue;
++                            }
++                            if (shorePlaneFound && std::abs(shorePlane - geometry.planeHeight) > ShoreAdjacencyTolerance) {
++                                shorePlaneAmbiguous = true;
++                                break;
++                            }
++                            if (!shorePlaneFound) {
++                                shorePlane = geometry.planeHeight;
++                                shorePlaneFound = true;
++                            }
++                        }
++                    }
++                    shorePlaneFound &= !shorePlaneAmbiguous;
++                    uint32_t shoreFeatures = shaderFeatureFlags;
++                    if (!shorePlaneFound) {
++                        shoreFeatures &= ~(BumbleFeatureWaterSceneReflection | BumbleFeatureWaterReflectionDebug);
++                    }
++                    InstanceDrawCall shoreDraw = instanceDrawCall;
++                    auto &shoreTriangles = shoreDraw.triangles;
++                    ShaderDescription shoreDesc = bumbleRasterShaderDescription(
++                        call, shoreFeatures, BumbleMaterialWater, modernLightingEligible);
++                    shoreDesc.bumbleShaderVariant |= BumbleShaderShorelineOverlay;
++                    shoreDesc.otherMode.L &= ~Z_UPD;
++                    shoreTriangles.shaderDesc = shoreDesc;
++                    shoreTriangles.bumbleDepthReadOnly = true;
++                    shoreTriangles.bumbleWaterPlaneHeight = shorePlaneFound ? shorePlane : 0.0f;
++                    RasterShader *shoreShader = nullptr;
++                    if (!p.ubershadersOnly) {
++                        p.rasterShaderCache->submit(shoreDesc);
++                        shoreShader = p.rasterShaderCache->getGPUShader(shoreDesc);
++                    }
++                    const bool shoreCoverageAdd = shoreDesc.otherMode.cvgDst() == CVG_DST_WRAP ||
++                        shoreDesc.otherMode.cvgDst() == CVG_DST_SAVE;
++                    shoreTriangles.pipeline = shoreShader != nullptr ? shoreShader->getPipeline()
++                        : rasterShaderUber->getPipeline(2u, true, false, shoreCoverageAdd, true);
++                    shoreTriangles.bumbleUbershader = shoreShader == nullptr;
++                    if (shoreShader != nullptr) {
++                        ++performanceSpecializedPipelines;
++                        ++performanceSpecializedPipelinesByFamily[2u];
++                        if (shoreShader->usesProvisionalPipeline()) {
++                            ++performanceProvisionalPipelines;
++                            ++performanceProvisionalPipelinesByFamily[2u];
++                            shoreShader->noteProvisionalUse(std::max(1u, shoreTriangles.faceCount));
++                        }
++                    }
++                    else {
++                        ++performanceUberPipelines;
++                        ++performanceUberPipelinesByFamily[2u];
++                    }
++                    // Preserve original RDP-param identity; only the renderer slot is new.
++                    auto shoreIndices = renderIndices;
++                    shoreIndices.modernMaterialClass = BumbleMaterialWater;
++                    const uint32_t shoreIndex = static_cast<uint32_t>(instanceDrawCallVector.size());
++                    renderIndicesVector.push_back(shoreIndices);
++                    instanceDrawCallVector.push_back(shoreDraw);
++                    if (shorePlaneFound) {
++                        pendingShorelineReceivers.push_back({shoreIndex, shorePlane, drawBoundsValid,
++                            drawMinimumWorld, drawMaximumWorld});
++                    }
++                    else {
++                        shorelineAmbientScene.instanceIndices.push_back(shoreIndex);
++                    }
++                    static uint32_t shoreTraceRecords = 0u;
++                    if (bumbleMaterialTraceEnabled() && shoreTraceRecords < 96u) {
++                        std::fprintf(stderr, "BUMBLE_SHORELINE record=%u hash=0x%016" PRIX64
++                            " projection=%u faces=%u original=%u overlay=%u reflected=%u plane=%.3f"
++                            " depth=less_equal_read_only coverage=preserved sample=texel0\n",
++                            shoreTraceRecords++, drawData.callTiles[call.callDesc.tileIndex].tmemHashOrID,
++                            pr, shoreTriangles.faceCount, instanceIndex, shoreIndex,
++                            shorePlaneFound ? 1u : 0u, static_cast<double>(shorePlane));
++                        std::fflush(stderr);
++                    }
++                }
+                 globalCallIndex++;
+             }
+         }
+diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
+index 62329b2..e2b2749 100644
+--- a/src/render/rt64_raster_shader.cpp
++++ b/src/render/rt64_raster_shader.cpp
+@@ -475,6 +475,9 @@ namespace RT64 {
+         creation.culling = !copyMode && desc.flags.culling;
+         creation.zCmp = !copyMode && desc.otherMode.zCmp() && (desc.otherMode.zMode() != ZMODE_DEC);
+         creation.zUpd = !copyMode && desc.otherMode.zUpd();
++        creation.depthLessEqual = (desc.bumbleShaderVariant & (1u << 18u)) != 0u &&
++            desc.bumbleShaderFamily() == 2u && creation.zCmp && !creation.zUpd;
++        creation.alphaBlend |= creation.depthLessEqual;
+         creation.cvgAdd = (desc.otherMode.cvgDst() == CVG_DST_WRAP) || (desc.otherMode.cvgDst() == CVG_DST_SAVE);
+         creation.NoN = desc.flags.NoN;
+         creation.usesHDR = desc.flags.usesHDR;
+@@ -620,7 +623,9 @@ namespace RT64 {
+         pipelineDesc.cullMode = c.culling ? RenderCullMode::FRONT : RenderCullMode::NONE;
+         pipelineDesc.depthClipEnabled = !c.NoN;
+         pipelineDesc.depthEnabled = c.zCmp || c.zUpd;
+-        pipelineDesc.depthFunction = c.zCmp ? RenderComparisonFunction::LESS : RenderComparisonFunction::ALWAYS;
++        pipelineDesc.depthFunction = c.zCmp
++            ? (c.depthLessEqual ? RenderComparisonFunction::LESS_EQUAL : RenderComparisonFunction::LESS)
++            : RenderComparisonFunction::ALWAYS;
+         pipelineDesc.depthWriteEnabled = c.zUpd;
+         pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
+         pipelineDesc.multisampling = c.multisampling;
+@@ -644,6 +649,11 @@ namespace RT64 {
+ 
+         // Alpha blending is performed by using dual source blending. The blending factor will be in the secondary output.
+         RenderBlendDesc &targetBlend = pipelineDesc.renderTargetBlend[0];
++        if (c.depthLessEqual) {
++            // Alpha stores N64 coverage, already written by the bank owner.
++            targetBlend.renderTargetWriteMask = uint8_t(RenderColorWriteEnable::RED) |
++                uint8_t(RenderColorWriteEnable::GREEN) | uint8_t(RenderColorWriteEnable::BLUE);
++        }
+         if (c.alphaBlend) {
+             targetBlend.blendEnabled = true;
+             targetBlend.srcBlend = RenderBlend::SRC1_ALPHA;
+@@ -814,8 +824,10 @@ namespace RT64 {
+ 
+         uint32_t threadIndex = 0;
+         for (uint32_t i = 0; i < pipelineCount; i++) {
+-            creation.shaderFamily = i / PipelineStatesPerFamily;
+-            const uint32_t stateIndex = i % PipelineStatesPerFamily;
++            creation.depthLessEqual = i >= NormalPipelineCount;
++            creation.shaderFamily = creation.depthLessEqual ? 2u : i / PipelineStatesPerFamily;
++            const uint32_t stateIndex = creation.depthLessEqual
++                ? 1u | ((i - NormalPipelineCount) << 2u) : i % PipelineStatesPerFamily;
+             creation.pixelShader = pixelShaders[creation.shaderFamily].get();
+             creation.zCmp = stateIndex & (1 << 0);
+             creation.zUpd = stateIndex & (1 << 1);
+@@ -912,7 +924,7 @@ namespace RT64 {
+         }
+ 
+         for (const PipelineCreation &creation : pipelineThreadCreations[threadIndex]) {
+-            uint32_t pipelineIndex = pipelineStateIndex(creation.shaderFamily, creation.zCmp, creation.zUpd, creation.cvgAdd);
++            uint32_t pipelineIndex = pipelineStateIndex(creation.shaderFamily, creation.zCmp, creation.zUpd, creation.cvgAdd, creation.depthLessEqual);
+ 
+             if (pipelineIndex == 0) {
+                 firstPipelineMutex.lock();
+@@ -942,7 +954,11 @@ namespace RT64 {
+         }
+     }
+ 
+-    uint32_t RasterShaderUber::pipelineStateIndex(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd) const {
++    uint32_t RasterShaderUber::pipelineStateIndex(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd, bool depthLessEqual) const {
++        if (depthLessEqual) {
++            assert(shaderFamily == 2u && zCmp && !zUpd);
++            return NormalPipelineCount + uint32_t(cvgAdd);
++        }
+         assert(shaderFamily < ShaderFamilyCount);
+         return shaderFamily * PipelineStatesPerFamily +
+             (uint32_t(zCmp)         << 0) |
+@@ -950,8 +966,8 @@ namespace RT64 {
+             (uint32_t(cvgAdd)       << 2);
+     }
+ 
+-    const RenderPipeline *RasterShaderUber::getPipeline(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd) const {
+-        return pipelines[pipelineStateIndex(shaderFamily, zCmp, zUpd, cvgAdd)].get();
++    const RenderPipeline *RasterShaderUber::getPipeline(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd, bool depthLessEqual) const {
++        return pipelines[pipelineStateIndex(shaderFamily, zCmp, zUpd, cvgAdd, depthLessEqual)].get();
+     }
+ 
+ };
+diff --git a/src/render/rt64_raster_shader.h b/src/render/rt64_raster_shader.h
+index c5c944d..2c9a436 100644
+--- a/src/render/rt64_raster_shader.h
++++ b/src/render/rt64_raster_shader.h
+@@ -57,6 +57,7 @@ namespace RT64 {
+         bool zUpd;
+         bool cvgAdd;
+         bool usesHDR;
++        bool depthLessEqual = false;
+         bool isolatedPipelineCache = false;
+         uint32_t shaderFamily = 0;
+         std::vector<RenderSpecConstant> specConstants;
+@@ -96,11 +97,12 @@ namespace RT64 {
+     struct RasterShaderUber {
+         static constexpr uint32_t ShaderFamilyCount = 4;
+         static constexpr uint32_t PipelineStatesPerFamily = 8;
++        static constexpr uint32_t NormalPipelineCount = ShaderFamilyCount * PipelineStatesPerFamily;
+         static const uint64_t RasterVSLibraryHash;
+         static const uint64_t RasterPSLibraryHash;
+ 
+         std::unique_ptr<RenderPipeline> pipelines[
+-            ShaderFamilyCount * PipelineStatesPerFamily
++            NormalPipelineCount + 2
+         ];
+         std::unique_ptr<RenderPipeline> postBlendDitherNoiseAddPipeline;
+         std::unique_ptr<RenderPipeline> postBlendDitherNoiseSubPipeline;
+@@ -118,7 +120,7 @@ namespace RT64 {
+         ~RasterShaderUber();
+         void threadCreatePipelines(uint32_t threadIndex);
+         void waitForPipelineCreation();
+-        uint32_t pipelineStateIndex(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd) const;
+-        const RenderPipeline *getPipeline(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd) const;
++        uint32_t pipelineStateIndex(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd, bool depthLessEqual = false) const;
++        const RenderPipeline *getPipeline(uint32_t shaderFamily, bool zCmp, bool zUpd, bool cvgAdd, bool depthLessEqual = false) const;
+     };
+ };
+diff --git a/src/render/rt64_shader_common.cpp b/src/render/rt64_shader_common.cpp
+index 6c49cad..81e7bb9 100644
+--- a/src/render/rt64_shader_common.cpp
++++ b/src/render/rt64_shader_common.cpp
+@@ -81,5 +81,11 @@ namespace RT64 {
++        // Shoreline blending reads equal depth over the original bank draw.
++        const uint32_t shorelinePipeline =
++            pipelineDescription.bumbleShaderFamily() == 2u &&
++            pipelineDescription.otherMode.zCmp() && !pipelineDescription.otherMode.zUpd() &&
++            pipelineDescription.otherMode.zMode() != ZMODE_DEC
++                ? pipelineDescription.bumbleShaderVariant & (1u << 18u) : 0u;
+         pipelineDescription.bumbleShaderVariant =
+-            pipelineDescription.bumbleShaderFamily();
++            pipelineDescription.bumbleShaderFamily() | shorelinePipeline;
+         return XXH3_64bits(
+             &pipelineDescription,
+             sizeof(pipelineDescription)
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index e4527dd..5c8d058 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -408,6 +408,9 @@ LIBRARY_EXPORT bool RasterPS(
+         (bumbleMaterialClass == 2u || bumbleMaterialClass >= 4u) &&
+         !renderFlagRect(rp.flags) &&
+         (otherMode.cycleType() != G_CYC_COPY);
++    // Keep derivatives outside the per-pixel shoreline rejection below.
++    const float3 waterDdx = ddx(vertexWorldPosition);
++    const float3 waterDdy = ddy(vertexWorldPosition);
+     int2 pixelPosSeed = floor(vertexPosition.xy);
+     uint randomSeed = initRand(FrParams.frameCount, instanceIndex * pixelPosSeed.y * pixelPosSeed.x, 16); // TODO: Review seed.
+ 
+@@ -511,5 +514,17 @@ LIBRARY_EXPORT bool RasterPS(
+         texVal1 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, oneCycleHardwareBug);
+     }
+     
++    // The original opaque shore remains the depth/shadow/bank owner.
++    const bool shorelineOverlay = modernWaterSurface &&
++        (activeBumbleShaderVariant & (1u << 18u)) != 0u;
++    float shorelineWeight = 1.0f;
++    if (shorelineOverlay) {
++        const float blueChroma = texVal0.b - max(texVal0.r, texVal0.g);
++        shorelineWeight = smoothstep(1.0f / 31.0f, 11.0f / 31.0f, blueChroma);
++        if (shorelineWeight <= 0.0f) {
++            return false;
++        }
++    }
++
+     // Only the reviewed fluid/fluid transition tiles use their existing sample to select a palette.
+     const bool modernToxicWaterSurface = modernWaterSurface &&
+@@ -631,8 +648,8 @@ LIBRARY_EXPORT bool RasterPS(
+         [branch]
+         if (!vertexLightingValid) {
+             const float3 geometricNormal = cross(
+-                ddx(vertexWorldPosition),
+-                ddy(vertexWorldPosition)
++                waterDdx,
++                waterDdy
+             );
+             const float geometricLengthSq = dot(
+                 geometricNormal,
+@@ -671,8 +688,8 @@ LIBRARY_EXPORT bool RasterPS(
+             lightingIndices.modernLightDirectionKey.xyz;
+         if (modernWaterSurface) {
+             const float waterWorldFootprint = max(
+-                length(ddx(vertexWorldPosition)),
+-                length(ddy(vertexWorldPosition))
++                length(waterDdx),
++                length(waterDdy)
+             );
+             const BumbleWaterDetail waterDetail = bumbleWaterDetail(
+                 vertexWorldPosition,
+@@ -1294,6 +1311,9 @@ LIBRARY_EXPORT bool RasterPS(
+     if (alphaBlend) {
+         resultAlpha.a = resultColor.a;
+     }
++    if (shorelineOverlay) {
++        resultAlpha.a = shorelineWeight;
++    }
+     
+     // Preserve the value in the destination.
+     if (otherMode.cvgDst() == CVG_DST_SAVE) {

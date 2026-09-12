@@ -1,0 +1,213 @@
+diff --git a/src/render/rt64_shader_compiler.cpp b/src/render/rt64_shader_compiler.cpp
+index 82984ed..24111f8 100644
+--- a/src/render/rt64_shader_compiler.cpp
++++ b/src/render/rt64_shader_compiler.cpp
+@@ -6,23 +6,31 @@
+ #if defined(_WIN32)
+ 
+ #include "rt64_shader_compiler.h"
++#include <wrl/client.h>
+ 
+ #include "common/rt64_common.h"
+ 
+ namespace RT64 {
++    using Microsoft::WRL::ComPtr;
++
++    static void checkHRESULT(HRESULT hr, const char *operation) {
++        if (FAILED(hr)) {
++            throw std::runtime_error(std::string(operation) + " failed (HRESULT " + std::to_string(hr) + ")");
++        }
++    }
+     // ShaderCompiler
+ 
+     ShaderCompiler::ShaderCompiler() {
+         HRESULT res = DxcCreateInstance(CLSID_DxcCompiler, __uuidof(IDxcCompiler), (void **)(&dxcCompiler));
+         if (FAILED(res)) {
+-            fprintf(stderr, "DxcCreateInstance(DxcCompiler) failed with error code 0x%lX.\n", res);
+-            return;
++            checkHRESULT(res, "DxcCreateInstance(DxcCompiler)");
+         }
+ 
+         res = DxcCreateInstance(CLSID_DxcUtils, __uuidof(IDxcUtils), (void **)(&dxcUtils));
+         if (FAILED(res)) {
+-            fprintf(stderr, "DxcCreateInstance(DxcUtils) failed with error code 0x%lX.\n", res);
+-            return;
++            dxcCompiler->Release();
++            dxcCompiler = nullptr;
++            checkHRESULT(res, "DxcCreateInstance(DxcUtils)");
+         }
+     }
+ 
+@@ -37,12 +45,15 @@ namespace RT64 {
+     }
+ 
+     static void checkResultForError(IDxcOperationResult *result) {
+-        HRESULT resultCode;
+-        result->GetStatus(&resultCode);
++        if (result == nullptr) {
++            throw std::runtime_error("DXC returned no operation result");
++        }
++        HRESULT resultCode = E_FAIL;
++        checkHRESULT(result->GetStatus(&resultCode), "DXC GetStatus");
+         if (FAILED(resultCode)) {
+-            IDxcBlobEncoding *error;
++            ComPtr<IDxcBlobEncoding> error;
+             HRESULT hr = result->GetErrorBuffer(&error);
+-            if (FAILED(hr)) {
++            if (FAILED(hr) || !error) {
+                 throw std::runtime_error("Failed to get shader compiler error");
+             }
+ 
+@@ -59,12 +70,10 @@ namespace RT64 {
+     void ShaderCompiler::compile(const std::string &shaderCode, const std::wstring &entryName, const std::wstring &profile,
+         RenderShaderFormat shaderFormat, IDxcBlob **shaderBlob) const
+     {
+-        IDxcBlobEncoding *textBlob = nullptr;
++        *shaderBlob = nullptr;
++        ComPtr<IDxcBlobEncoding> textBlob;
+         HRESULT res = dxcUtils->CreateBlobFromPinned((LPBYTE)shaderCode.c_str(), (uint32_t)shaderCode.size(), DXC_CP_ACP, &textBlob);
+-        if (FAILED(res)) {
+-            fprintf(stderr, "CreateBlobFromPinned failed with error code 0x%lX.\n", res);
+-            return;
+-        }
++        checkHRESULT(res, "CreateBlobFromPinned");
+ 
+         std::vector<LPCWSTR> arguments;
+         arguments.push_back(L"-Qstrip_debug");
+@@ -87,41 +96,39 @@ namespace RT64 {
+ 
+             break;
+         default:
+-            assert(false && "Unknown shader format.");
+-            return;
++            throw std::runtime_error("Unknown shader format");
+         }
+ 
+-        IDxcOperationResult *result = nullptr;
+-        dxcCompiler->Compile(textBlob, L"", entryName.c_str(), profile.c_str(), arguments.data(), (UINT32)(arguments.size()), nullptr, 0, nullptr, &result);
+-        checkResultForError(result);
+-        result->GetResult(shaderBlob);
+-        textBlob->Release();
++        ComPtr<IDxcOperationResult> result;
++        checkHRESULT(dxcCompiler->Compile(textBlob.Get(), L"", entryName.c_str(), profile.c_str(), arguments.data(), (UINT32)(arguments.size()), nullptr, 0, nullptr, &result), "DXC Compile");
++        checkResultForError(result.Get());
++        checkHRESULT(result->GetResult(shaderBlob), "DXC GetResult");
++        if (*shaderBlob == nullptr) {
++            throw std::runtime_error("DXC returned no compiled shader");
++        }
+     }
+ 
+     void ShaderCompiler::link(const std::wstring &entryName, const std::wstring &profile, IDxcBlob **libraryBlobs,
+         const wchar_t **libraryBlobNames, uint32_t libraryBlobCount, IDxcBlob **shaderBlob) const 
+     {
+-        IDxcLinker *dxcLinker = nullptr;
+-        HRESULT res = DxcCreateInstance(CLSID_DxcLinker, __uuidof(IDxcLinker), (void **)(&dxcLinker));
+-        if (FAILED(res)) {
+-            fprintf(stderr, "DxcCreateInstance(DxcLinker) failed with error code 0x%lX.\n", res);
+-            return;
+-        }
++        *shaderBlob = nullptr;
++        ComPtr<IDxcLinker> dxcLinker;
++        HRESULT res = DxcCreateInstance(CLSID_DxcLinker, IID_PPV_ARGS(&dxcLinker));
++        checkHRESULT(res, "DxcCreateInstance(DxcLinker)");
+ 
+         for (uint32_t i = 0; i < libraryBlobCount; i++) {
+             res = dxcLinker->RegisterLibrary(libraryBlobNames[i], libraryBlobs[i]);
+-            if (FAILED(res)) {
+-                fprintf(stderr, "RegisterLibrary failed with error code 0x%lX.\n", res);
+-                return;
+-            }
++            checkHRESULT(res, "DXC RegisterLibrary");
+         }
+ 
+-        IDxcOperationResult *result = nullptr;
+-        dxcLinker->Link(entryName.c_str(), profile.c_str(), libraryBlobNames, libraryBlobCount, nullptr, 0, &result);
+-        checkResultForError(result);
+-        result->GetResult(shaderBlob);
+-        dxcLinker->Release();
++        ComPtr<IDxcOperationResult> result;
++        checkHRESULT(dxcLinker->Link(entryName.c_str(), profile.c_str(), libraryBlobNames, libraryBlobCount, nullptr, 0, &result), "DXC Link");
++        checkResultForError(result.Get());
++        checkHRESULT(result->GetResult(shaderBlob), "DXC GetResult");
++        if (*shaderBlob == nullptr) {
++            throw std::runtime_error("DXC returned no linked shader");
++        }
+     }
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
+--- a/src/render/rt64_raster_shader.cpp
++++ b/src/render/rt64_raster_shader.cpp
+@@ -431,34 +431,41 @@
+             static const wchar_t *blobPSLibraryNames[] = { L"RasterPSEntry", L"RasterPSLibrary" };
+             IDxcBlob *blobVSLibraries[] = { nullptr, nullptr };
+             IDxcBlob *blobPSLibraries[] = { nullptr, nullptr };
+-            shaderCompiler->dxcUtils->CreateBlobFromPinned(RasterVSLibraryBlobDXIL, sizeof(RasterVSLibraryBlobDXIL), DXC_CP_ACP, (IDxcBlobEncoding **)(&blobVSLibraries[1]));
+-
+-            const void *PSLibraryBlob = useMSAA ? RasterPSLibraryMSBlobDXIL : RasterPSLibraryBlobDXIL;
+-            uint32_t PSLibraryBlobSize = useMSAA ? sizeof(RasterPSLibraryMSBlobDXIL) : sizeof(RasterPSLibraryBlobDXIL);
+-            shaderCompiler->dxcUtils->CreateBlobFromPinned(PSLibraryBlob, PSLibraryBlobSize, DXC_CP_ACP, (IDxcBlobEncoding **)(&blobPSLibraries[1]));
+-                
+-            // Compile both the vertex and pixel shader functions as libraries.
+-            const std::wstring VertexShaderName = L"VSMain";
+-            const std::wstring PixelShaderName = L"PSMain";
+-            shaderCompiler->compile(shaderText.vertexShader, VertexShaderName, L"lib_6_3", shaderFormat, &blobVSLibraries[0]);
+-            shaderCompiler->compile(shaderText.pixelShader, PixelShaderName, L"lib_6_3", shaderFormat, &blobPSLibraries[0]);
+-
+-            // Link the vertex and pixel shaders with the libraries that define their main functions.
+-            IDxcBlob *blobVS = nullptr;
+-            IDxcBlob *blobPS = nullptr;
+-            shaderCompiler->link(VertexShaderName, L"vs_6_3", blobVSLibraries, blobVSLibraryNames, std::size(blobVSLibraries), &blobVS);
+-            shaderCompiler->link(PixelShaderName, L"ps_6_3", blobPSLibraries, blobPSLibraryNames, std::size(blobPSLibraries), &blobPS);
+-
+-            vertexShader = device->createShader(blobVS->GetBufferPointer(), blobVS->GetBufferSize(), "VSMain", shaderFormat);
+-            pixelShader = device->createShader(blobPS->GetBufferPointer(), blobPS->GetBufferSize(), "PSMain", shaderFormat);
+-
+-            // Blobs can be discarded once the shaders are created.
+-            blobVSLibraries[0]->Release();
+-            blobVSLibraries[1]->Release();
+-            blobPSLibraries[0]->Release();
+-            blobPSLibraries[1]->Release();
+-            blobPS->Release();
+-            blobVS->Release();
++            IDxcBlob *blobVS = nullptr;
++            IDxcBlob *blobPS = nullptr;
++            // Every blob belongs to this compilation, including on failure.
++            struct BlobOwner {
++                IDxcBlob **blobs[6];
++                ~BlobOwner() {
++                    for (IDxcBlob **blob : blobs) {
++                        if (*blob != nullptr) (*blob)->Release();
++                    }
++                }
++            } blobOwner{ { &blobVSLibraries[0], &blobVSLibraries[1],
++                &blobPSLibraries[0], &blobPSLibraries[1], &blobVS, &blobPS } };
++            if (FAILED(shaderCompiler->dxcUtils->CreateBlobFromPinned(RasterVSLibraryBlobDXIL, sizeof(RasterVSLibraryBlobDXIL), DXC_CP_ACP, (IDxcBlobEncoding **)(&blobVSLibraries[1]))) || blobVSLibraries[1] == nullptr) {
++                throw std::runtime_error("Unable to load raster vertex shader library");
++            }
++
++            const void *PSLibraryBlob = useMSAA ? RasterPSLibraryMSBlobDXIL : RasterPSLibraryBlobDXIL;
++            uint32_t PSLibraryBlobSize = useMSAA ? sizeof(RasterPSLibraryMSBlobDXIL) : sizeof(RasterPSLibraryBlobDXIL);
++            if (FAILED(shaderCompiler->dxcUtils->CreateBlobFromPinned(PSLibraryBlob, PSLibraryBlobSize, DXC_CP_ACP, (IDxcBlobEncoding **)(&blobPSLibraries[1]))) || blobPSLibraries[1] == nullptr) {
++                throw std::runtime_error("Unable to load raster pixel shader library");
++            }
++                
++            // Compile both the vertex and pixel shader functions as libraries.
++            const std::wstring VertexShaderName = L"VSMain";
++            const std::wstring PixelShaderName = L"PSMain";
++            shaderCompiler->compile(shaderText.vertexShader, VertexShaderName, L"lib_6_3", shaderFormat, &blobVSLibraries[0]);
++            shaderCompiler->compile(shaderText.pixelShader, PixelShaderName, L"lib_6_3", shaderFormat, &blobPSLibraries[0]);
++
++            // Link the vertex and pixel shaders with the libraries that define their main functions.
++            shaderCompiler->link(VertexShaderName, L"vs_6_3", blobVSLibraries, blobVSLibraryNames, std::size(blobVSLibraries), &blobVS);
++            shaderCompiler->link(PixelShaderName, L"ps_6_3", blobPSLibraries, blobPSLibraryNames, std::size(blobPSLibraries), &blobPS);
++
++            vertexShader = device->createShader(blobVS->GetBufferPointer(), blobVS->GetBufferSize(), "VSMain", shaderFormat);
++            pixelShader = device->createShader(blobPS->GetBufferPointer(), blobPS->GetBufferSize(), "PSMain", shaderFormat);
++
+ #       else
+             assert(false && "This platform does not support runtime shader compilation.");
+ #       endif

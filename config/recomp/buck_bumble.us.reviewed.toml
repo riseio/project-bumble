@@ -1,0 +1,1700 @@
+
+[input]
+entrypoint = 0x80010400
+output_func_path = "../../generated/recompiled_reviewed"
+rom_file_path = "../../OriginalGame/Buck Bumble (USA).z64"
+symbols_file_path = "buck_bumble.us.syms.toml"
+bss_section_suffix = "_bss"
+recomp_include = "#include \"reviewed_runtime_exports.h\""
+
+[patches]
+ignored = [
+    "func_80018FB0",
+    "func_80018FC0",
+    "D_80018FE0",
+    "func_80019964",
+]
+
+stubs = [
+    "func_8001AA00",
+]
+
+[[patches.hook]]
+func = "func_800ABD78"
+before_vram = 0x800ABD78
+text = "bumble_begin_native_high_scores(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800ABD78"
+before_vram = 0x800AC1FC
+text = "bumble_end_native_high_scores(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8008810C"
+before_vram = 0x8008810C
+text = "bumble_record_modern_particle_spawn(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80088454"
+before_vram = 0x80088454
+text = "if (bumble_replace_modern_particle_render(rdram, ctx)) { return; }"
+
+[[patches.hook]]
+func = "func_8008C480"
+before_vram = 0x8008C480
+text = "bumble_record_debris_modern_explosion(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80089CE0"
+before_vram = 0x80089CE0
+text = "bumble_record_modern_legacy_effect_spawn(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80089F04"
+before_vram = 0x80089F04
+text = "if (bumble_replace_modern_legacy_effect_render(rdram, ctx)) { return; }"
+
+
+[[patches.hook]]
+func = "func_80065E2C"
+before_vram = 0x80065E60
+text = "bumble_record_laser_impact(rdram, (uint32_t)ctx->r6);"
+
+[[patches.hook]]
+func = "func_8005DE48"
+before_vram = 0x8005DFE0
+text = "bumble_mark_next_modern_legacy_effect(2u);"
+
+[[patches.hook]]
+func = "func_8005DE48"
+before_vram = 0x8005E004
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_8005E848"
+before_vram = 0x8005E9A4
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_8005ECA8"
+before_vram = 0x8005ED90
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80060470"
+before_vram = 0x80060558
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80060780"
+before_vram = 0x80060840
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80061738"
+before_vram = 0x80061950
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80061DB0"
+before_vram = 0x80061E8C
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800659B4"
+before_vram = 0x80065A5C
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80065B18"
+before_vram = 0x80065BC0
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80065D20"
+before_vram = 0x80065D80
+text = "bumble_mark_next_modern_particle(1u);"
+
+
+[[patches.hook]]
+func = "func_80055FC8"
+before_vram = 0x80056A1C
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_8007B2BC"
+before_vram = 0x8007B540
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80080160"
+before_vram = 0x80080574
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80080160"
+before_vram = 0x80080598
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_80080B50"
+before_vram = 0x80080BE0
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80080B50"
+before_vram = 0x80080C04
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_80096EF0"
+before_vram = 0x80097530
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800BC70C"
+before_vram = 0x800BD408
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800BC70C"
+before_vram = 0x800BD430
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_80078A54"
+before_vram = 0x80078EF0
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80078A54"
+before_vram = 0x80078F18
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_80078A54"
+before_vram = 0x80079074
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80078A54"
+before_vram = 0x8007909C
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_80079C5C"
+before_vram = 0x8007A6C4
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_80079C5C"
+before_vram = 0x8007A6EC
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_800C673C"
+before_vram = 0x800C7474
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800C673C"
+before_vram = 0x800C749C
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_800BE04C"
+before_vram = 0x800BED54
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800BE04C"
+before_vram = 0x800BED7C
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_80082188"
+before_vram = 0x80082988
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_8009B820"
+before_vram = 0x8009B980
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800C7A50"
+before_vram = 0x800C7D64
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800C7A50"
+before_vram = 0x800C7DA4
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800C47F0"
+before_vram = 0x800C4894
+text = "bumble_mark_next_modern_particle(1u);"
+
+[[patches.hook]]
+func = "func_800C47F0"
+before_vram = 0x800C4920
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.hook]]
+func = "func_800C47F0"
+before_vram = 0x800C499C
+text = "bumble_mark_next_modern_particle(2u);"
+
+[[patches.instruction]]
+func = "func_80025400"
+vram = 0x80025520
+value = 0x00000000 # lw $zero, -0x21F0($at)
+
+[[patches.instruction]]
+func = "func_80025400"
+vram = 0x8002554C
+value = 0x00000000 # lw $zero, -0x21F0($at)
+
+[[patches.instruction]]
+func = "func_80052558"
+vram = 0x8005255C
+value = 0x00000000 # slti $zero, $t0, 0
+
+[[patches.instruction]]
+func = "func_80051DB0"
+vram = 0x80051DE4
+value = 0x00000000 # jal osContReset -> bounded direct-call override
+
+[[patches.hook]]
+func = "func_80051DB0"
+before_vram = 0x80051DEC
+text = "osContReset_recomp(rdram, ctx);"
+
+[[patches.instruction]]
+func = "func_800BB7E8"
+vram = 0x800BB96C
+value = 0x00000000 # jal osPfsNumFiles -> bounded project-native override
+
+[[patches.hook]]
+func = "func_800BB7E8"
+before_vram = 0x800BB974
+text = "buck_osPfsNumFiles_recomp(rdram, ctx);"
+
+[[patches.instruction]]
+func = "func_800BA224"
+vram = 0x800BA280
+value = 0x00000000 # jal __osGetId -> bounded project-native identity override
+
+[[patches.hook]]
+func = "func_800BA224"
+before_vram = 0x800BA288
+text = "buck_controller_pak_validate_recomp(rdram, ctx);"
+
+[[patches.instruction]]
+func = "audio_build_and_submit_task"
+vram = 0x800518D8
+value = 0x00000000 # lw v0, 0(v0) at AI_LEN_REG
+
+[[patches.hook]]
+func = "audio_build_and_submit_task"
+before_vram = 0x800518DC
+text = "osAiGetLength_recomp(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800284C0"
+before_vram = 0x80028514
+text = "buck_osSetEventMesg_bridge(rdram, (uint32_t)MEM_W(0X28, ctx->r29), (int32_t)MEM_W(0X2C, ctx->r29), (int32_t)MEM_W(0X30, ctx->r29));"
+
+[[patches.instruction]]
+func = "buck_si_device_busy"
+vram = 0x80028B34
+value = 0x00000000 # lw a0, 0x18(t6) at SI_STATUS_REG
+
+[[patches.hook]]
+func = "buck_si_device_busy"
+before_vram = 0x80028B38
+text = "buck_si_device_busy_clear(rdram, ctx);"
+
+[[patches.instruction]]
+func = "func_8004D1E8"
+vram = 0x8004D238
+value = 0x00000000 # jalr v0 -> bounded 45-entry sound-command dispatcher
+
+[[patches.hook]]
+func = "func_8004D1E8"
+before_vram = 0x8004D240
+text = "buck_sound_command_dispatch_recomp(rdram, ctx);"
+
+[[patches.instruction]]
+func = "func_80090E64"
+vram = 0x80090FD8
+value = 0x00000000 # jalr a0 -> bounded deferred resource-command dispatcher
+
+[[patches.hook]]
+func = "func_80090E64"
+before_vram = 0x80090FE0
+text = "buck_resource_command_dispatch_recomp(rdram, ctx);"
+
+[[patches.instruction]]
+func = "func_800969C4"
+vram = 0x80096A64
+value = 0x00000000 # jalr a0 -> bounded immediate resource-command dispatcher
+
+[[patches.hook]]
+func = "func_800969C4"
+before_vram = 0x80096A6C
+text = "buck_resource_command_dispatch_recomp(rdram, ctx);"
+
+[[patches.hook]]
+func = "pi_dma_read_blocking"
+before_vram = 0x80011588
+text = "buck_native_pi_dma_post_probe(rdram, ctx, 0x80011580u);"
+
+[[patches.hook]]
+func = "pi_dma_read_blocking"
+before_vram = 0x80011598
+text = "buck_native_pi_dma_receipt_probe(rdram, ctx, 0x80011598u);"
+
+[[patches.hook]]
+func = "pi_dma_read_blocking_chunked"
+before_vram = 0x80011628
+text = "buck_native_pi_dma_post_probe(rdram, ctx, 0x80011620u);"
+
+[[patches.hook]]
+func = "pi_dma_read_blocking_chunked"
+before_vram = 0x80011638
+text = "buck_native_pi_dma_receipt_probe(rdram, ctx, 0x80011638u);"
+
+[[patches.hook]]
+func = "audio_dma_proc"
+before_vram = 0x80051C40
+text = "buck_native_pi_dma_post_probe(rdram, ctx, 0x80051C38u);"
+
+[[patches.hook]]
+func = "func_80051CA8"
+before_vram = 0x80051CE8
+text = "buck_native_pi_dma_receipt_probe(rdram, ctx, 0x80051CE8u);"
+
+[[patches.hook]]
+func = "audio_build_and_submit_task"
+before_vram = 0x80051A58
+text = "buck_native_rsp_task_probe(rdram, ctx, 0x80051A58u);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x80054E84
+text = "buck_native_rsp_task_probe(rdram, ctx, 0x80054E84u);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x80054458
+text = "bumble_prepare_extended_matrix_arena(rdram, ctx);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x80054D68
+text = "bumble_guard_extended_display_list_capacity(rdram, ctx);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x80054E58
+text = "bumble_restore_task_display_list_owner(rdram, ctx);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x80054678
+text = "bumble_configure_single_player_frame_scissor(rdram, ctx);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x80054928
+text = "bumble_configure_single_player_depth_clear(rdram, ctx);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x800549A4
+text = "bumble_force_wide_sky_background_fill(rdram, ctx);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x80054A54
+text = "bumble_configure_single_player_color_clear(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80054EC8"
+before_vram = 0x80054F60
+text = "bumble_configure_single_player_world_aperture(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80054EC8"
+before_vram = 0x8005508C
+text = "bumble_emit_modern_sky_pass(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80055204"
+before_vram = 0x80055204
+text = "bumble_restore_split_screen_world_aperture(rdram, ctx);"
+
+[[patches.hook]]
+func = "scheduler_start_selected_task"
+before_vram = 0x80027944
+text = "buck_native_rsp_task_probe(rdram, ctx, 0x80028F2Cu);"
+
+[[patches.hook]]
+func = "scheduler_start_selected_task"
+before_vram = 0x8002794C
+text = "buck_native_rsp_task_probe(rdram, ctx, 0x800290BCu);"
+
+[[patches.hook]]
+func = "func_80051DB0"
+before_vram = 0x80051E00
+text = "buck_controller_init_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "controller_manager_poll_and_translate"
+before_vram = 0x80051EF4
+text = "buck_raw_pad_return_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "controller_manager_poll_and_translate"
+before_vram = 0x800523B8
+text = "bumble_apply_modern_translated_confirm(rdram, ctx); buck_normalized_pad_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AAF8C"
+before_vram = 0x800AB080
+text = "bumble_preempt_new_game_rumble_prompt(rdram, ctx); bumble_prepare_native_graphics_options_menu(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B99F4"
+before_vram = 0x800B9A28
+text = "bumble_prepare_native_graphics_options_menu(rdram, ctx);"
+
+[[patches.hook]]
+func = "frontend_menu_update"
+before_vram = 0x800AB72C
+text = "bumble_mark_modern_gameplay_inactive(rdram, ctx); bumble_disable_main_menu_attract(rdram, ctx); bumble_bypass_new_game_rumble_prompt(rdram, ctx); bumble_apply_modern_frontend_confirm(rdram, ctx); bumble_handle_native_graphics_options_input(rdram, ctx); bumble_handle_native_game_completion_input(rdram, ctx); buck_frontend_confirm_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "frontend_menu_update"
+before_vram = 0x800ABC64
+text = "bumble_preempt_main_menu_attract_transition(rdram, ctx);"
+
+[[patches.hook]]
+func = "frontend_menu_update"
+before_vram = 0x800ABC70
+text = "bumble_retain_main_menu_after_attract_transition(rdram, ctx);"
+
+[[patches.hook]]
+func = "frontend_state_initialize"
+before_vram = 0x800AABCC
+text = "bumble_apply_startup_menu_skip(rdram, ctx);"
+
+[[patches.hook]]
+func = "gameplay_pause_update"
+before_vram = 0x800B1F20
+text = "bumble_mark_modern_gameplay_active(rdram, ctx);"
+
+[[patches.hook]]
+func = "gameplay_pause_update"
+before_vram = 0x800B1FF0
+text = "bumble_mark_modern_gameplay_active(rdram, ctx);"
+
+[[patches.hook]]
+func = "gameplay_pause_update"
+before_vram = 0x800B1F98
+text = "bumble_apply_unlimited_health_gate(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AFE28"
+before_vram = 0x800B026C
+text = "buck_level_select_cheat_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B0284"
+before_vram = 0x800B0284
+text = "bumble_capture_campaign_level_progress(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B0284"
+before_vram = 0x800B0384
+text = "bumble_initialize_campaign_level_grid(rdram, ctx); buck_mission2_selector_init_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B0408"
+before_vram = 0x800B0408
+text = "bumble_handle_campaign_level_grid_input(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B0408"
+before_vram = 0x800B04D8
+text = "buck_mission2_selector_select_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B0408"
+before_vram = 0x800B06B4
+text = "bumble_commit_campaign_level_grid(rdram, ctx); buck_mission2_selection_commit_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80092144"
+before_vram = 0x800922C8
+text = "bumble_level_editor_observe_authored_record(rdram, ctx); buck_mission1_installer_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A42E0"
+before_vram = 0x800A42E0
+text = "if (bumble_level_editor_preserve_louse_actor()) return;"
+
+[[patches.hook]]
+func = "generic_object_update"
+before_vram = 0x8009D038
+text = "bumble_gameplay_modifier_tick(rdram); if (bumble_level_editor_tick(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "func_80053CA4"
+before_vram = 0x80053CD0
+text = "bumble_scale_enemy_awareness_planar_distance(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80053D38"
+before_vram = 0x80053D6C
+text = "bumble_scale_enemy_awareness_target_distance(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80053D74"
+before_vram = 0x80053DC0
+text = "bumble_scale_enemy_awareness_player_distance(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80053404"
+before_vram = 0x80053404
+text = "bumble_begin_damage_feedback(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80053404"
+before_vram = 0x800534A0
+text = "bumble_end_damage_feedback(rdram, ctx, 0x18u);"
+
+[[patches.hook]]
+func = "func_800CA2E0"
+before_vram = 0x800CA3B8
+text = "bumble_bind_boss_encounter(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A63D0
+text = "bumble_begin_boss_health_bar(rdram, ctx); bumble_ui_begin_gameplay_mission_gauge(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A6694
+text = "bumble_ui_end_gameplay_mission_gauge(rdram, ctx); bumble_end_boss_health_bar(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80053404"
+before_vram = 0x8005349C
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r6);"
+
+[[patches.hook]]
+func = "func_80066050"
+before_vram = 0x80066098
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r16);"
+
+[[patches.hook]]
+func = "func_8007643C"
+before_vram = 0x8007649C
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r16);"
+
+[[patches.hook]]
+func = "func_800765D4"
+before_vram = 0x80076630
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r16);"
+
+[[patches.hook]]
+func = "func_800767CC"
+before_vram = 0x80076834
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r16);"
+
+[[patches.hook]]
+func = "func_800777E4"
+before_vram = 0x80077840
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r16);"
+
+[[patches.hook]]
+func = "func_80097684"
+before_vram = 0x80097890
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r16);"
+
+[[patches.hook]]
+func = "func_800CA9E0"
+before_vram = 0x800CAA2C
+text = "bumble_apply_enemy_health_damage(rdram, ctx, (uint32_t)ctx->r19);"
+
+[[patches.hook]]
+func = "func_80053F50"
+before_vram = 0x800540A4
+text = "bumble_level_editor_repair_missing_target(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8007D0D0"
+before_vram = 0x8007D294
+text = "buck_mission1_child_target_probe(rdram, ctx, 0x8007D294u, (uint32_t)ctx->r16);"
+
+[[patches.hook]]
+func = "func_8007D2EC"
+before_vram = 0x8007D44C
+text = "buck_mission1_child_target_probe(rdram, ctx, 0x8007D44Cu, (uint32_t)ctx->r17);"
+
+[[patches.hook]]
+func = "func_80078A54"
+before_vram = 0x80078EC8
+text = "buck_mission1_terminal_caller_probe(rdram, ctx, 0x80078EC8u);"
+
+[[patches.hook]]
+func = "func_800990E0"
+before_vram = 0x8009930C
+text = "buck_mission1_terminal_caller_probe(rdram, ctx, 0x8009930Cu);"
+
+[[patches.hook]]
+func = "func_8007B2BC"
+before_vram = 0x8007B5DC
+text = "buck_mission1_terminal_caller_probe(rdram, ctx, 0x8007B5DCu);"
+
+[[patches.hook]]
+func = "func_8007B674"
+before_vram = 0x8007C6B0
+text = "buck_mission1_terminal_caller_probe(rdram, ctx, 0x8007C6B0u);"
+
+[[patches.hook]]
+func = "func_8007CBEC"
+before_vram = 0x8007CE74
+text = "buck_mission1_terminal_caller_probe(rdram, ctx, 0x8007CE74u);"
+
+[[patches.hook]]
+func = "func_800990E0"
+before_vram = 0x800990E0
+text = "buck_mission1_damage_event_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80053B6C"
+before_vram = 0x80053B6C
+text = "buck_mission1_terminal_entry_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80053B6C"
+before_vram = 0x80053B9C
+text = "buck_mission1_terminal_exit_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80096064"
+before_vram = 0x80096090
+text = "buck_mission1_decrement_store_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800965CC"
+before_vram = 0x800965D8
+text = "buck_mission1_zero_gate_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80095788"
+before_vram = 0x80095788
+text = "buck_mission1_success_callback_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80095788"
+before_vram = 0x800957D4
+text = "bumble_handle_mission_outcome_checkpoint(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B1D4C"
+before_vram = 0x800B1E60
+text = "buck_mission1_success_frontend_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B2BB8"
+before_vram = 0x800B2C6C
+text = "bumble_autosave_campaign_progress(rdram, ctx); buck_mission1_level_increment_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B2BB8"
+before_vram = 0x800B2C08
+text = "bumble_apply_unlimited_health_gate(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B2BB8"
+before_vram = 0x800B2C48
+text = "bumble_cancel_life_decrement(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B2BB8"
+before_vram = 0x800B2C54
+text = "bumble_remove_lives_gate(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B518C"
+before_vram = 0x800B51B4
+text = "bumble_apply_unlimited_health_gate(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B518C"
+before_vram = 0x800B51F8
+text = "bumble_cancel_life_decrement(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B518C"
+before_vram = 0x800B5204
+text = "bumble_remove_lives_gate(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800BB274"
+before_vram = 0x800BB274
+text = "buck_mission1_profile_save_entry_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800BB274"
+before_vram = 0x800BB28C
+text = "buck_mission1_profile_built_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800BB274"
+before_vram = 0x800BB2F4
+text = "buck_mission1_profile_save_result_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800BB308"
+before_vram = 0x800BB308
+text = "buck_mission1_profile_reopen_entry_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800BB308"
+before_vram = 0x800BB370
+text = "buck_mission1_profile_reopen_result_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x80059E98
+text = "bumble_prepare_modern_collision_world(rdram, ctx); bumble_update_modern_player_aim(rdram, ctx); bumble_mission1_completion_player_update(rdram, ctx); buck_player_update_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80058500"
+before_vram = 0x80059764
+text = "bumble_gate_modern_player_teleport(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80058500"
+before_vram = 0x8005988C
+text = "bumble_complete_modern_player_teleport(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80058500"
+before_vram = 0x80058830
+text = "bumble_apply_ammo_pickup_amount(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800770EC"
+before_vram = 0x800770EC
+text = "bumble_prepare_modern_teleport_visual_record(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800770EC"
+before_vram = 0x80077118
+text = "bumble_tag_modern_teleport_visual_record(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8006B6E4"
+before_vram = 0x8006B8EC
+text = "bumble_register_dynamic_gate_layer(rdram, (uint32_t)ctx->r17);"
+
+[[patches.hook]]
+func = "func_8006BB24"
+before_vram = 0x8006BD50
+text = "bumble_register_dynamic_gate_layer(rdram, (uint32_t)ctx->r18);"
+
+[[patches.hook]]
+func = "func_8006FB80"
+before_vram = 0x8006FD70
+text = "bumble_register_dynamic_gate_layer(rdram, (uint32_t)ctx->r17);"
+
+[[patches.hook]]
+func = "spawn_actor_dispatch"
+before_vram = 0x800912DC
+text = "buck_player_one_owner_commit_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "spawn_actor_dispatch"
+before_vram = 0x80091348
+text = "buck_player_two_owner_commit_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "generic_object_update"
+before_vram = 0x8009D124
+text = "if (bumble_level_editor_skip_actor_update(rdram, (uint32_t)ctx->r4)) goto after_4; buck_generic_player_callback_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "generic_object_update"
+before_vram = 0x8009D12C
+text = "bumble_level_editor_finish_actor_update(rdram);"
+
+[[patches.hook]]
+func = "func_80055FC8"
+before_vram = 0x80056B0C
+text = "bumble_enemy_spawner_retire_collision(rdram, (uint32_t)ctx->r17);"
+
+[[patches.hook]]
+func = "func_800661EC"
+before_vram = 0x80066900
+text = "bumble_enemy_spawner_retire_collision(rdram, (uint32_t)ctx->r17);"
+
+[[patches.hook]]
+func = "func_8007D0D0"
+before_vram = 0x8007D2CC
+text = "bumble_enemy_spawner_retire_collision(rdram, (uint32_t)ctx->r18);"
+
+[[patches.hook]]
+func = "func_800807D8"
+before_vram = 0x8008096C
+text = "bumble_enemy_spawner_retire_collision(rdram, (uint32_t)ctx->r17);"
+
+[[patches.hook]]
+func = "func_80096EF0"
+before_vram = 0x80097668
+text = "bumble_enemy_spawner_retire_collision(rdram, (uint32_t)ctx->r17);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005A520
+text = "bumble_apply_honeycomb_water_rescue(rdram, ctx); buck_player_state_dispatch_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005A61C
+text = "buck_player_state2_control_sample_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005A680
+text = "buck_player_state2_scaled_controls_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005A860
+text = "buck_player_state2_orientation_sample_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005A9D8
+text = "buck_player_state2_orientation_post_probe(rdram, ctx); bumble_apply_modern_player_aim(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005AB14
+text = "buck_player_state2_integrator_pre_probe(rdram, ctx); bumble_prepare_modern_player_movement(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005AB1C
+text = "buck_player_state2_integrator_post_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005AF20
+text = "bumble_resolve_modern_airborne_collision(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005B14C
+text = "bumble_gate_manual_landing(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005B168
+text = "bumble_guard_manual_landing_state_store(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005B6A4
+text = "bumble_guard_manual_grounded_entry_state_store(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005B28C
+text = "bumble_retract_modern_airborne_landing_gear(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005BA6C
+text = "bumble_prepare_modern_player_movement(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005BE44
+text = "bumble_observe_automatic_ground_exit(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C008
+text = "bumble_observe_automatic_ground_exit_commit(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C0D8
+text = "bumble_apply_manual_takeoff_press(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C0E8
+text = "bumble_bypass_manual_takeoff_state7_exclusion(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C114
+text = "bumble_bypass_manual_takeoff_resource_gate(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C1AC
+text = "bumble_observe_manual_takeoff_commit(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C214
+text = "bumble_apply_modern_player_aim(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C278
+text = "if (bumble_restore_imminent_mission_failure_checkpoint(rdram, ctx)) { goto L_8005C644; }"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C520
+text = "bumble_finalize_modern_player_aim(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_update"
+before_vram = 0x8005C644
+text = "bumble_stabilize_modern_airborne_collision_recovery(rdram, ctx);"
+
+# Keep accepted web-box provenance rather than guessing capture from state 4.
+[[patches.hook]]
+func = "func_80058500"
+before_vram = 0x80059BD4
+text = "bumble_observe_web_box_contact(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80077FFC"
+before_vram = 0x80077FFC
+text = "bumble_forget_web_box_contact((uint32_t)ctx->r4);"
+
+[[patches.hook]]
+func = "func_80090D40"
+before_vram = 0x80090D40
+text = "bumble_clear_web_box_contacts();"
+
+[[patches.hook]]
+func = "func_8005E590"
+before_vram = 0x8005E830
+text = "bumble_prepare_projectile_scene_range(rdram, ctx, (uint32_t)ctx->r17, 0u);"
+
+[[patches.hook]]
+func = "func_8005EA0C"
+before_vram = 0x8005EC90
+text = "bumble_prepare_projectile_scene_range(rdram, ctx, (uint32_t)ctx->r17, 1u);"
+
+[[patches.hook]]
+func = "func_8005EEE8"
+before_vram = 0x8005F29C
+text = "bumble_prepare_projectile_scene_range(rdram, ctx, (uint32_t)ctx->r18, 4u);"
+
+[[patches.hook]]
+func = "func_8005E1CC"
+before_vram = 0x8005E468
+text = "bumble_prepare_projectile_scene_range(rdram, ctx, (uint32_t)ctx->r16, 6u);"
+
+[[patches.hook]]
+func = "func_8006225C"
+before_vram = 0x800624E4
+text = "bumble_prepare_projectile_scene_range(rdram, ctx, (uint32_t)ctx->r16, 8u);"
+
+[[patches.hook]]
+func = "func_8005DE48"
+before_vram = 0x8005DE64
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r17, 2u);"
+
+[[patches.hook]]
+func = "func_8005E848"
+before_vram = 0x8005E864
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r16, 0u);"
+
+[[patches.hook]]
+func = "func_8005ECA8"
+before_vram = 0x8005ECBC
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r16, 1u);"
+
+[[patches.hook]]
+func = "func_80060470"
+before_vram = 0x80060488
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r16, 10u);"
+
+[[patches.hook]]
+func = "func_80061738"
+before_vram = 0x80061758
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r16, 5u);"
+
+[[patches.hook]]
+func = "func_80063040"
+before_vram = 0x800638E8
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r17, 9u);"
+
+[[patches.hook]]
+func = "func_80065894"
+before_vram = 0x800658B0
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r17, 3u);"
+
+[[patches.hook]]
+func = "func_80065E80"
+before_vram = 0x80065E94
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r16, 6u);"
+
+[[patches.hook]]
+func = "func_8005DE48"
+before_vram = 0x8005DF64
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r17, 2u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_8005E848"
+before_vram = 0x8005E930
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r16, 0u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_8005ECA8"
+before_vram = 0x8005ED0C
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r16, 1u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_8005F2C0"
+before_vram = 0x8005F330
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r17, 4u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_80060470"
+before_vram = 0x800604D8
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r16, 10u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_80061738"
+before_vram = 0x800618B0
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r16, 5u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_80063040"
+before_vram = 0x80063928
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r17, 9u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_80065E80"
+before_vram = 0x80065EE8
+text = "ctx->r2 = bumble_resolve_weapon_static_contact(rdram, ctx, (uint32_t)ctx->r16, 6u, (uint32_t)ctx->r2);"
+
+[[patches.hook]]
+func = "func_8005F2C0"
+before_vram = 0x8005F2D8
+text = "bumble_begin_weapon_static_step(rdram, ctx, (uint32_t)ctx->r17, 4u);"
+
+[[patches.hook]]
+func = "func_80061738"
+before_vram = 0x80061BD0
+text = "if (bumble_apply_modern_guided_missile_aim(rdram, ctx) != 0) { goto L_80061C40; }"
+
+[[patches.hook]]
+func = "func_800624FC"
+before_vram = 0x80062564
+text = "if (bumble_update_modern_lightning_projectile(rdram, ctx, (uint32_t)ctx->r16) != 0) { goto L_80062680; }"
+
+[[patches.hook]]
+func = "func_800626C0"
+before_vram = 0x80062750
+text = "if (bumble_lightning_collision_target_visible(rdram, ctx, (uint32_t)ctx->r17, (uint32_t)ctx->r16) == 0) { goto L_80062884; }"
+
+[[patches.hook]]
+func = "func_800653AC"
+before_vram = 0x800653AC
+text = "return;"
+
+[[patches.hook]]
+func = "func_80065894"
+before_vram = 0x80065938
+text = "bumble_update_multi_bomb_static_contact(rdram, ctx, (uint32_t)ctx->r17);"
+
+
+[[patches.hook]]
+func = "terrain_visibility_grid_render"
+before_vram = 0x800859A0
+text = "bumble_expand_terrain_visibility(rdram, ctx);"
+
+[[patches.hook]]
+func = "terrain_visibility_grid_render"
+before_vram = 0x800859BC
+text = "bumble_relocate_terrain_visibility_build_scratch(rdram, ctx);"
+
+[[patches.hook]]
+func = "terrain_visibility_grid_render"
+before_vram = 0x80085C70
+text = "bumble_relocate_terrain_visibility_consume_scratch(rdram, ctx);"
+
+[[patches.hook]]
+func = "terrain_visibility_grid_render"
+before_vram = 0x80085D94
+text = "bumble_finish_terrain_visibility_scratch(rdram, ctx);"
+
+[[patches.hook]]
+func = "terrain_visibility_grid_render"
+before_vram = 0x80085B84
+text = "bumble_collect_procedural_grass_cell(rdram, ctx);"
+
+[[patches.hook]]
+func = "terrain_visibility_grid_render"
+before_vram = 0x80085D98
+text = "bumble_emit_procedural_grass_pass(rdram, ctx);"
+
+[[patches.hook]]
+func = "terrain_visibility_grid_render"
+before_vram = 0x80085D9C
+text = "bumble_emit_modern_electric_pass(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8005598C"
+before_vram = 0x80055A4C
+text = "bumble_begin_modern_teleport_visual_scope(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8005598C"
+before_vram = 0x80055A54
+text = "bumble_guard_post_object_matrix_capacity(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8005598C"
+before_vram = 0x80055BCC
+text = "bumble_end_modern_teleport_visual_scope(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8005598C"
+before_vram = 0x80055C08
+text = "bumble_matrix_arena_world_pass_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009D868"
+before_vram = 0x8009DA10
+text = "bumble_object_cull_pvs_reject_probe(rdram, ctx); bumble_expand_static_geometry_pvs(rdram, ctx); bumble_guard_object_matrix_capacity(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009D868"
+before_vram = 0x8009DA4C
+text = "bumble_scale_object_distance_threshold(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009D868"
+before_vram = 0x8009DA54
+text = "bumble_object_cull_distance_reject_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009D868"
+before_vram = 0x8009DA5C
+text = "bumble_record_rendered_actor(); bumble_begin_actor_matrix_group(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009D868"
+before_vram = 0x8009DDEC
+text = "bumble_end_actor_matrix_group(rdram);"
+
+[[patches.hook]]
+func = "func_8009D868"
+before_vram = 0x8009DA88
+text = "bumble_begin_modern_barrel_roll_visual(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009D868"
+before_vram = 0x8009DAA8
+text = "bumble_end_modern_barrel_roll_visual(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800926AC"
+before_vram = 0x8009274C
+text = "bumble_ui_begin_script_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800926AC"
+before_vram = 0x80092754
+text = "bumble_ui_end_script_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800928BC"
+before_vram = 0x800928BC
+text = "bumble_ui_begin_script_panel(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800928BC"
+before_vram = 0x80092B04
+text = "bumble_ui_end_script_panel(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80095558"
+before_vram = 0x80095588
+text = "bumble_ui_observe_briefing_queue_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9580"
+before_vram = 0x800A95B8
+text = "bumble_ui_begin_briefing_panel(rdram, ctx);"
+
+# Retain the original queue/reveal owner while laying out its complete text.
+[[patches.hook]]
+func = "func_800A9098"
+before_vram = 0x800A9128
+text = "bumble_reset_briefing_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AA024"
+before_vram = 0x800AA024
+text = "bumble_reset_briefing_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9214"
+before_vram = 0x800A924C
+text = "bumble_queue_briefing_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9580"
+before_vram = 0x800A98AC
+text = "bumble_expand_briefing_wrap_width(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9580"
+before_vram = 0x800A98F0
+text = "bumble_ui_begin_briefing_line(rdram, ctx, 0x800A98F0u);"
+
+[[patches.hook]]
+func = "func_800A9580"
+before_vram = 0x800A98F8
+text = "bumble_ui_end_briefing_line(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9580"
+before_vram = 0x800A991C
+text = "bumble_ui_begin_briefing_line(rdram, ctx, 0x800A991Cu);"
+
+[[patches.hook]]
+func = "func_800A9580"
+before_vram = 0x800A9924
+text = "bumble_ui_end_briefing_line(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9580"
+before_vram = 0x800A9994
+text = "bumble_ui_end_briefing_panel(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A6824"
+before_vram = 0x800A6824
+text = "bumble_ui_begin_sprite_rect(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A6824"
+before_vram = 0x800A68EC
+text = "bumble_ui_end_sprite_rect(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A6824"
+before_vram = 0x800A6A00
+text = "bumble_ui_end_sprite_rect(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A6A08"
+before_vram = 0x800A6A08
+text = "bumble_ui_begin_hud_rect_batch(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A6A08"
+before_vram = 0x800A7184
+text = "bumble_ui_end_hud_rect_batch(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A0080"
+before_vram = 0x800A00E8
+text = "bumble_apply_player_maximum_health(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A5C60
+text = "bumble_ui_begin_gameplay_hud_root(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A681C
+text = "bumble_ui_end_gameplay_hud_root(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A5F80
+text = "bumble_ui_begin_gameplay_radar(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A60D0
+text = "bumble_ui_end_gameplay_radar(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A67E0
+text = "bumble_ui_begin_gameplay_weapon_model(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A67E8
+text = "bumble_ui_end_gameplay_weapon_model(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4B54"
+before_vram = 0x800A5510
+text = "bumble_ui_begin_gameplay_weapon_neighbor(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4B54"
+before_vram = 0x800A5620
+text = "bumble_ui_end_gameplay_weapon_neighbor(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4B54"
+before_vram = 0x800A5648
+text = "bumble_ui_begin_gameplay_weapon_neighbor(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4B54"
+before_vram = 0x800A5758
+text = "bumble_ui_end_gameplay_weapon_neighbor(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A718C"
+before_vram = 0x800A757C
+text = "bumble_ui_begin_gameplay_right_hud(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A718C"
+before_vram = 0x800A7584
+text = "bumble_ui_end_gameplay_right_hud(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4844"
+before_vram = 0x800A4844
+text = "bumble_ui_begin_gameplay_lives(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4844"
+before_vram = 0x800A4B34
+text = "bumble_ui_end_gameplay_lives(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A61D4
+text = "bumble_ui_begin_gameplay_status_bar(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A6288
+text = "bumble_ui_end_gameplay_status_bar(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A6704
+text = "bumble_ui_begin_gameplay_weapon_ammo(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A5C60"
+before_vram = 0x800A670C
+text = "bumble_ui_end_gameplay_weapon_ammo(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9E4C"
+before_vram = 0x800A9E4C
+text = "bumble_ui_begin_gameplay_key_group(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A9E4C"
+before_vram = 0x800A9FC0
+text = "bumble_ui_end_gameplay_key_group(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AA3B8"
+before_vram = 0x800AA3B8
+text = "bumble_ui_begin_gameplay_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AA3B8"
+before_vram = 0x800AA4BC
+text = "bumble_ui_end_gameplay_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4310"
+before_vram = 0x800A4310
+text = "bumble_ui_begin_gameplay_number(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A4310"
+before_vram = 0x800A4640
+text = "bumble_ui_end_gameplay_number(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A8D0C"
+before_vram = 0x800A8D0C
+text = "bumble_ui_begin_gameplay_timer(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A8D0C"
+before_vram = 0x800A8E38
+text = "bumble_ui_end_gameplay_timer(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AC204"
+before_vram = 0x800AC244
+text = "bumble_ui_begin_fullscreen_panel(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AC204"
+before_vram = 0x800AC460
+text = "bumble_ui_end_fullscreen_panel(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AC204"
+before_vram = 0x800AC584
+text = "bumble_ui_begin_native_menu_list(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AC204"
+before_vram = 0x800AC604
+text = "bumble_ui_end_native_menu_list(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AE344"
+before_vram = 0x800AE344
+text = "bumble_ui_begin_texrect(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AE344"
+before_vram = 0x800AE864
+text = "bumble_ui_end_texrect(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AE86C"
+before_vram = 0x800AE86C
+text = "bumble_ui_setup_2d_scissor(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AE9AC"
+before_vram = 0x800AE9AC
+text = "bumble_ui_begin_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AE9AC"
+before_vram = 0x800AED4C
+text = "bumble_ui_reduce_main_menu_pulse(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800AE9AC"
+before_vram = 0x800AF088
+text = "bumble_ui_end_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B9748"
+before_vram = 0x800B9748
+text = "bumble_ui_begin_text_line(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B9748"
+before_vram = 0x800B98C8
+text = "bumble_ui_end_text_line(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800ADACC"
+before_vram = 0x800AE03C
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800AE03Cu);"
+
+[[patches.hook]]
+func = "func_800AF274"
+before_vram = 0x800AF47C
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800AF47Cu);"
+
+[[patches.hook]]
+func = "func_800AF274"
+before_vram = 0x800AF5C0
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800AF5C0u);"
+
+[[patches.hook]]
+func = "func_800AF274"
+before_vram = 0x800AF720
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800AF720u);"
+
+[[patches.hook]]
+func = "func_800AF274"
+before_vram = 0x800AFA34
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800AFA34u);"
+
+[[patches.hook]]
+func = "func_800AF274"
+before_vram = 0x800AFB68
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800AFB68u);"
+
+[[patches.hook]]
+func = "func_800AF274"
+before_vram = 0x800AFC9C
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800AFC9Cu);"
+
+[[patches.hook]]
+func = "func_800AC204"
+before_vram = 0x800AC204
+text = "bumble_ui_begin_campaign_level_grid(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B08E4"
+before_vram = 0x800B0B84
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B0B84u);"
+
+[[patches.hook]]
+func = "func_800B08E4"
+before_vram = 0x800B0D08
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B0D08u);"
+
+[[patches.hook]]
+func = "func_800B08E4"
+before_vram = 0x800B0E8C
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B0E8Cu);"
+
+[[patches.hook]]
+func = "func_800AC204"
+before_vram = 0x800AC688
+text = "bumble_ui_end_campaign_level_grid(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B11B8"
+before_vram = 0x800B13B4
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B13B4u);"
+
+[[patches.hook]]
+func = "func_800B11B8"
+before_vram = 0x800B14F8
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B14F8u);"
+
+[[patches.hook]]
+func = "func_800B11B8"
+before_vram = 0x800B1658
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B1658u);"
+
+[[patches.hook]]
+func = "func_800B11B8"
+before_vram = 0x800B1968
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B1968u);"
+
+[[patches.hook]]
+func = "func_800B11B8"
+before_vram = 0x800B1A9C
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B1A9Cu);"
+
+[[patches.hook]]
+func = "func_800B11B8"
+before_vram = 0x800B1BD0
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B1BD0u);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B37F8
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B37F8u);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B393C
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B393Cu);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B3A90
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B3A90u);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B3CE0
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B3CE0u);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B3E14
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B3E14u);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B3FAC
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B3FACu);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B4300
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B4300u);"
+
+[[patches.hook]]
+func = "func_800B35D4"
+before_vram = 0x800B4440
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B4440u);"
+
+[[patches.hook]]
+func = "func_800B477C"
+before_vram = 0x800B4A40
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B4A40u);"
+
+[[patches.hook]]
+func = "func_800B477C"
+before_vram = 0x800B4BC4
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B4BC4u);"
+
+[[patches.hook]]
+func = "func_800B477C"
+before_vram = 0x800B4D48
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B4D48u);"
+
+[[patches.hook]]
+func = "func_800B477C"
+before_vram = 0x800B4F24
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B4F24u);"
+
+[[patches.hook]]
+func = "func_800B5638"
+before_vram = 0x800B5B48
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B5B48u);"
+
+[[patches.hook]]
+func = "func_800B5638"
+before_vram = 0x800B5CB0
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B5CB0u);"
+
+[[patches.hook]]
+func = "func_800B9748"
+before_vram = 0x800B98A8
+text = "bumble_ui_publish_direct_text_call(rdram, ctx, 0x800B98A8u);"
+
+[[patches.hook]]
+func = "func_800B8180"
+before_vram = 0x800B8180
+text = "bumble_death_screen_observe_text(rdram, ctx); bumble_ui_begin_direct_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800B8180"
+before_vram = 0x800B81CC
+text = "bumble_ui_end_direct_text(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80094544"
+before_vram = 0x8009468C
+text = "bumble_apply_mission_time_limit(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80094544"
+before_vram = 0x80094690
+text = "bumble_apply_mission_time_limit(rdram, ctx);"

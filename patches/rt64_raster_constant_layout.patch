@@ -1,0 +1,30 @@
+diff --git a/src/shared/rt64_raster_params.h b/src/shared/rt64_raster_params.h
+--- a/src/shared/rt64_raster_params.h
++++ b/src/shared/rt64_raster_params.h
+@@ -7,6 +7,7 @@
+ #include "shared/rt64_hlsl.h"
+ 
+ #ifdef HLSL_CPU
++#include <cstddef>
+ namespace interop {
+ #endif
+     struct RasterParams {
+@@ -23,7 +24,18 @@
+         uint bumbleTeleportDisabledTint;
+         float2 screenScale;
++        // HLSL constant-buffer vectors cannot straddle a 16-byte register.
++        uint screenPadding;
+         float2 screenOffset;
+     };
+ #ifdef HLSL_CPU
++    static_assert(offsetof(RasterParams, renderIndex) == 0);
++    static_assert(offsetof(RasterParams, bumbleShaderVariant) == 4);
++    static_assert(offsetof(RasterParams, bumbleReflectionPass) == 8);
++    static_assert(offsetof(RasterParams, bumbleWaterPlaneHeight) == 12);
++    static_assert(offsetof(RasterParams, bumbleTeleportDisabledTint) == 16);
++    static_assert(offsetof(RasterParams, screenScale) == 20);
++    static_assert(offsetof(RasterParams, screenPadding) == 28);
++    static_assert(offsetof(RasterParams, screenOffset) == 32);
++    static_assert(sizeof(RasterParams) == 40);
+ };
+ #endif

@@ -1,0 +1,261 @@
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index ed8ad04..52169a2 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -1411,14 +1411,14 @@ namespace RT64 {
+                 thread_local std::vector<BufferUploader *> bufferUploaders;
+                 bufferUploaders.clear();
+ 
+-                // Create all GPU tile mappings and upload them.
+-                bool uploadGPUTiles = (gpuTileCursor < rdpTileCursor);
++                // A later partial framebuffer batch can reuse earlier tile indices without reloading texture state.
++                bool uploadGPUTiles = (rdpTileCursor > 0);
+                 if (uploadGPUTiles) {
+                     std::pair<size_t, size_t> gpuTileRange;
+-                    gpuTileRange.first = gpuTileCursor;
++                    gpuTileRange.first = 0;
+                     gpuTileRange.second = rdpTileCursor;
+-                    framebufferRenderer->createGPUTiles(&workload.drawData.callTiles[gpuTileCursor], rdpTileCursor - gpuTileCursor,
+-                        &workload.drawData.gpuTiles[gpuTileCursor], &framebufferManager, ext.textureCache, workload.submissionFrame);
++                    framebufferRenderer->createGPUTiles(workload.drawData.callTiles.data(), rdpTileCursor,
++                        workload.drawData.gpuTiles.data(), &framebufferManager, ext.textureCache, workload.submissionFrame);
+ 
+                     // Upload the GPU tiles.
+                     ext.tilesUploader->submit(ext.framebufferGraphicsWorker, {
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index a5dae01..b2b5726 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -14,6 +14,7 @@
+ #include <cstdio>
+ #include <iterator>
+ #include <limits>
++#include <stdexcept>
+ 
+ #include "../include/rt64_extended_gbi.h"
+ 
+@@ -2133,11 +2134,13 @@ namespace RT64 {
+         textureCacheVersions = textureCache->textureMap.versions;
+         textureCacheTextures = textureCache->textureMap.textures;
+         textureCacheTextureReplacements = textureCache->textureMap.textureReplacements;
+-        textureCacheFreeSpaces = textureCache->textureMap.freeSpaces;
+-        textureCacheSize = static_cast<uint32_t>(textureCacheTextures.size());
++        textureCacheDescriptorIndices.assign(textureCacheTextures.size(), UINT32_MAX);
++        staticTextureBindings.clear();
++        textureCacheSize = 0;
+         textureCacheGlobalVersion = textureCache->textureMap.globalVersion;
+         textureCacheReplacementMapEnabled = textureCache->textureMap.replacementMapEnabled;
+         dynamicTextureViewVector.clear();
++        dynamicTextureIndices.clear();
+         dynamicTextureBarrierVector.clear();
+     }
+ 
+@@ -2170,21 +2173,32 @@ namespace RT64 {
+                     gpuTile.flags.rawTMEM = false;
+                     gpuTile.flags.hasMipmaps = false;
+                 }
++                else {
++                    throw std::runtime_error("RT64 referenced tile copy is missing");
++                }
+             }
+             else {
+-                // Retrieve the texture from the cache or use a blank texture if not found.
++                // Upload completion must precede mapping.
+                 uint32_t textureIndex = 0;
+                 bool textureReplaced = false;
+                 bool hasMipmaps = false;
+                 bool shiftedByHalf = false;
+-                textureCache->textureMap.use(callTile.tmemHashOrID, submissionFrame, textureIndex, gpuTile.tcScale, gpuTile.textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf);
++                if (!textureCache->textureMap.use(callTile.tmemHashOrID, submissionFrame, textureIndex, gpuTile.tcScale, gpuTile.textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf) ||
++                    textureIndex >= textureCacheTextures.size() || textureCacheTextures[textureIndex] == nullptr) {
++                    throw std::runtime_error("RT64 referenced texture is missing after upload completion");
++                }
+ 
+                 // Describe the GPU tile for a regular texture.
+                 gpuTile.ulScale.x = gpuTile.tcScale.x;
+                 gpuTile.ulScale.y = gpuTile.tcScale.y;
+                 gpuTile.texelShift = { 0, 0 };
+                 gpuTile.texelMask = { UINT_MAX, UINT_MAX };
+-                gpuTile.textureIndex = textureIndex;
++                uint32_t &descriptorIndex = textureCacheDescriptorIndices.at(textureIndex);
++                if (descriptorIndex == UINT32_MAX) {
++                    descriptorIndex = getDestinationIndex();
++                    staticTextureBindings.emplace_back(descriptorIndex, textureIndex);
++                }
++                gpuTile.textureIndex = descriptorIndex;
+                 gpuTile.flags.alphaIsCvg = false;
+                 gpuTile.flags.highRes = textureReplaced;
+                 gpuTile.flags.fromCopy = false;
+@@ -2196,32 +2211,41 @@ namespace RT64 {
+     }
+ 
+     uint32_t FramebufferRenderer::getDestinationIndex() {
+-        uint32_t dstIndex;
+-        if (textureCacheFreeSpaces.empty()) {
+-            dstIndex = textureCacheSize++;
++        // Only textures referenced by this submission consume shader slots.
++        if (textureCacheSize >= FramebufferRendererDescriptorTextureSet::UpperRange) {
++            throw std::runtime_error("RT64 submission exceeds texture descriptor capacity");
+         }
+-        else {
+-            dstIndex = textureCacheFreeSpaces.back();
+-            textureCacheFreeSpaces.pop_back();
+-        }
+-
+-        return dstIndex;
++        return textureCacheSize++;
+     }
+     
+     uint32_t FramebufferRenderer::getTextureIndex(RenderTarget *renderTarget) {
+         assert(renderTarget != nullptr);
+ 
+-        uint32_t dstIndex = getDestinationIndex();
+-        dynamicTextureViewVector.emplace_back(DynamicTextureView{ renderTarget->getResolvedTexture(), dstIndex, renderTarget->getResolvedTextureView()});
++        return getTextureIndex(renderTarget->getResolvedTexture(), renderTarget->getResolvedTextureView());
++    }
++
++    uint32_t FramebufferRenderer::getTextureIndex(const RenderTexture *texture, const RenderTextureView *view) {
++        auto &indices = dynamicTextureIndices[texture];
++        for (uint32_t index : indices) {
++            const auto &binding = dynamicTextureViewVector[index];
++            if (binding.textureView == view) {
++                return binding.dstIndex;
++            }
++        }
++        const uint32_t dstIndex = getDestinationIndex();
++        indices.push_back(uint32_t(dynamicTextureViewVector.size()));
++        dynamicTextureViewVector.emplace_back(DynamicTextureView{ texture, dstIndex, view });
+         return dstIndex;
+     }
+     
+     uint32_t FramebufferRenderer::getTextureIndex(const FramebufferManager::TileCopy &tileCopy) {
+         assert(tileCopy.texture != nullptr);
+ 
+-        uint32_t dstIndex = getDestinationIndex();
+-        dynamicTextureViewVector.emplace_back(DynamicTextureView{ tileCopy.texture.get(), dstIndex, nullptr });
+-        dynamicTextureBarrierVector.emplace_back(RenderTextureBarrier(tileCopy.texture.get(), RenderTextureLayout::SHADER_READ));
++        const size_t previousSize = dynamicTextureViewVector.size();
++        const uint32_t dstIndex = getTextureIndex(tileCopy.texture.get(), nullptr);
++        if (dynamicTextureViewVector.size() != previousSize) {
++            dynamicTextureBarrierVector.emplace_back(RenderTextureBarrier(tileCopy.texture.get(), RenderTextureLayout::SHADER_READ));
++        }
+         return dstIndex;
+     }
+     
+@@ -2232,23 +2257,27 @@ namespace RT64 {
+         auto &activeTextureSet = descTextureSets[activeFrameSlot];
+         auto &activeTextureVersions =
+             descriptorTextureVersions[activeFrameSlot];
++        auto &activeCacheIndices = descriptorTextureCacheIndices[activeFrameSlot];
+         uint32_t &activeTextureGlobalVersion =
+             descriptorTextureGlobalVersions[activeFrameSlot];
+         bool &activeTextureReplacementMapEnabled =
+             descriptorTextureReplacementMapEnabled[activeFrameSlot];
+         
+-        const bool createSet = (descTextureSet == nullptr) || (descTextureSet->textureCacheSize < (textureCacheSize + 1));
++        const uint32_t requiredSize = std::max(textureCacheSize, 1u);
++        const bool createSet = (descTextureSet == nullptr) || (descTextureSet->textureCacheSize < requiredSize);
+         if (createSet) {
+             activeTextureSet = std::make_unique<
+                 FramebufferRendererDescriptorTextureSet>(
+                     worker->device,
+-                    ((textureCacheSize + 1) * 3) / 2
++                    std::min((requiredSize * 3) / 2,
++                        uint32_t(FramebufferRendererDescriptorTextureSet::UpperRange))
+                 );
+             descTextureSet = activeTextureSet.get();
+         }
+ 
+         if (createSet || (activeTextureReplacementMapEnabled != textureCacheReplacementMapEnabled)) {
+             activeTextureVersions.clear();
++            activeCacheIndices.clear();
+             activeTextureGlobalVersion = 0;
+             activeTextureReplacementMapEnabled =
+                 textureCacheReplacementMapEnabled;
+@@ -2317,28 +2346,30 @@ namespace RT64 {
+ 
+         // Make sure the versions vector matches the texture cache size.
+         activeTextureVersions.resize(textureCacheSize, 0);
++        activeCacheIndices.resize(textureCacheSize, UINT32_MAX);
+ 
+         // Update texture vector with static textures from the cache and dynamic resource views.
+-        if (activeTextureGlobalVersion != textureCacheGlobalVersion) {
+-            const uint32_t textureVersionSize = static_cast<uint32_t>(textureCacheVersions.size());
+-            for (uint32_t i = 0; i < textureVersionSize; i++) {
+-                if (textureCacheVersions[i] == activeTextureVersions[i]) {
++        {
++            for (const auto &[dstIndex, i] : staticTextureBindings) {
++                if (activeCacheIndices[dstIndex] == i &&
++                    textureCacheVersions[i] == activeTextureVersions[dstIndex]) {
+                     continue;
+                 }
+ 
+-                activeTextureVersions[i] = textureCacheVersions[i];
++                activeTextureVersions[dstIndex] = textureCacheVersions[i];
++                activeCacheIndices[dstIndex] = i;
+                 if (textureCacheTextures[i] == nullptr) {
+                     continue;
+                 }
+ 
+                 if (textureCacheReplacementMapEnabled && (textureCacheTextureReplacements[i] != nullptr)) {
+-                    descTextureSet->setTexture(i, textureCacheTextureReplacements[i]->texture.get(), RenderTextureLayout::SHADER_READ);
++                    descTextureSet->setTexture(dstIndex, textureCacheTextureReplacements[i]->texture.get(), RenderTextureLayout::SHADER_READ);
+                 }
+                 else if (textureCacheTextures[i]->texture != nullptr) {
+-                    descTextureSet->setTexture(i, textureCacheTextures[i]->texture.get(), RenderTextureLayout::SHADER_READ);
++                    descTextureSet->setTexture(dstIndex, textureCacheTextures[i]->texture.get(), RenderTextureLayout::SHADER_READ);
+                 }
+                 else {
+-                    descTextureSet->setTexture(i, textureCacheTextures[i]->tmem.get(), RenderTextureLayout::SHADER_READ);
++                    descTextureSet->setTexture(dstIndex, textureCacheTextures[i]->tmem.get(), RenderTextureLayout::SHADER_READ);
+                 }
+             }
+ 
+@@ -2348,6 +2379,7 @@ namespace RT64 {
+         for (const DynamicTextureView &dynamicView : dynamicTextureViewVector) {
+             descTextureSet->setTexture(dynamicView.dstIndex, dynamicView.texture, RenderTextureLayout::SHADER_READ, dynamicView.textureView);
+             activeTextureVersions[dynamicView.dstIndex] = 0;
++            activeCacheIndices[dynamicView.dstIndex] = UINT32_MAX;
+         }
+ 
+         textureMapLock.unlock();
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index 655595f..fa16fb9 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -93,7 +93,9 @@ namespace RT64 {
+         std::vector<uint32_t> textureCacheVersions;
+         std::vector<Texture *> textureCacheTextures;
+         std::vector<Texture *> textureCacheTextureReplacements;
+-        std::vector<uint32_t> textureCacheFreeSpaces;
++        // Cache indices are persistent identities, not shader array indices.
++        std::vector<uint32_t> textureCacheDescriptorIndices;
++        std::vector<std::pair<uint32_t, uint32_t>> staticTextureBindings;
+         uint32_t textureCacheSize = 0;
+         uint32_t textureCacheGlobalVersion = 0;
+         bool textureCacheReplacementMapEnabled = false;
+@@ -101,6 +103,7 @@ namespace RT64 {
+         std::vector<RenderPipelineProgram> hitGroupVector;
+         std::vector<interop::RenderIndices> renderIndicesVector;
+         std::vector<DynamicTextureView> dynamicTextureViewVector;
++        std::unordered_map<const RenderTexture *, std::vector<uint32_t>> dynamicTextureIndices;
+         std::vector<RenderTextureBarrier> dynamicTextureBarrierVector;
+         std::unique_ptr<BufferUploader> shaderUploader;
+         std::vector<RSPSmoothNormalGenerationCB> rspSmoothNormalVector;
+@@ -138,6 +141,8 @@ namespace RT64 {
+         bool dummyDepthTargetTransitioned = false;
+         std::array<std::vector<uint32_t>, MaximumFramesInFlight>
+             descriptorTextureVersions;
++        std::array<std::vector<uint32_t>, MaximumFramesInFlight>
++            descriptorTextureCacheIndices;
+         std::array<uint32_t, MaximumFramesInFlight>
+             descriptorTextureGlobalVersions{};
+         std::array<bool, MaximumFramesInFlight>
+@@ -290,6 +295,7 @@ namespace RT64 {
+         void updateTextureCache(TextureCache *textureCache);
+         void createGPUTiles(const DrawCallTile *callTiles, uint32_t callTileCount, interop::GPUTile *dstGPUTiles, const FramebufferManager *fbManager, TextureCache *textureCache, uint64_t submissionFrame);
+         uint32_t getDestinationIndex();
++        uint32_t getTextureIndex(const RenderTexture *texture, const RenderTextureView *view);
+         uint32_t getTextureIndex(RenderTarget *renderTarget);
+         uint32_t getTextureIndex(const FramebufferManager::TileCopy &tileCopy);
+         void updateMultisampling();

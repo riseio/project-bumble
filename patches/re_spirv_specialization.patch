@@ -1,0 +1,105 @@
+diff --git a/re-spirv-cli.cpp b/re-spirv-cli.cpp
+index bb86219..023e44b 100644
+--- a/re-spirv-cli.cpp
++++ b/re-spirv-cli.cpp
+@@ -194,4 +194,4 @@ int main(int argc, char *argv[]) {
+     return 0;
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/re-spirv.cpp b/re-spirv.cpp
+index 26f70e5..75b84f0 100644
+--- a/re-spirv.cpp
++++ b/re-spirv.cpp
+@@ -1390,17 +1390,23 @@ namespace respv {
+                 optimizerReduceLabelDegree(optimizedWords[wordIndex + 2], rContext);
+             }
+ 
+-            // Make the final label the new default case and reduce the word count.
++            // Keep the switch header so nested exits to its merge block remain valid.
+             optimizedWords[wordIndex] = SpvOpSwitch | (3U << 16U);
+-            optimizedWords[wordIndex + 1] = rContext.shader.defaultSwitchOpConstantInt;
++            optimizedWords[wordIndex + 1] =
++                rContext.shader.defaultSwitchOpConstantInt;
+             optimizedWords[wordIndex + 2] = defaultLabelId;
+ 
+-            // Increase the degree of the default constant that was chosen so it's not considered as dead code.
+-            uint32_t defaultConstantInstructionIndex = rContext.shader.results[rContext.shader.defaultSwitchOpConstantInt].instructionIndex;
+-            rContext.instructionOutDegrees[defaultConstantInstructionIndex]++;
+-
+-            // Eliminate any remaining words on the block.
+-            for (uint32_t i = wordIndex + 3; i < (wordIndex + wordCount); i++) {
++            // Keep the replacement selector alive and eliminate only the discarded case operands.
++            const uint32_t defaultConstantInstructionIndex =
++                rContext.shader.results[
++                    rContext.shader.defaultSwitchOpConstantInt
++                ].instructionIndex;
++            rContext.instructionOutDegrees[
++                defaultConstantInstructionIndex
++            ]++;
++            for (uint32_t i = wordIndex + 3;
++                i < (wordIndex + wordCount);
++                i++) {
+                 optimizedWords[i] = UINT32_MAX;
+             }
+         }
+@@ -1675,20 +1688,38 @@ namespace respv {
+             return false;
+         }
+ 
+-        if (!optimizerRunEvaluationPass(context)) {
+-            return false;
+-        }
++        // Repeat evaluation after Phi simplification exposes more constant branches.
++        constexpr uint32_t MaxEvaluationPasses = 16;
++        size_t previousDeletedWordCount = SIZE_MAX;
++        for (uint32_t pass = 0; pass < MaxEvaluationPasses; pass++) {
++            if (!optimizerRunEvaluationPass(context)) {
++                return false;
++            }
+ 
+-        if (!optimizerRemoveUnusedDecorations(context)) {
+-            return false;
+-        }
++            if (!optimizerRemoveUnusedDecorations(context)) {
++                return false;
++            }
+ 
+-        // FIXME: For some reason, it seems that based on the order of the resolution, OpPhis can be compacted
+-        // before all their preceding blocks have been evaluated in time whether they should be deleted or not.
+-        // This pass merely re-runs the compaction step as a safeguard to remove any stale references. There's
+-        // potential for further optimization if this is fixed properly.
+-        if (!optimizerCompactPhis(context)) {
+-            return false;
++            if (!optimizerCompactPhis(context)) {
++                return false;
++            }
++
++            const uint32_t *optimizedWords =
++                reinterpret_cast<const uint32_t *>(
++                    context.optimizedData.data()
++                );
++            const size_t optimizedWordCount =
++                context.optimizedData.size() / sizeof(uint32_t);
++            size_t deletedWordCount = 0;
++            for (size_t word = 5; word < optimizedWordCount; word++) {
++                deletedWordCount += optimizedWords[word] == UINT32_MAX;
++            }
++
++            if (deletedWordCount == previousDeletedWordCount) {
++                break;
++            }
++
++            previousDeletedWordCount = deletedWordCount;
+         }
+ 
+         if (!optimizerCompactData(context)) {
+@@ -1697,4 +1734,4 @@ namespace respv {
+ 
+         return true;
+     }
+-};
+\ No newline at end of file
++};

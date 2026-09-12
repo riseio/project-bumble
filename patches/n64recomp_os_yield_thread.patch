@@ -1,0 +1,16 @@
+diff --git a/src/symbol_lists.cpp b/src/symbol_lists.cpp
+index 9c8f27d..b1ff83f 100644
+--- a/src/symbol_lists.cpp
++++ b/src/symbol_lists.cpp
+@@ -81,10 +81,11 @@ const std::unordered_set<std::string> N64Recomp::reimplemented_funcs {
+     // Threading functions
+     "osCreateThread",
+     "osStartThread",
+     "osStopThread",
+     "osDestroyThread",
++    "osYieldThread",
+     "osSetThreadPri",
+     "osGetThreadPri",
+     "osGetThreadId",
+     // Message Queue functions
+     "osCreateMesgQueue",

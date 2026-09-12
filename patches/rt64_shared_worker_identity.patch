@@ -1,0 +1,82 @@
+diff --git a/src/render/rt64_render_worker.h b/src/render/rt64_render_worker.h
+--- a/src/render/rt64_render_worker.h
++++ b/src/render/rt64_render_worker.h
+@@ -14,6 +14,8 @@
+     struct RenderWorker {
+         RenderDevice *device = nullptr;
+         std::string name;
++        uint64_t profilerWorkerId = 0, profilerLogicalQueueId = 0, profilerNativeQueueId = 0;
++        RenderCommandListType commandListType = RenderCommandListType::UNKNOWN;
+         std::unique_ptr<RenderCommandQueue> ownedCommandQueue;
+         RenderCommandQueue *commandQueue = nullptr;
+         std::shared_ptr<std::mutex> commandQueueMutex;
+diff --git a/src/render/rt64_render_worker.cpp b/src/render/rt64_render_worker.cpp
+--- a/src/render/rt64_render_worker.cpp
++++ b/src/render/rt64_render_worker.cpp
+@@ -4,7 +4,7 @@
+ 
+ #include "rt64_render_worker.h"
+ 
+-#include <functional>
++#include "rt64_profiler_worker_identity.h"
+ 
+ #include "common/rt64_performance_profiler.h"
+ 
+@@ -17,6 +17,7 @@
+ 
+         this->device = device;
+         this->name = name;
++        this->commandListType = commandListType;
+ 
+         if (sharedQueueWorker != nullptr) {
+             assert(sharedQueueWorker->commandQueue != nullptr);
+@@ -37,17 +38,13 @@
+         commandList = commandQueue->createCommandList();
+         commandFence = device->createCommandFence();
+ 
+-        const uint64_t workerId = std::hash<std::string>{}(name);
+-        PerformanceProfiler::setMetadata(
+-            "render_worker." + std::to_string(workerId),
+-            name
+-        );
+-    }
+-
+-    RenderWorker::~RenderWorker() { }
++        ProfilerWorkerIdentity::assign(this, sharedQueueWorker);
++    }
++
++    RenderWorker::~RenderWorker() { ProfilerWorkerIdentity::retire(this); }
+ 
+     void RenderWorker::execute() {
+-        const uint64_t workerId = std::hash<std::string>{}(name);
++        const uint64_t workerId = profilerWorkerId;
+         PerformanceScope ownershipWaitScope(
+             PerformanceCategory::Wait,
+             "RenderWorker.SubmissionOwnershipWait",
+@@ -89,7 +86,7 @@
+         uint32_t waitSemaphoreCount,
+         RenderCommandSemaphore **signalSemaphores,
+         uint32_t signalSemaphoreCount) {
+-        const uint64_t workerId = std::hash<std::string>{}(name);
++        const uint64_t workerId = profilerWorkerId;
+         const RenderCommandList *submittedCommandList = commandList.get();
+         PerformanceScope ownershipWaitScope(
+             PerformanceCategory::Wait,
+@@ -138,7 +135,7 @@
+     }
+ 
+     bool RenderWorker::executeIfQueueIdle() {
+-        const uint64_t workerId = std::hash<std::string>{}(name);
++        const uint64_t workerId = profilerWorkerId;
+         const std::scoped_lock submissionLock(submissionMutex);
+         if (pendingSubmissions.load(std::memory_order_acquire) != 0u) {
+             return false;
+@@ -222,7 +219,7 @@
+     }
+ 
+     bool RenderWorker::waitIfPending() {
+-        const uint64_t workerId = std::hash<std::string>{}(name);
++        const uint64_t workerId = profilerWorkerId;
+         const std::scoped_lock submissionLock(submissionMutex);
+         return retirePendingSubmissionLocked(workerId);
+     }

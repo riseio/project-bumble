@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "source": "Buck Bumble US revision-0 gameplay HUD texture inventory",
+  "rom": {
+    "size": 12582912,
+    "sha256": "d21e3d1c2ec4d7f025cfaa119553be9a5fa87a9fd6625ef1ef44dc1d4b0aa54b"
+  },
+  "rt64_hash_version": 5,
+  "upscale": {
+    "algorithm": "palette_preserving_scale2x",
+    "scale": 32,
+    "output_width": 1024,
+    "output_height": 1024,
+    "purpose": "faithful crisp 4K HUD remaster without invented artwork"
+  },
+  "textures": [
+    {
+      "id": "weapon_surface_03036400",
+      "rt64_hash": "5b500b6598c53d16",
+      "rom_offset": "0x005703F0",
+      "source_format": "RGBA16_BE",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 2048,
+      "source_sha256": "90d868cfe341c72ac67eeb5415975e7eb926415bfe761863322b7899b3b15be5"
+    },
+    {
+      "id": "weapon_surface_03039400",
+      "rt64_hash": "1f175a9a2915146f",
+      "rom_offset": "0x005733F0",
+      "source_format": "RGBA16_BE",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 2048,
+      "source_sha256": "c9096418ff07c770522c6a0b8c464748233411deed2bb2944bfb2e9cd4e6d237"
+    },
+    {
+      "id": "weapon_surface_0303CC00",
+      "rt64_hash": "fd0fed1e7720c49d",
+      "rom_offset": "0x00576BF0",
+      "source_format": "RGBA16_BE",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 2048,
+      "source_sha256": "117e91a80e55bbe1d220de75ea49fb1fe7fa0351d0cf6afd3d40f85126e42734"
+    },
+    {
+      "id": "weapon_surface_0303D400",
+      "rt64_hash": "a3610d49ef236262",
+      "rom_offset": "0x005773F0",
+      "source_format": "RGBA16_BE",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 2048,
+      "source_sha256": "a401c46cf164bd8416a2bfa527bbe6a99b0c678409a975c344e32d86c66a5966"
+    },
+    {
+      "id": "weapon_surface_0303DC00",
+      "rt64_hash": "ddc5c435290906cf",
+      "rom_offset": "0x00577BF0",
+      "source_format": "RGBA16_BE",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 2048,
+      "source_sha256": "ab528c45cc692bb903f6de4f59c7d772e87c5fd6173e80ea4b62e663836f644e"
+    },
+    {
+      "id": "weapon_surface_03040400",
+      "rt64_hash": "8e727ba47b90502f",
+      "rom_offset": "0x0057A3F0",
+      "source_format": "RGBA16_BE",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 2048,
+      "source_sha256": "c7bab8b44b347ff9dbe4092b3e0e44105821a8cdc9917ae69f41cef92d584ce6"
+    },
+    {
+      "id": "weapon_surface_0304AC00",
+      "rt64_hash": "e0bb7bcda724f2b2",
+      "rom_offset": "0x00584BF0",
+      "source_format": "RGBA16_BE",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 2048,
+      "source_sha256": "ba0eb2b98b5170dc1414103c18b9a08a7717f6d1ed84796d7af61758ab8f92f1"
+    },
+    {
+      "id": "life_indicator_buck_head",
+      "rt64_hash": "595e04223032b6af",
+      "rom_offset": "0x000D3B80",
+      "source_format": "RGBA32",
+      "source_width": 32,
+      "source_height": 32,
+      "source_size": 4096,
+      "source_sha256": "e3e41d5b5e878c626c3b8b0a46a235edb2bce92d01549e9a8601a30f09824624"
+    }
+  ],
+  "dynamic_assets": [
+    {
+      "id": "radar_display",
+      "policy": "retain_live_dynamic_texture_and_scale_vector_geometry_at_output_resolution",
+      "reason": "The 32x32 radar texture is rewritten by the game and has multiple runtime hashes; a static replacement would freeze its live markings."
+    }
+  ]
+}

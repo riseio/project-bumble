@@ -1,0 +1,279 @@
+diff --git a/ultramodern/include/ultramodern/diagnostic_vi_messages.hpp b/ultramodern/include/ultramodern/diagnostic_vi_messages.hpp
+new file mode 100644
+--- /dev/null
++++ b/ultramodern/include/ultramodern/diagnostic_vi_messages.hpp
+@@ -0,0 +1,85 @@
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++
++namespace ultramodern::diagnostic_vi {
++    enum class Event : uint32_t {
++        Generated = 1, Delivered, Consumed, DeliveryBlocked, TrackingLost,
++        QueueReset, StateReset, SlotChanged, SlotReplaced
++    };
++    using Callback = void(Event, uint64_t, uint32_t, uint32_t, uint32_t);
++    inline std::atomic<Callback *> callback{nullptr};
++    inline std::atomic<uint64_t> nextSequence{1};
++    void setCallback(Callback *sink);
++
++    inline void emit(Event event, uint64_t sequence, uint32_t queue,
++        uint32_t guestThread = 0, uint32_t slot = 0) {
++        if (auto *sink = callback.load(std::memory_order_relaxed)) {
++            sink(event, sequence, queue, guestThread, slot);
++        }
++    }
++
++    // Assign VI identity at the producer, not from guest message values.
++    inline uint64_t generated(uint32_t queue) {
++        if (!callback.load(std::memory_order_relaxed)) return 0;
++        const uint64_t sequence = nextSequence.fetch_add(1, std::memory_order_relaxed);
++        if (sequence) emit(Event::Generated, sequence, queue);
++        else emit(Event::TrackingLost, 0, queue);
++        return sequence;
++    }
++
++    struct Slot {
++        uint32_t address = 0, queue = 0, value = 0;
++        uint64_t sequence = 0;
++    };
++
++    // Only the runtime's serialized guest execution owner accesses this table.
++    template<std::size_t Capacity = 4096> class Slots {
++        static_assert(Capacity > 0);
++        std::array<Slot, Capacity> slots{};
++        static std::size_t index(uint32_t address) {
++            return ((address >> 2) * uint32_t(2654435761U)) % Capacity;
++        }
++    public:
++        void written(uint32_t address, uint32_t queue, uint32_t value, uint64_t sequence) {
++            if (!callback.load(std::memory_order_relaxed)) return;
++            auto &slot = slots[index(address)];
++            if (!sequence && slot.address != address) return;
++            if (slot.sequence) {
++                emit(slot.address == address ? Event::SlotReplaced : Event::TrackingLost,
++                    slot.sequence, slot.queue, 0, slot.address);
++            }
++            // Clear old tags on guest writes, including aliased queue storage.
++            slot = sequence ? Slot{address, queue, value, sequence} : Slot{};
++            if (sequence) emit(Event::Delivered, sequence, queue, 0, address);
++        }
++        void consumed(uint32_t address, uint32_t queue, uint32_t value, uint32_t guestThread) {
++            if (!callback.load(std::memory_order_relaxed)) return;
++            auto &slot = slots[index(address)];
++            if (!slot.sequence || slot.address != address) return;
++            const Slot old = slot;
++            slot = {};
++            if (old.queue == queue && old.value == value) {
++                emit(Event::Consumed, old.sequence, queue, guestThread, address);
++            }
++            else emit(Event::SlotChanged, old.sequence, old.queue, guestThread, address);
++        }
++        void resetQueue(uint32_t queue) {
++            if (!callback.load(std::memory_order_relaxed)) return;
++            for (auto &slot : slots) {
++                if (slot.sequence && slot.queue == queue) {
++                    emit(Event::QueueReset, slot.sequence, queue, 0, slot.address);
++                    slot = {};
++                }
++            }
++        }
++        void resetState() {
++            for (auto &slot : slots) slot = {};
++            emit(Event::StateReset, 0, 0);
++        }
++    };
++    inline Slots<> slots;
++}
+diff --git a/ultramodern/include/ultramodern/rt64_guest_vi_bridge.hpp b/ultramodern/include/ultramodern/rt64_guest_vi_bridge.hpp
+new file mode 100644
+--- /dev/null
++++ b/ultramodern/include/ultramodern/rt64_guest_vi_bridge.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++
++// Include after common/rt64_performance_profiler.h in the host that already owns both APIs.
++#include "ultramodern/diagnostic_vi_messages.hpp"
++
++namespace RT64::ProfilerGuestVI {
++    inline void observe(ultramodern::diagnostic_vi::Event event, uint64_t sequence,
++        uint32_t queue, uint32_t guestThread, uint32_t slot) {
++        using Event = ultramodern::diagnostic_vi::Event;
++        static constexpr const char *names[] = {"GuestVI.Invalid", "GuestVI.Generated",
++            "GuestVI.Delivered", "GuestVI.Consumed", "GuestVI.DeliveryBlocked", "GuestVI.TrackingLost",
++            "GuestVI.QueueReset", "GuestVI.StateReset", "GuestVI.SlotChanged", "GuestVI.SlotReplaced"};
++        const auto value = static_cast<uint32_t>(event);
++        if (value == 0 || value >= sizeof(names) / sizeof(names[0])) return;
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::CPU, names[value],
++            sequence, (uint64_t(queue) << 32) | guestThread, slot);
++    }
++
++    inline void install() {
++        if (!PerformanceProfiler::enabled()) return;
++        PerformanceProfiler::setMetadata("producer.guest_vi.supported", "1");
++        PerformanceProfiler::setMetadata("producer.guest_vi.enabled", "1");
++        PerformanceProfiler::setMetadata("producer.guest_vi.owner", "guest_retrace_consumption");
++        ultramodern::diagnostic_vi::setCallback(observe);
++    }
++}
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -5,15 +5,22 @@
+ 
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
++#include "ultramodern/diagnostic_vi_messages.hpp"
+ 
+ struct QueuedMessage {
+     PTR(OSMesgQueue) mq;
+     OSMesg mesg;
+     bool jam;
+     bool requeue_if_blocked;
++    uint64_t diagnosticVISequence = 0;
+ };
+ 
+ static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
++
++void ultramodern::diagnostic_vi::setCallback(Callback *sink) {
++    callback.store(sink, std::memory_order_release);
++}
++
+ std::bitset<32> requeue_enabled;
+ 
+ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueControl& mqc) {
+@@ -28,47 +35,67 @@
+ }
+ 
+ void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
+-    external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
++    const auto sequence = src == EventMessageSource::Vi ? diagnostic_vi::generated(uint32_t(mq)) : 0;
++    if (!external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)], sequence}) && sequence) {
++        diagnostic_vi::emit(diagnostic_vi::Event::TrackingLost, sequence, uint32_t(mq));
++    }
+ }
+ 
+ void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
+     external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
+ }
+ 
+-bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
++void ultramodern::enqueue_external_vi_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
++    const auto sequence = diagnostic_vi::generated(uint32_t(mq));
++    if (!external_messages.enqueue({mq, msg, jam, requeue_if_blocked, sequence}) && sequence) {
++        diagnostic_vi::emit(diagnostic_vi::Event::TrackingLost, sequence, uint32_t(mq));
++    }
++}
++
++bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, uint64_t diagnosticVISequence = 0);
+ 
+ void dequeue_external_messages(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     std::vector<QueuedMessage> requeued_messages{};
+     while (external_messages.try_dequeue(to_send)) {
+-        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
++        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false, to_send.diagnosticVISequence) && to_send.requeue_if_blocked) {
+             requeued_messages.push_back(to_send);
+         }
+     }
+     for (QueuedMessage& cur_mesg : requeued_messages) {
+-        external_messages.enqueue(cur_mesg);
++        if (!external_messages.enqueue(cur_mesg) && cur_mesg.diagnosticVISequence) {
++            ultramodern::diagnostic_vi::emit(ultramodern::diagnostic_vi::Event::TrackingLost,
++                cur_mesg.diagnosticVISequence, uint32_t(cur_mesg.mq));
++        }
+     }
+ }
+ 
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     external_messages.wait_dequeue(to_send);
+-    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-        external_messages.enqueue(to_send);
++    if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false, to_send.diagnosticVISequence) && to_send.requeue_if_blocked) {
++        if (!external_messages.enqueue(to_send) && to_send.diagnosticVISequence) {
++            ultramodern::diagnostic_vi::emit(ultramodern::diagnostic_vi::Event::TrackingLost,
++                to_send.diagnosticVISequence, uint32_t(to_send.mq));
++        }
+     }
+ }
+ 
+ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+     QueuedMessage to_send;
+     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+-        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+-            external_messages.enqueue(to_send);
++        if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false, to_send.diagnosticVISequence) && to_send.requeue_if_blocked) {
++            if (!external_messages.enqueue(to_send) && to_send.diagnosticVISequence) {
++            ultramodern::diagnostic_vi::emit(ultramodern::diagnostic_vi::Event::TrackingLost,
++                to_send.diagnosticVISequence, uint32_t(to_send.mq));
++        }
+         }
+     }
+ }
+ 
+ extern "C" void osCreateMesgQueue(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg, s32 count) {
+     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
++    ultramodern::diagnostic_vi::slots.resetQueue(uint32_t(mq_));
+     mq->blocked_on_recv = NULLPTR;
+     mq->blocked_on_send = NULLPTR;
+     mq->msgCount = count;
+@@ -89,11 +116,13 @@
+     return MQ_GET_COUNT(mq) >= mq->msgCount;
+ }
+ 
+-bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
++bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block, uint64_t diagnosticVISequence) {
+     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+     if (!block) {
+         // If non-blocking, fail if the queue is full.
+         if (MQ_IS_FULL(mq)) {
++            if (diagnosticVISequence) ultramodern::diagnostic_vi::emit(
++                ultramodern::diagnostic_vi::Event::DeliveryBlocked, diagnosticVISequence, uint32_t(mq_));
+             return false;
+         }
+     }
+@@ -110,12 +139,16 @@
+         // Jams insert at the head of the message queue's buffer.
+         mq->first = (mq->first + mq->msgCount - 1) % mq->msgCount;
+         TO_PTR(OSMesg, mq->msg)[mq->first] = msg;
++        ultramodern::diagnostic_vi::slots.written(
++            uint32_t(mq->msg) + uint32_t(mq->first) * sizeof(OSMesg), uint32_t(mq_), uint32_t(msg), diagnosticVISequence);
+         mq->validCount++;
+     }
+     else {
+         // Sends insert at the tail of the message queue's buffer.
+         s32 last = (mq->first + mq->validCount) % mq->msgCount;
+         TO_PTR(OSMesg, mq->msg)[last] = msg;
++        ultramodern::diagnostic_vi::slots.written(
++            uint32_t(mq->msg) + uint32_t(last) * sizeof(OSMesg), uint32_t(mq_), uint32_t(msg), diagnosticVISequence);
+         mq->validCount++;
+     }
+ 
+@@ -144,6 +177,12 @@
+         }
+     }
+ 
++    if (ultramodern::diagnostic_vi::callback.load(std::memory_order_relaxed)) {
++        ultramodern::diagnostic_vi::slots.consumed(
++            uint32_t(mq->msg) + uint32_t(mq->first) * sizeof(OSMesg), uint32_t(mq_),
++            uint32_t(TO_PTR(OSMesg, mq->msg)[mq->first]), uint32_t(ultramodern::this_thread()));
++    }
++
+     if (msg_ != NULLPTR) {
+         *TO_PTR(OSMesg, msg_) = TO_PTR(OSMesg, mq->msg)[mq->first];
+     }
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -74,6 +74,7 @@
+ void set_message_queue_control(const MessageQueueControl& mqc);
+ void enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src);
+ void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked);
++void enqueue_external_vi_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked);
+ void wait_for_external_message(RDRAM_ARG1);
+ void wait_for_external_message_timed(RDRAM_ARG1, u32 millis);
+ 

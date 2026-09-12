@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.z64 binary
+*.n64 binary
+*.v64 binary
+*.bin binary

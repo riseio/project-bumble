@@ -1,0 +1,18 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -944,4 +944,7 @@
+ 
+-            bool isDynamicSampler = (range.type == RenderDescriptorRangeType::SAMPLER) && (range.immutableSampler == nullptr);
+-            if (isDynamicSampler) {
++            if (range.immutableSampler != nullptr) {
++                // Static samplers live in the root signature, not either heap.
++                descriptorHeapIndices.emplace_back(UINT32_MAX);
++            }
++            else if (range.type == RenderDescriptorRangeType::SAMPLER) {
+                 descriptorHeapIndices.emplace_back(samplerDescriptorCount);
+@@ -3881,3 +3886,3 @@
+                         staticSampler.MaxLOD = samplerDesc.MaxLOD;
+-                        staticSampler.ShaderRegister = renderRange.binding;
++                        staticSampler.ShaderRegister = renderRange.binding + k;
+                         staticSampler.RegisterSpace = i;

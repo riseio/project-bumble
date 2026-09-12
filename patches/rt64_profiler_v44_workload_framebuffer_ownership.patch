@@ -1,0 +1,236 @@
+diff --git a/src/hle/rt64_present.h b/src/hle/rt64_present.h
+--- a/src/hle/rt64_present.h
++++ b/src/hle/rt64_present.h
+@@ -18,5 +18,7 @@ namespace RT64 {
+         VI screenVI;
+         std::vector<uint8_t> storage;
+         std::vector<FramebufferOperation> fbOperations;
++        // The producer snapshots the color images owned by the workload that created this Present.
++        std::vector<uint32_t> workloadColorImageAddresses;
+         DebuggerFramebuffer debuggerFramebuffer;
+         bool paused = false;
+diff --git a/src/hle/rt64_state.h b/src/hle/rt64_state.h
+--- a/src/hle/rt64_state.h
++++ b/src/hle/rt64_state.h
+@@ -150,7 +150,8 @@ namespace RT64 {
+         void fullSyncFramebufferPairTiles(Workload &workload, FramebufferPair &fbPair, uint32_t &loadOpCursor, uint32_t &rdpTileCursor);
+         void listProcessBegin();
+         void listProcessEnd();
+-        void updateScreen(const VI &newVI, bool fromEarlyPresent);
++        void updateScreen(const VI &newVI, bool fromEarlyPresent,
++            const Workload *sourceWorkload = nullptr);
+         void updateMultisampling();
+         void inspect();
+         void advanceWorkload(Workload &workload, bool paused);
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "rt64_state.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cinttypes>
+ 
+@@ -1939,7 +1940,7 @@ namespace RT64 {
+                         (colorImg.width == fbSize.x) &&
+                         (colorImg.siz == fbSiz))
+                     {
+-                        updateScreen(entry.vi, true);
++                        updateScreen(entry.vi, true, &workload);
+                         viPresented = true;
+                         earlyPresentSubmitted = true;
+                         earlyPresentMatchedAddress = colorImg.address;
+@@ -1989,7 +1990,8 @@ namespace RT64 {
+         );
+     }
+     
+-    void State::updateScreen(const VI &newVI, bool fromEarlyPresent) {
++    void State::updateScreen(const VI &newVI, bool fromEarlyPresent,
++        const Workload *sourceWorkload) {
+         PerformanceScope screenScope(
+             PerformanceCategory::Frame,
+             "State.UpdateScreenAndSubmit",
+@@ -2025,7 +2027,21 @@ namespace RT64 {
+         const int presentCursor = ext.presentQueue->writeCursor;
+         Present &present = ext.presentQueue->presents[presentCursor];
+         present.fbOperations.clear();
+         present.storage.clear();
++        present.workloadColorImageAddresses.clear();
++        if (sourceWorkload != nullptr) {
++            for (uint32_t f = 0; f < sourceWorkload->fbPairCount; ++f) {
++                const uint32_t address =
++                    sourceWorkload->fbPairs[f].colorImage.address;
++                if (std::find(
++                        present.workloadColorImageAddresses.begin(),
++                        present.workloadColorImageAddresses.end(),
++                        address
++                    ) == present.workloadColorImageAddresses.end()) {
++                    present.workloadColorImageAddresses.emplace_back(address);
++                }
++            }
++        }
+ 
+         const bool presentEarly = !ext.presentQueue->viewRDRAM && (ext.enhancementConfig->presentation.mode == EnhancementConfiguration::Presentation::Mode::PresentEarly);
+         const uint32_t screenFbAddress = newVI.fbAddress();
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -893,6 +893,8 @@ namespace RT64 {
+         bool consumesInterpolationSequence = false;
+         bool interpolationSequenceFullyQueued = false;
+         bool interpolationFramebufferMismatch = false;
++        bool workloadFramebufferInventoryAvailable = false;
++        bool workloadFramebufferOwnerMatched = false;
+         bool retainWorkloadLock = false;
+         InterpolatedFrameCounters unmatchedFrameCounters;
+         InterpolatedFrameCounters *matchingFrameCounters = nullptr;
+@@ -952,7 +954,10 @@ namespace RT64 {
+             }
+             
+             if ((presentFb != nullptr) && (viFb != nullptr)) {
+-                for (uint32_t colorAddress : ext.sharedResources->colorImageAddressVector) {
++                workloadFramebufferInventoryAvailable =
++                    !present.workloadColorImageAddresses.empty();
++                for (uint32_t colorAddress :
++                    present.workloadColorImageAddresses) {
+                     Framebuffer *colorFb = fbManager.find(colorAddress);
+                     if (colorFb == nullptr) {
+                         continue;
+@@ -978,6 +983,7 @@ namespace RT64 {
+                     // so interpolation is possible.
+                     if (colorFb == presentFb) {
+                         presentFb->interpolationEnabled = true;
++                        workloadFramebufferOwnerMatched = true;
+                         break;
+                     }
+                 }
+@@ -1084,7 +1090,13 @@ namespace RT64 {
+                     (counterTargetAddress != 0u &&
+                         counterTargetAddress != presentFb->addressStart
+                         ? (1u << 3u)
+-                        : 0u);
++                        : 0u) |
++                    (workloadFramebufferInventoryAvailable
++                        ? (1u << 4u)
++                        : 0u) |
++                    (workloadFramebufferOwnerMatched
++                        ? (1u << 5u)
++                        : 0u);
+                 PerformanceProfiler::recordInstant(
+                     PerformanceCategory::Frame,
+                     "Present.InterpolationResolved",
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -2025,8 +2025,8 @@ namespace RT64 {
+                 {
+                     std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
+                     FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
+-                    std::vector<uint32_t> &colorVector = ext.sharedResources->colorImageAddressVector;
+-                    std::unordered_set<uint32_t> &colorSet = ext.sharedResources->colorImageAddressSet;
++                    thread_local std::vector<uint32_t> colorVector;
++                    thread_local std::unordered_set<uint32_t> colorSet;
+                     colorVector.clear();
+                     colorSet.clear();
+                     for (int32_t f = workload.fbPairCount - 1; f >= 0; f--) {
+diff --git a/src/hle/rt64_shared_queue_resources.h b/src/hle/rt64_shared_queue_resources.h
+--- a/src/hle/rt64_shared_queue_resources.h
++++ b/src/hle/rt64_shared_queue_resources.h
+@@ -66,8 +66,6 @@ namespace RT64 {
+ 
+         // Workload to present state.
+         uint32_t viOriginalRate = 0;
+-        std::vector<uint32_t> colorImageAddressVector;
+-        std::unordered_set<uint32_t> colorImageAddressSet;
+         std::vector<std::unique_ptr<RenderTarget>> interpolatedColorTargets;
+         std::vector<std::unique_ptr<RenderCommandSemaphore>>
+             interpolatedTargetReadySemaphores;
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -2139,6 +2139,9 @@ namespace RT64 {
+             uint64_t interpolationFramebufferMismatchCount = 0;
+             uint64_t interpolationFramebufferMismatchPresentedCount = 0;
+             uint64_t interpolationFramebufferMismatchRejectedCount = 0;
++            uint64_t presentationFramebufferInventoryCount = 0;
++            uint64_t presentationFramebufferOwnerMatchedCount = 0;
++            uint64_t presentationFramebufferOwnerMissingCount = 0;
+             uint64_t earlyPresentDecisionCount = 0;
+             uint64_t earlyPresentEnabledCount = 0;
+             uint64_t earlyPresentCandidateCount = 0;
+@@ -2398,6 +2401,19 @@ namespace RT64 {
+                                 framebufferMismatch && consumed ? 1u : 0u;
+                             interpolationFramebufferMismatchRejectedCount +=
+                                 framebufferMismatch && !consumed ? 1u : 0u;
++                            const bool workloadFramebufferInventory =
++                                (flags & (1u << 4u)) != 0u;
++                            const bool workloadFramebufferOwnerMatched =
++                                (flags & (1u << 5u)) != 0u;
++                            presentationFramebufferInventoryCount +=
++                                workloadFramebufferInventory ? 1u : 0u;
++                            presentationFramebufferOwnerMatchedCount +=
++                                workloadFramebufferOwnerMatched ? 1u : 0u;
++                            presentationFramebufferOwnerMissingCount +=
++                                workloadFramebufferInventory &&
++                                    !workloadFramebufferOwnerMatched
++                                ? 1u
++                                : 0u;
+                         }
+                         else if (eventName ==
+                             "State.FullSyncEarlyPresentDecision") {
+@@ -4621,7 +4637,16 @@ namespace RT64 {
+                 (presentationSlotCompletionP95 > budget);
+             const bool presentedInterpolationFramebufferMismatch =
+                 interpolationFramebufferMismatchPresentedCount > 0u;
+-            if (presentedInterpolationFramebufferMismatch) {
++            const bool presentationFramebufferOwnerMissing =
++                presentationFramebufferOwnerMissingCount > 0u;
++            if (presentationFramebufferOwnerMissing) {
++                diagnosis =
++                    "PRESENT_FRAMEBUFFER_WORKLOAD_OWNERSHIP_MISSING";
++                confidence = "high";
++                primaryStage = "Present.InterpolationResolved";
++                primaryP95 = 0.0;
++            }
++            else if (presentedInterpolationFramebufferMismatch) {
+                 diagnosis =
+                     "PRESENTED_INTERPOLATION_FRAMEBUFFER_IDENTITY_MISMATCH";
+                 confidence = "high";
+@@ -4694,6 +4720,7 @@ namespace RT64 {
+             if (observedCadenceWithinTolerance &&
+                 !hardInterpolationFailure &&
+                 !presentedInterpolationFramebufferMismatch &&
++                !presentationFramebufferOwnerMissing &&
+                 !observedOutputContradiction) {
+                 if (dynamicVertexCoverageGap) {
+                     diagnosis =
+@@ -4732,4 +4759,5 @@ namespace RT64 {
+                     !gpuIdleClockMaintenanceStarved &&
+                     !threadSchedulingDeadlineMiss &&
+                     !presentedInterpolationFramebufferMismatch &&
++                    !presentationFramebufferOwnerMissing &&
+                     (earlyPresentSubmissionMissCount <= 2u)) {
+@@ -4816,7 +4844,7 @@ namespace RT64 {
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v43\",\n";
++            output << "{\n  \"schema\": \"rt64-performance-summary-v44\",\n";
+             output << "  \"capture_mode\": \""
+                 << (profiler.lowOverhead ? "low_overhead" : "detailed")
+                 << "\",\n";
+@@ -5153,6 +5181,12 @@ namespace RT64 {
+                 << interpolationFramebufferMismatchPresentedCount
+                 << ",\"framebuffer_mismatch_rejected_count\":"
+                 << interpolationFramebufferMismatchRejectedCount
++                << ",\"workload_framebuffer_inventory_count\":"
++                << presentationFramebufferInventoryCount
++                << ",\"workload_framebuffer_owner_matched_count\":"
++                << presentationFramebufferOwnerMatchedCount
++                << ",\"workload_framebuffer_owner_missing_count\":"
++                << presentationFramebufferOwnerMissingCount
+                 << ",\"early_present_decision_count\":"
+                 << earlyPresentDecisionCount
+                 << ",\"early_present_enabled_count\":"

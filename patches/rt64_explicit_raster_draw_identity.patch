@@ -1,0 +1,65 @@
+diff --git a/src/shaders/RasterDrawIndex.hlsli b/src/shaders/RasterDrawIndex.hlsli
+new file mode 100644
+--- /dev/null
++++ b/src/shaders/RasterDrawIndex.hlsli
+@@ -0,0 +1,10 @@
++#pragma once
++#include "shared/rt64_raster_params.h"
++#include "Library.hlsli"
++
++[[vk::push_constant]] ConstantBuffer<RasterParams> gConstants : register(b0, space0);
++
++// D3D12 SV_InstanceID excludes StartInstanceLocation; Vulkan InstanceIndex includes firstInstance.
++LIBRARY_EXPORT uint getRasterDrawIndex() {
++    return gConstants.renderIndex;
++}
+diff --git a/src/shaders/RasterVS.hlsl b/src/shaders/RasterVS.hlsl
+--- a/src/shaders/RasterVS.hlsl
++++ b/src/shaders/RasterVS.hlsl
+@@ -11,3 +11,3 @@
+ 
+-[[vk::push_constant]] ConstantBuffer<RasterParams> gConstants : register(b0, space0);
++#include "RasterDrawIndex.hlsli"
+ 
+@@ -217,3 +217,2 @@
+     , in float4 iWorldNormal : NORMAL0
+-    , in uint renderIndex : SV_InstanceID
+     , out float4 oPosition : SV_POSITION
+@@ -237,3 +236,4 @@
+     float4 oFlatColor;
+ #endif
++    const uint renderIndex = getRasterDrawIndex();
+     RasterVS(
+diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
+--- a/src/render/rt64_raster_shader.cpp
++++ b/src/render/rt64_raster_shader.cpp
+@@ -554,2 +554,3 @@
+         vss <<
++            "uint getRasterDrawIndex();"
+             "void RasterVS(const RenderParams, const uint, const uint, in float4, in float2, in float4, in float4, in float4, out float4, out float2, out float4, out float4, out float4, out float4, out float4, out float4);"
+@@ -561,3 +562,2 @@
+             "   in float4 iWorldNormal : NORMAL0,"
+-            "   in uint renderIndex : SV_InstanceID,"
+             "   out float4 oPosition : SV_POSITION,"
+@@ -583,2 +583,3 @@
+         vss <<
++            "   const uint renderIndex = getRasterDrawIndex();"
+             "   RasterVS(getRenderParams(), " + std::to_string(desc.bumbleShaderFamily()) + "U, renderIndex, iPosition, iUV, iColor, iWorldPosition, iWorldNormal, oPosition, oUV, oSmoothColor, oFlatColor, oWorldPosition, oWorldNormal, oShadowPosition, oDynamicShadowPosition);"
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2598,3 +2598,3 @@
+                 profileGeometryRasterSubmitted(renderIndicesVector[renderIndex].instanceIndex);
+-                worker->commandList->drawIndexedInstanced(drawCall.triangles.faceCount * 3, 1, drawCall.triangles.indexStart, 0, renderIndex);
++                worker->commandList->drawIndexedInstanced(drawCall.triangles.faceCount * 3, 1, drawCall.triangles.indexStart, 0, 0);
+             }
+@@ -2601,3 +2601,3 @@
+             else {
+-                worker->commandList->drawInstanced(drawCall.triangles.faceCount * 3, 1, drawCall.triangles.indexStart, renderIndex);
++                worker->commandList->drawInstanced(drawCall.triangles.faceCount * 3, 1, drawCall.triangles.indexStart, 0);
+             }
+@@ -2720,3 +2720,4 @@
+                 
++                rasterParams.renderIndex = i;
+                 rasterParams.bumbleShaderVariant =
+                     triangles.shaderDesc.bumbleShaderVariant;

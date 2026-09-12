@@ -1,0 +1,26 @@
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index 454b9de..8562812 100644
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -804,6 +804,7 @@ namespace RT64 {
+             break;
+         }
+         case DeveloperShortcut::Replacements: {
++            const std::lock_guard lock(textureCache->textureMapMutex);
+             textureCache->textureMap.replacementMapEnabled = !textureCache->textureMap.replacementMapEnabled;
+             break;
+         }
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+index 4dbbab2..ce8fb36 100644
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -142,7 +142,8 @@ namespace RT64 {
+         std::vector<AccessList::iterator> listIterators;
+         std::vector<Texture *> evictedTextures;
+         ReplacementMap replacementMap;
+-        bool replacementMapEnabled;
++        // Atomic reads let the host skip unchanged options without waiting on uploads.
++        std::atomic_bool replacementMapEnabled{true};
+ 
+         TextureMap();
+         ~TextureMap();

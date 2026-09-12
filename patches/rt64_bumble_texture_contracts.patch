@@ -1,0 +1,221 @@
+diff --git a/src/common/rt64_tmem_hasher.h b/src/common/rt64_tmem_hasher.h
+index 9a332ab..bc25aa4 100644
+--- a/src/common/rt64_tmem_hasher.h
++++ b/src/common/rt64_tmem_hasher.h
+@@ -198,6 +198,8 @@ namespace RT64 {
+         }
+ 
+         static bool requiresRawTMEM(const LoadTile &loadTile, uint16_t width, uint16_t height) {
++            // With no row advance, odd-row word swapping can read outside a decoded rectangle's hash span.
++            if (loadTile.line == 0) return true;
+             const uint32_t TMEMBytes = 4096;
+             const bool RGBA32 = (loadTile.siz == G_IM_SIZ_32b) && (loadTile.fmt == G_IM_FMT_RGBA);
+             const uint32_t tmemSize = RGBA32 ? (TMEMBytes >> 1) : TMEMBytes;
+@@ -206,4 +209,4 @@ namespace RT64 {
+             return (bytesToHash > tmemSize);
+         }
+     };
+-};
+\ No newline at end of file
++};
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 52169a2..978599c 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -260,13 +260,7 @@ namespace RT64 {
+                     const uint32_t callTileIndex = drawCall.tileIndex + t;
+                     auto &dstCallTile = drawData.callTiles[callTileIndex];
+ 
+-                    // Failsafe cases.
+-                    if (tile.line == 0) {
+-                        assert((drawCall.otherMode.cycleType() != G_CYC_COPY) && "Copy mode should be able to work even with tiles that aren't defined.");
+-                        dstCallTile.valid = false;
+-                        continue;
+-                    }
+-
++                    // Zero stride is still authored TMEM addressing, not an invalid/unbound shader tile.
+                     dstCallTile.valid = true;
+                     dstCallTile.loadTile = tile;
+                     dstCallTile.reinterpretTile = false;
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index b2b5726..3e1be02 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2134,9 +2134,7 @@ namespace RT64 {
+         textureCacheVersions = textureCache->textureMap.versions;
+         textureCacheTextures = textureCache->textureMap.textures;
+         textureCacheTextureReplacements = textureCache->textureMap.textureReplacements;
+-        textureCacheDescriptorIndices.assign(textureCacheTextures.size(), UINT32_MAX);
+-        staticTextureBindings.clear();
+-        textureCacheSize = 0;
++        textureIndices.reset(textureCacheTextures.size());
+         textureCacheGlobalVersion = textureCache->textureMap.globalVersion;
+         textureCacheReplacementMapEnabled = textureCache->textureMap.replacementMapEnabled;
+         dynamicTextureViewVector.clear();
+@@ -2194,12 +2192,7 @@ namespace RT64 {
+                 gpuTile.ulScale.y = gpuTile.tcScale.y;
+                 gpuTile.texelShift = { 0, 0 };
+                 gpuTile.texelMask = { UINT_MAX, UINT_MAX };
+-                uint32_t &descriptorIndex = textureCacheDescriptorIndices.at(textureIndex);
+-                if (descriptorIndex == UINT32_MAX) {
+-                    descriptorIndex = getDestinationIndex();
+-                    staticTextureBindings.emplace_back(descriptorIndex, textureIndex);
+-                }
+-                gpuTile.textureIndex = descriptorIndex;
++                gpuTile.textureIndex = textureIndices.mapStatic(textureIndex);
+                 gpuTile.flags.alphaIsCvg = false;
+                 gpuTile.flags.highRes = textureReplaced;
+                 gpuTile.flags.fromCopy = false;
+@@ -2213,9 +2206,6 @@ namespace RT64 {
+     uint32_t FramebufferRenderer::getDestinationIndex() {
+         // Only textures referenced by this submission consume shader slots.
+-        if (textureCacheSize >= FramebufferRendererDescriptorTextureSet::UpperRange) {
+-            throw std::runtime_error("RT64 submission exceeds texture descriptor capacity");
+-        }
+-        return textureCacheSize++;
++        return textureIndices.allocate();
+     }
+     
+     uint32_t FramebufferRenderer::getTextureIndex(RenderTarget *renderTarget) {
+@@ -2226,6 +2216,7 @@ namespace RT64 {
+     }
+ 
+     uint32_t FramebufferRenderer::getTextureIndex(const RenderTexture *texture, const RenderTextureView *view) {
++        if (texture == nullptr) throw std::invalid_argument("RT64 dynamic texture has no backing resource");
+         auto &indices = dynamicTextureIndices[texture];
+         for (uint32_t index : indices) {
+             const auto &binding = dynamicTextureViewVector[index];
+@@ -2263,7 +2254,7 @@ namespace RT64 {
+         bool &activeTextureReplacementMapEnabled =
+             descriptorTextureReplacementMapEnabled[activeFrameSlot];
+         
+-        const uint32_t requiredSize = std::max(textureCacheSize, 1u);
++        const uint32_t requiredSize = std::max(textureIndices.count, 1u);
+         const bool createSet = (descTextureSet == nullptr) || (descTextureSet->textureCacheSize < requiredSize);
+         if (createSet) {
+             activeTextureSet = std::make_unique<
+@@ -2345,32 +2336,36 @@ namespace RT64 {
+         descCommonSet->setBuffer(descCommonSet->DynamicRenderParams, drawBuffers->renderParamsBuffer.get(), RenderBufferStructuredView(sizeof(interop::RenderParams)));
+ 
+         // Make sure the versions vector matches the texture cache size.
+-        activeTextureVersions.resize(textureCacheSize, 0);
+-        activeCacheIndices.resize(textureCacheSize, UINT32_MAX);
++        activeTextureVersions.resize(textureIndices.count, 0);
++        activeCacheIndices.resize(textureIndices.count, UINT32_MAX);
+ 
+         // Update texture vector with static textures from the cache and dynamic resource views.
+         {
+-            for (const auto &[dstIndex, i] : staticTextureBindings) {
++            for (const auto &[dstIndex, i] : textureIndices.staticBindings) {
+                 if (activeCacheIndices[dstIndex] == i &&
+                     textureCacheVersions[i] == activeTextureVersions[dstIndex]) {
+                     continue;
+                 }
+ 
+-                activeTextureVersions[dstIndex] = textureCacheVersions[i];
+-                activeCacheIndices[dstIndex] = i;
+                 if (textureCacheTextures[i] == nullptr) {
+-                    continue;
++                    throw std::runtime_error("RT64 static texture owner is missing");
+                 }
+ 
++                const RenderTexture *backing = nullptr;
+                 if (textureCacheReplacementMapEnabled && (textureCacheTextureReplacements[i] != nullptr)) {
+-                    descTextureSet->setTexture(dstIndex, textureCacheTextureReplacements[i]->texture.get(), RenderTextureLayout::SHADER_READ);
++                    backing = textureCacheTextureReplacements[i]->texture.get();
+                 }
+                 else if (textureCacheTextures[i]->texture != nullptr) {
+-                    descTextureSet->setTexture(dstIndex, textureCacheTextures[i]->texture.get(), RenderTextureLayout::SHADER_READ);
++                    backing = textureCacheTextures[i]->texture.get();
+                 }
+                 else {
+-                    descTextureSet->setTexture(dstIndex, textureCacheTextures[i]->tmem.get(), RenderTextureLayout::SHADER_READ);
++                    backing = textureCacheTextures[i]->tmem.get();
+                 }
++                if (backing == nullptr) throw std::runtime_error("RT64 static texture has no backing resource");
++                descTextureSet->setTexture(dstIndex, backing, RenderTextureLayout::SHADER_READ);
++                // A failed write must not publish a cache hit for this slot.
++                activeTextureVersions[dstIndex] = textureCacheVersions[i];
++                activeCacheIndices[dstIndex] = i;
+             }
+ 
+             activeTextureGlobalVersion = textureCacheGlobalVersion;
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+index fa16fb9..e42f996 100644
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -6,6 +6,7 @@
+ 
+ #include <array>
+ #include <mutex>
++#include <stdexcept>
+ #include <stdint.h>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -43,6 +44,34 @@
+ #endif
+ 
+ namespace RT64 {
++    // The submission allocator is independent of cache residency/high-water indices.
++    struct SubmissionTextureIndices {
++        const uint32_t capacity;
++        uint32_t count = 0;
++        std::vector<uint32_t> cacheIndices;
++        std::vector<std::pair<uint32_t, uint32_t>> staticBindings;
++
++        explicit SubmissionTextureIndices(uint32_t capacity) : capacity(capacity) { }
++        void reset(size_t cacheSize) {
++            cacheIndices.assign(cacheSize, UINT32_MAX);
++            staticBindings.clear();
++            count = 0;
++        }
++        uint32_t allocate() {
++            if (count >= capacity) throw std::out_of_range("RT64 submission exceeds texture descriptor capacity");
++            return count++;
++        }
++        uint32_t mapStatic(uint32_t cacheIndex) {
++            auto &index = cacheIndices.at(cacheIndex);
++            if (index == UINT32_MAX) {
++                if (count >= capacity) throw std::out_of_range("RT64 submission exceeds texture descriptor capacity");
++                // Publish identity only after the vector insertion succeeds.
++                staticBindings.emplace_back(count, cacheIndex);
++                index = count++;
++            }
++            return index;
++        }
++    };
+     struct DynamicTextureView {
+         const RenderTexture *texture = nullptr;
+         uint32_t dstIndex = 0;
+@@ -94,9 +124,7 @@ namespace RT64 {
+         std::vector<Texture *> textureCacheTextures;
+         std::vector<Texture *> textureCacheTextureReplacements;
+         // Cache indices are persistent identities, not shader array indices.
+-        std::vector<uint32_t> textureCacheDescriptorIndices;
+-        std::vector<std::pair<uint32_t, uint32_t>> staticTextureBindings;
+-        uint32_t textureCacheSize = 0;
++        SubmissionTextureIndices textureIndices{FramebufferRendererDescriptorTextureSet::UpperRange};
+         uint32_t textureCacheGlobalVersion = 0;
+         bool textureCacheReplacementMapEnabled = false;
+         std::vector<InstanceDrawCall> instanceDrawCallVector;
+diff --git a/src/shaders/TextureDecoder.hlsli b/src/shaders/TextureDecoder.hlsli
+index dcc88b2..8053419 100644
+--- a/src/shaders/TextureDecoder.hlsli
++++ b/src/shaders/TextureDecoder.hlsli
+@@ -15,7 +15,8 @@
+ #define RDP_TMEM_MASK16 0x7FF
+ 
+ uint implLoadTMEM(uint relativeAddress, uint maskAddress, uint orAddress, bool oddRow, uint textureStart, uint rowSize, Texture1D<uint> TMEM) {
+-    const uint rowStart = (relativeAddress / rowSize) * rowSize;
++    // Preserve zero row advance and odd-row word swapping without division by zero.
++    const uint rowStart = (relativeAddress / max(rowSize, 1u)) * rowSize;
+     const uint wordIndex = (relativeAddress - rowStart) / 4;
+     const uint swapWordIndex = wordIndex ^ 1;
+     const uint finalAddress = select_uint(oddRow,
+@@ -206,4 +208,4 @@ float4 sampleTMEM(int2 texelInt, uint siz, uint fmt, uint address, uint stride,
+             return float4(0.0f, 0.0f, 0.0f, 1.0f);
+         }
+     }
+-}
+\ No newline at end of file
++}

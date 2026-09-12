@@ -1,0 +1,121 @@
+diff --git a/src/hle/rt64_workload.h b/src/hle/rt64_workload.h
+--- a/src/hle/rt64_workload.h
++++ b/src/hle/rt64_workload.h
+@@ -56,6 +56,8 @@ namespace RT64 {
+         std::vector<interop::float4x4> prevProjTransforms;
+         std::vector<interop::float4x4> prevViewProjTransforms;
+         std::vector<interop::float4x4> worldTransforms;
++        // Source-endpoint motion, independent of interpolated presentation weights.
++        std::vector<uint8_t> worldTransformMotion;
+         std::vector<interop::float4x4> prevWorldTransforms;
+         std::vector<interop::float4x4> invTWorldTransforms;
+         std::vector<interop::float4x4> lerpWorldTransforms;
+diff --git a/src/hle/rt64_workload.cpp b/src/hle/rt64_workload.cpp
+--- a/src/hle/rt64_workload.cpp
++++ b/src/hle/rt64_workload.cpp
+@@ -89,6 +89,7 @@ namespace RT64 {
+         drawData.lerpRspLookAt.clear();
+         drawData.loadOperations.clear();
+         drawData.worldTransforms.clear();
++        drawData.worldTransformMotion.clear();
+         drawData.viewTransforms.clear();
+         drawData.projTransforms.clear();
+         drawData.viewProjTransforms.clear();
+diff --git a/src/render/rt64_transform_processor.cpp b/src/render/rt64_transform_processor.cpp
+--- a/src/render/rt64_transform_processor.cpp
++++ b/src/render/rt64_transform_processor.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "rt64_transform_processor.h"
++#include "rt64_bumble_shadow_geometry.h"
+ 
+ #include "common/rt64_math.h"
+ #include "hle/rt64_game_frame.h"
+@@ -30,6 +31,7 @@ namespace RT64 {
+             lerpWorldTransforms.clear();
+             invTWorldTransforms.clear();
+             prevWorldTransforms.clear();
++            drawData.worldTransformMotion.assign(drawData.worldTransforms.size(), 0);
+ 
+             hlslpp::float4x4 prevMatrix, curMatrix, invMatrix, invTMatrix;
+ 
+@@ -42,8 +44,10 @@ namespace RT64 {
+                     if (transformMap.mapped) {
+                         const hlslpp::float4x4 &prevTransform = prevDrawData.worldTransforms[workloadMap.transforms[t].prevTransformIndex];
+                         const hlslpp::float4x4 &curTransform = drawData.worldTransforms[t];
+-                        prevMatrix = transformMap.rigidBody.lerp(p.prevFrameWeight, prevTransform, curTransform, true);
+-                        curMatrix = transformMap.rigidBody.lerp(p.curFrameWeight, prevTransform, curTransform, true);
++                        const bool moving = bumbleShadowTransformChanged(prevTransform, curTransform);
++                        drawData.worldTransformMotion[t] = moving;
++                        prevMatrix = moving ? transformMap.rigidBody.lerp(p.prevFrameWeight, prevTransform, curTransform, true) : curTransform;
++                        curMatrix = moving ? transformMap.rigidBody.lerp(p.curFrameWeight, prevTransform, curTransform, true) : curTransform;
+                         invMatrix = hlslpp::inverse(curMatrix);
+                         invTMatrix = hlslpp::transpose(invMatrix);
+                         lerpWorldTransforms.emplace_back(curMatrix);
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -572,33 +572,8 @@ namespace RT64 {
+         const DrawData &drawData = workload.drawData;
+         const uint32_t first = call.callDesc.minWorldMatrix;
+         const uint32_t last = call.callDesc.maxWorldMatrix;
+-        if (first > last || last >= drawData.worldTransformGroups.size()) {
+-            return false;
+-        }
+-        for (uint32_t matrixIndex = first;
+-             matrixIndex <= last;
+-             ++matrixIndex) {
+-            const uint32_t groupIndex =
+-                drawData.worldTransformGroups[matrixIndex];
+-            if (groupIndex >= drawData.transformGroups.size()) {
+-                continue;
+-            }
+-            const uint32_t matrixId =
+-                drawData.transformGroups[groupIndex].matrixId;
+-            // Native actor draws use their stable guest actor address as the transform group id.
+-            if (matrixId >= 0x80000000u && matrixId <= 0x807FFFFFu) {
+-                return true;
+-            }
+-            // AUTO/IGNORE is not proof of immobility.
+-            if (matrixIndex < drawData.worldTransforms.size() &&
+-                matrixIndex < drawData.prevWorldTransforms.size() &&
+-                std::memcmp(
+-                    &drawData.worldTransforms[matrixIndex],
+-                    &drawData.prevWorldTransforms[matrixIndex],
+-                    sizeof(interop::float4x4)
+-                ) != 0) {
+-                return true;
+-            }
+-        }
++        // A stable object ID owns matching, not motion: level shells have IDs too.
++        if (bumbleShadowTransformsMoving(drawData, first, last)) return true;
++        // motion above is also source-owned. Do not scan
+         thread_local const Workload *cachedWorkload = nullptr;
+         thread_local uint64_t cachedSubmission = UINT64_MAX;
+diff --git a/src/render/rt64_bumble_shadow_geometry.h b/src/render/rt64_bumble_shadow_geometry.h
+--- a/src/render/rt64_bumble_shadow_geometry.h
++++ b/src/render/rt64_bumble_shadow_geometry.h
+@@ -3,7 +3,22 @@
+ #include "hle/rt64_workload.h"
+ #include "xxHash/xxh3.h"
+ #include <stdexcept>
++#include <cstring>
+ 
+ namespace RT64 {
++    inline bool bumbleShadowTransformChanged(const interop::float4x4 &previous,
++        const interop::float4x4 &current) {
++        return std::memcmp(&previous, &current, sizeof(current)) != 0;
++    }
++
++    inline bool bumbleShadowTransformsMoving(const DrawData &data,
++        uint32_t first, uint32_t last) {
++        if (first > last || last >= data.worldTransformMotion.size())
++            throw std::runtime_error("Invalid shadow caster source motion range");
++        for (uint32_t matrix = first; matrix <= last; ++matrix)
++            if (data.worldTransformMotion[matrix]) return true;
++        return false;
++    }
++
+     // Source geometry is immutable within a workload, not across workloads.
+     inline uint64_t bumbleShadowGeometryKey(const DrawData &data,

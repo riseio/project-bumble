@@ -1,0 +1,16 @@
+diff --git a/plume_d3d12.h b/plume_d3d12.h
+--- a/plume_d3d12.h
++++ b/plume_d3d12.h
+@@ -446,2 +446,4 @@
+         ID3D12PipelineLibrary *pipelineLibrary = nullptr;
++        // CreatePipelineLibrary borrows this blob until the library is released.
++        std::vector<uint8_t> pipelineCacheBacking;
+         std::filesystem::path pipelineCachePath;
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -4614,3 +4614,3 @@
+-        std::vector<uint8_t> initialData;
++        auto &initialData = pipelineCacheBacking;
+         if (!pipelineCachePath.empty()) {
+             std::ifstream input(

@@ -1,0 +1,36 @@
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -1604,6 +1604,13 @@
+                     submission.targetSetId
+                 );
+             }
++            // stop() wakes the presentation-event condition so teardown can join this thread.
++            if (!threadsRunning) {
++                if (!workloadLockReleasedForPresentation) {
++                    workloadLock.unlock();
++                }
++                return;
++            }
+             if (submission.targetReadySemaphore != nullptr) {
+                 RenderCommandSemaphore *signalSemaphore =
+                     submission.targetReadySemaphore;
+@@ -2451,5 +2463,9 @@
+                     std::memory_order_release
+                 );
+                 for (uint32_t frame = 0; frame < displayFrames; frame++) {
++                    // A stop request can arrive between members of a generated frame batch.
++                    if (!threadsRunning) {
++                        break;
++                    }
+                     assert(frame < interpolationGraphicsWorkers.size());
+                     // Distribute the bounded frame set across the full tick span.
+@@ -2555,6 +2573,9 @@
+                         interpolationTargetKey, interpolationTargetFbPairIndex, overrideTarget, overrideModifier, velocityUploaderUsed, uploadExtras, tileInterpolationUsed, lookAtInterpolationUsed, submission);
+                     ext.workloadGraphicsWorker =
+                         primaryWorkloadGraphicsWorker;
++                    if (!threadsRunning) {
++                        break;
++                    }
+                     ext.sharedResources->renderedFrameCount.fetch_add(
+                         1,
+                         std::memory_order_relaxed

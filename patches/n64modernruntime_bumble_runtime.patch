@@ -1,0 +1,479 @@
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 410a77a..1ea25ad 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -830,10 +830,22 @@ void recomp::start(const recomp::Configuration& cfg) {
+         }
+     }
+ 
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=runtime_loop_exited\n");
++    std::fflush(stderr);
+     graphics_shutdown_ready.signal();
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=graphics_shutdown_signaled\n");
++    std::fflush(stderr);
+ 
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=game_thread_join_begin\n");
++    std::fflush(stderr);
+     game_thread.join();
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=game_thread_join_end\n");
++    std::fflush(stderr);
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=event_threads_join_begin\n");
++    std::fflush(stderr);
+     ultramodern::join_event_threads();
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=event_threads_join_end\n");
++    std::fflush(stderr);
+     ultramodern::join_thread_cleaner_thread();
+     ultramodern::join_saving_thread();
+     
+diff --git a/librecomp/src/ultra_translation.cpp b/librecomp/src/ultra_translation.cpp
+index e0d367e..d5fa1bc 100644
+--- a/librecomp/src/ultra_translation.cpp
++++ b/librecomp/src/ultra_translation.cpp
+@@ -29,8 +29,7 @@ extern "C" void osDestroyThread_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void osYieldThread_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    assert(false);
+-    // osYieldThread(rdram);
++    osYieldThread(rdram);
+ }
+ 
+ extern "C" void osSetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
+diff --git a/ultramodern/include/ultramodern/events.hpp b/ultramodern/include/ultramodern/events.hpp
+index dbb2ea5..f0a26c3 100644
+--- a/ultramodern/include/ultramodern/events.hpp
++++ b/ultramodern/include/ultramodern/events.hpp
+@@ -1,14 +1,37 @@
+ #ifndef __EVENTS_HPP__
+ #define __EVENTS_HPP__
+ 
++#include <cstdint>
++
+ namespace ultramodern {
+     namespace events {
++        enum class GraphicsActionType : uint32_t {
++            SpTask = 1,
++            ScreenUpdate = 2,
++        };
++
+         struct callbacks_t {
+-            using vi_callback_t = void();
++            using vi_callback_t = void(
++                uint64_t wake_lateness_nanoseconds,
++                uint64_t skipped_retraces
++            );
+             using gfx_init_callback_t = void();
++            using graphics_action_dequeued_t = void(
++                GraphicsActionType type,
++                uint64_t queued_nanoseconds,
++                uint64_t dequeued_nanoseconds,
++                uint64_t sequence
++            );
++            using graphics_action_completed_t = void(
++                GraphicsActionType type,
++                uint64_t dequeued_nanoseconds,
++                uint64_t completed_nanoseconds,
++                uint64_t sequence
++            );
+ 
+             /**
+-             * Called in each VI.
++             * Called in each VI with the host timer's wake deadline miss and
++             * the number of retraces skipped since the previous callback.
+              */
+             vi_callback_t* vi_callback;
+ 
+@@ -16,6 +39,16 @@ namespace ultramodern {
+              * Called before entering the gfx main loop.
+              */
+             gfx_init_callback_t* gfx_init_callback;
++
++            /**
++             * Reports the complete host queue delay for graphics tasks and VI
++             * screen updates. This optional boundary lets renderers distinguish
++             * upstream action starvation from time spent inside the renderer.
++             */
++            graphics_action_dequeued_t* graphics_action_dequeued = nullptr;
++
++            /** Reports the complete execution time of the dequeued action. */
++            graphics_action_completed_t* graphics_action_completed = nullptr;
+         };
+ 
+         void set_callbacks(const callbacks_t& callbacks);
+diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
+index 1dab1b8..a7128b1 100644
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -15,7 +15,7 @@ namespace ultramodern {
+         enum class Pak {
+             None,
+             RumblePak,
+-            // ControllerPak,
++            ControllerPak,
+             // TransferPak
+         };
+ 
+@@ -57,6 +57,7 @@ namespace ultramodern {
+         };
+ 
+         void set_callbacks(const callbacks_t& callbacks);
++        connected_device_info_t get_connected_device_info(int controller_num);
+     }
+ }
+ 
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 2f1cfb5..ec76903 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -26,10 +26,14 @@ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t&
+ 
+ struct SpTaskAction {
+     OSTask task;
++    uint64_t queued_nanoseconds;
++    uint64_t sequence;
+ };
+ 
+ struct ScreenUpdateAction {
+     ultramodern::renderer::ViRegs regs;
++    uint64_t queued_nanoseconds;
++    uint64_t sequence;
+ };
+ 
+ struct UpdateConfigAction {
+@@ -137,6 +141,17 @@ static struct {
+     moodycamel::ConcurrentQueue<OSThread*> deleted_threads{};
+ } events_context{};
+ 
++static std::atomic_uint64_t graphics_action_sequence{0};
++static std::atomic_uint64_t screen_update_sequence{0};
++
++static uint64_t action_clock_nanoseconds() {
++    return static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()
++        ).count()
++    );
++}
++
+ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
+     return &events_context.vi.update_screen_regs;
+ }
+@@ -205,9 +220,20 @@ void vi_thread_func() {
+             next = std::chrono::high_resolution_clock::now();
+         }
+         ultramodern::sleep_until(next);
++        const auto wake_time = std::chrono::high_resolution_clock::now();
++        const uint64_t wake_lateness_nanoseconds = wake_time > next
++            ? static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    wake_time - next
++                ).count()
++            )
++            : 0;
+         auto time_now = ultramodern::time_since_start();
+         // Calculate how many VIs have passed
+         uint64_t new_total_vis = (time_now * (60 * ultramodern::get_speed_multiplier()) / 1000ms) + 1;
++        const uint64_t skipped_retraces = new_total_vis > total_vis + 1
++            ? new_total_vis - total_vis - 1
++            : 0;
+         if (new_total_vis > total_vis + 1) {
+             //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
+         }
+@@ -224,7 +250,11 @@ void vi_thread_func() {
+ 
+         // Queue a screen update for the graphics thread with the current VI register state.
+         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
+-        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
++        events_context.action_queue.enqueue(ScreenUpdateAction{
++            events_context.vi.regs,
++            action_clock_nanoseconds(),
++            screen_update_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
++        });
+ 
+         // Update VI registers and swap VI modes.
+         events_context.vi.update_vi();
+@@ -250,7 +280,10 @@ void vi_thread_func() {
+         }
+ 
+         if (events_callbacks.vi_callback != nullptr) {
+-            events_callbacks.vi_callback();
++            events_callbacks.vi_callback(
++                wake_lateness_nanoseconds,
++                skipped_retraces
++            );
+         }
+     }
+ }
+@@ -359,6 +392,22 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
++                // Present the completed workload without waiting for the next VI poll.
++                if (ultramodern::is_game_started() &&
++                    !enabled_instant_present) {
++                    renderer_context->enable_instant_present();
++                    enabled_instant_present = true;
++                }
++                const uint64_t dequeued_nanoseconds =
++                    action_clock_nanoseconds();
++                if (events_callbacks.graphics_action_dequeued != nullptr) {
++                    events_callbacks.graphics_action_dequeued(
++                        ultramodern::events::GraphicsActionType::SpTask,
++                        task_action->queued_nanoseconds,
++                        dequeued_nanoseconds,
++                        task_action->sequence
++                    );
++                }
+                 // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+                 // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+                 // is finished as well, so sending this early shouldn't be an issue in most cases.
+@@ -377,13 +432,39 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+                 ultramodern::extensions::on_displaylist_parsed(displaylist);
+                 ultramodern::extensions::on_displaylist_completed(displaylist);
++                if (events_callbacks.graphics_action_completed != nullptr) {
++                    events_callbacks.graphics_action_completed(
++                        ultramodern::events::GraphicsActionType::SpTask,
++                        dequeued_nanoseconds,
++                        action_clock_nanoseconds(),
++                        task_action->sequence
++                    );
++                }
+                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
+             }
+             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
++                const uint64_t dequeued_nanoseconds =
++                    action_clock_nanoseconds();
++                if (events_callbacks.graphics_action_dequeued != nullptr) {
++                    events_callbacks.graphics_action_dequeued(
++                        ultramodern::events::GraphicsActionType::ScreenUpdate,
++                        screen_update_action->queued_nanoseconds,
++                        dequeued_nanoseconds,
++                        screen_update_action->sequence
++                    );
++                }
+                 events_context.vi.update_screen_regs = screen_update_action->regs;
+                 renderer_context->update_screen();
+                 display_refresh_rate = renderer_context->get_display_framerate();
+                 resolution_scale = renderer_context->get_resolution_scale();
++                if (events_callbacks.graphics_action_completed != nullptr) {
++                    events_callbacks.graphics_action_completed(
++                        ultramodern::events::GraphicsActionType::ScreenUpdate,
++                        dequeued_nanoseconds,
++                        action_clock_nanoseconds(),
++                        screen_update_action->sequence
++                    );
++                }
+             }
+             else if (const auto* config_action = std::get_if<UpdateConfigAction>(&action)) {
+                 (void)config_action;
+@@ -398,8 +479,16 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+         }
+     }
+ 
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=gfx_loop_exited\n");
++    std::fflush(stderr);
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=gfx_shutdown_wait_begin\n");
++    std::fflush(stderr);
+     graphics_shutdown_ready.wait();
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=gfx_shutdown_wait_end\n");
++    std::fflush(stderr);
+     renderer_context->shutdown();
++    std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=renderer_shutdown_returned\n");
++    std::fflush(stderr);
+ }
+ 
+ #define VI_CTRL_TYPE_16             0x00002
+@@ -562,7 +651,11 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+ 
+     // Send gfx tasks to the graphics action queue
+     if (task->t.type == M_GFXTASK) {
+-        events_context.action_queue.enqueue(SpTaskAction{ *task });
++        events_context.action_queue.enqueue(SpTaskAction{
++            *task,
++            action_clock_nanoseconds(),
++            graphics_action_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
++        });
+     }
+     // Set all other tasks as the RSP task
+     else {
+diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
+index 8e86cb1..38dc4c4 100644
+--- a/ultramodern/src/input.cpp
++++ b/ultramodern/src/input.cpp
+@@ -21,6 +21,15 @@ void ultramodern::input::set_callbacks(const callbacks_t& callbacks) {
+     input_callbacks = callbacks;
+ }
+ 
++ultramodern::input::connected_device_info_t
++ultramodern::input::get_connected_device_info(int controller_num) {
++    if (input_callbacks.get_connected_device_info != nullptr) {
++        return input_callbacks.get_connected_device_info(controller_num);
++    }
++
++    return {};
++}
++
+ static std::chrono::high_resolution_clock::time_point input_poll_time;
+ 
+ static void update_poll_time() {
+diff --git a/ultramodern/src/threadqueue.cpp b/ultramodern/src/threadqueue.cpp
+index f9c0fa1..a718c2c 100644
+--- a/ultramodern/src/threadqueue.cpp
++++ b/ultramodern/src/threadqueue.cpp
+@@ -43,14 +43,16 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
+ bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
+     debug_printf("[Thread Queue] Removing thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
+ 
+-    PTR(PTR(OSThread)) cur = queue_;
+-    while (cur != NULLPTR) {
+-        PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
+-        if (*cur_ptr == t_) {
+-            *cur_ptr = TO_PTR(OSThread, *cur_ptr)->next;
++    PTR(OSThread)* cur = queue_to_ptr(PASS_RDRAM queue_);
++    while (*cur != NULLPTR) {
++        if (*cur == t_) {
++            OSThread* removed = TO_PTR(OSThread, *cur);
++            *cur = removed->next;
++            removed->next = NULLPTR;
++            removed->queue = NULLPTR;
+             return true;
+         }
+-        cur = TO_PTR(OSThread, *cur_ptr)->next;
++        cur = &TO_PTR(OSThread, *cur)->next;
+     }
+ 
+     return false;
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 6e3ed18..6799cf1 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -274,13 +274,32 @@ extern "C" void osStopThread(RDRAM_ARG PTR(OSThread) t_) {
+     if (t_ == NULLPTR) {
+         t_ = thread_self;
+     }
+-    // Check if the thread is stopping itself (arg is null or thread_self).
+-    if (t_ == thread_self) {
+-        ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+-    }
+-    else {
+-        assert(false);
++    OSThread* t = TO_PTR(OSThread, t_);
++
++    // A stopped thread stays alive and may be started again later.
++    if (t_ != thread_self) {
++        if (t->state != OSThreadState::STOPPED) {
++            if (t->queue != NULLPTR) {
++                ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
++            }
++            t->next = NULLPTR;
++            t->queue = NULLPTR;
++            t->state = OSThreadState::STOPPED;
++        }
++        return;
+     }
++
++    // Check if the thread is stopping itself (arg is null or thread_self).
++    t->next = NULLPTR;
++    t->queue = NULLPTR;
++    t->state = OSThreadState::STOPPED;
++    ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
++}
++
++extern "C" void osYieldThread(RDRAM_ARG1) {
++    // Yield cooperatively: requeue, dispatch the highest-priority thread, then resume here.
++    ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::this_thread());
++    ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
+ }
+ 
+ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+@@ -315,8 +339,12 @@ extern "C" void osSetThreadPri(RDRAM_ARG PTR(OSThread) t_, OSPri pri) {
+         t->priority = pri;
+ 
+         if (t_ != ultramodern::this_thread() && t->state != OSThreadState::STOPPED) {
+-            ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+-            ultramodern::thread_queue_insert(PASS_RDRAM t->queue, t_);
++            // Save the queue before removal clears it.
++            const PTR(PTR(OSThread)) queue = t->queue;
++            if (queue != NULLPTR &&
++                ultramodern::thread_queue_remove(PASS_RDRAM queue, t_)) {
++                ultramodern::thread_queue_insert(PASS_RDRAM queue, t_);
++            }
+         }
+ 
+         ultramodern::check_running_queue(PASS_RDRAM1);
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index ee26c45..bdc3bb0 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include <thread>
+ #include <variant>
+ #include <set>
+@@ -214,10 +215,62 @@ void ultramodern::sleep_milliseconds(uint32_t millis) {
+ 
+ void ultramodern::sleep_until(const std::chrono::high_resolution_clock::time_point& time_point) {
+     auto time_now = std::chrono::high_resolution_clock::now();
++    if (time_point <= time_now) {
++        return;
++    }
++
++    // Sleep() can overshoot the VI deadline because of host timer granularity.
++    struct ThreadTimer {
++        HANDLE handle = CreateWaitableTimerExW(
++            nullptr,
++            nullptr,
++            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++            TIMER_MODIFY_STATE | SYNCHRONIZE
++        );
++
++        ThreadTimer() {
++            if (handle == nullptr) {
++                handle = CreateWaitableTimerW(nullptr, FALSE, nullptr);
++            }
++        }
++
++        ~ThreadTimer() {
++            if (handle != nullptr) {
++                CloseHandle(handle);
++            }
++        }
++    };
++
++    thread_local ThreadTimer timer;
++    if (timer.handle != nullptr) {
++        const auto remaining = time_point - time_now;
++        const LONGLONG ticks100ns = std::max<LONGLONG>(
++            1,
++            std::chrono::ceil<std::chrono::duration<LONGLONG, std::ratio<1, 10'000'000>>>(remaining).count()
++        );
++        LARGE_INTEGER due_time{};
++        due_time.QuadPart = -ticks100ns;
++        if (SetWaitableTimer(
++                timer.handle,
++                &due_time,
++                0,
++                nullptr,
++                nullptr,
++                FALSE
++            ) &&
++            (WaitForSingleObject(timer.handle, INFINITE) == WAIT_OBJECT_0)) {
++            return;
++        }
++    }
++
++    // Preserve a safe fallback for older Windows builds and handle failures.
++    time_now = std::chrono::high_resolution_clock::now();
+     if (time_point > time_now) {
+-        long long delta_ms = std::chrono::ceil<std::chrono::milliseconds>(time_point - time_now).count();
+-        // printf("Sleeping %lld %d ms\n", delta_ms, (uint32_t)delta_ms);
+-        Sleep(delta_ms);
++        const long long delta_ms =
++            std::chrono::ceil<std::chrono::milliseconds>(
++                time_point - time_now
++            ).count();
++        Sleep(static_cast<DWORD>(delta_ms));
+     }
+ }
+ 

@@ -1,0 +1,134 @@
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -958,59 +958,78 @@
+     static uint32_t bumbleMaterialClass(
+         const DrawData &drawData,
+         const Projection &projection,
+         const GameCall &call
+-    ) {
+-        if (projection.type != Projection::Type::Perspective ||
+-            call.callDesc.extendedType != DrawExtendedType::None ||
+-            call.callDesc.triangleCount == 0u) {
+-            return BumbleMaterialNone;
+-        }
+-        if (call.callDesc.tileCount == 0u) {
+-            return BumbleMaterialNone;
+-        }
+-
+-        const bool shoreline = bumbleShorelineDraw(drawData, projection, call);
+-        uint32_t selected = BumbleMaterialNone;
+-        for (uint32_t tile = 0; tile < call.callDesc.tileCount; ++tile) {
+-            const uint64_t tileIndex =
+-                static_cast<uint64_t>(call.callDesc.tileIndex) + tile;
+-            if (tileIndex >= drawData.callTiles.size()) {
+-                break;
+-            }
+-            const DrawCallTile &drawTile =
+-                drawData.callTiles[static_cast<size_t>(tileIndex)];
+-            if (bumbleLegacyWaterOverlayContract(
+-                    drawData,
+-                    drawTile,
+-                    call
+-                )) {
+-                // The known-texture draw below owns the replacement surface.
+-                return BumbleMaterialLegacyWaterOverlay;
+-            }
+-            const uint32_t candidate = bumbleMaterialClassForHash(
+-                drawTile.tmemHashOrID
+-            );
+-            // The fluid/fluid palette uses TEXEL0.
+-            if (candidate == BumbleMaterialWaterTransition &&
+-                (tile != 0u || !call.shaderDesc.flags.usesTexture0 ||
+-                 call.callDesc.otherMode.textLOD() == G_TL_LOD)) {
+-                continue;
+-            }
+-            // Water is deliberately strongest because a mipmapped call can carry more than one tile.
+-            if (bumbleWaterMaterialClass(candidate) && !shoreline) {
+-                return candidate;
+-            }
+-            if (candidate == BumbleMaterialLegacyWaterOverlay &&
+-                bumbleLegacyWaterOverlayContract(
+-                    drawData,
+-                    drawTile,
+-                    call
+-                )) {
+-                return candidate;
+-            }
+-            if (candidate == BumbleMaterialEarth) {
+-                selected = candidate;
+-            }
++    ) {
++        if (projection.type != Projection::Type::Perspective ||
++            call.callDesc.extendedType != DrawExtendedType::None ||
++            call.callDesc.triangleCount == 0u) {
++            return BumbleMaterialNone;
++        }
++        if (call.callDesc.tileCount == 0u) {
++            return BumbleMaterialNone;
++        }
++
++        const bool uses0 = call.shaderDesc.flags.usesTexture0;
++        const bool uses1 = call.shaderDesc.flags.usesTexture1;
++        if (!uses0 && !uses1) {
++            return BumbleMaterialNone;
++        }
++        const bool lod = call.callDesc.otherMode.textLOD() == G_TL_LOD;
++        const bool oneCycle = call.callDesc.otherMode.cycleType() == G_CYC_1CYCLE;
++        const bool shoreline = bumbleShorelineDraw(drawData, projection, call);
++        uint32_t selected = BumbleMaterialNone;
++        for (uint32_t tile = 0; tile < call.callDesc.tileCount; ++tile) {
++            // Match RasterPS sampling, including the one-cycle TEXEL1 alias.
++            if (!lod && !((tile == 0u && (uses0 || (oneCycle && uses1))) ||
++                    (tile == 1u && !oneCycle && uses1))) {
++                continue;
++            }
++            const uint64_t tileIndex =
++                static_cast<uint64_t>(call.callDesc.tileIndex) + tile;
++            if (tileIndex >= drawData.callTiles.size()) {
++                break;
++            }
++            const DrawCallTile &drawTile =
++                drawData.callTiles[static_cast<size_t>(tileIndex)];
++            if (!drawTile.valid) {
++                continue;
++            }
++            if (bumbleLegacyWaterOverlayContract(
++                    drawData,
++                    drawTile,
++                    call
++                )) {
++                // The known-texture draw below owns the replacement surface.
++                return BumbleMaterialLegacyWaterOverlay;
++            }
++            // Raw TMEM and framebuffer-copy IDs are not reviewed image hashes.
++            if (drawTile.rawTMEM || drawTile.tileCopyUsed) {
++                continue;
++            }
++            const uint32_t candidate = bumbleMaterialClassForHash(
++                drawTile.tmemHashOrID
++            );
++            // The fluid/fluid palette uses TEXEL0.
++            if (candidate == BumbleMaterialWaterTransition &&
++                (tile != 0u || !call.shaderDesc.flags.usesTexture0 ||
++                 call.callDesc.otherMode.textLOD() == G_TL_LOD)) {
++                continue;
++            }
++            // Water is deliberately strongest because a mipmapped call can carry more than one tile.
++            if (bumbleWaterMaterialClass(candidate) && !shoreline) {
++                return candidate;
++            }
++            if (candidate == BumbleMaterialLegacyWaterOverlay &&
++                bumbleLegacyWaterOverlayContract(
++                    drawData,
++                    drawTile,
++                    call
++                )) {
++                return candidate;
++            }
++            if (candidate == BumbleMaterialEarth) {
++                selected = candidate;
++            }
+         }
+         return selected;
+     }

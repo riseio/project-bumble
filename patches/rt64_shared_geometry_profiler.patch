@@ -1,0 +1,1286 @@
+diff --git a/src/render/rt64_geometry_profiler.h b/src/render/rt64_geometry_profiler.h
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_geometry_profiler.h
+@@ -0,0 +1,49 @@
++#pragma once
++#include <cstdint>
++#include "rt64_render_worker.h"
++#include "shared/rt64_hlsl.h"
++#include "rt64_descriptor_sets.h"
++#if __has_include("rt64_conforming_mesh.h")
++#include "rt64_conforming_mesh.h"
++#define RT64_PROFILER_CONFORMING_SUPPORT 1
++#endif
++
++namespace RT64 {
++    struct Workload;
++    struct GameFrameMap;
++    struct RenderTarget;
++    struct ShaderLibrary;
++    // Opt-in numeric geometry evidence, never a rendering or matching policy.
++    bool profileGeometry(const Workload &workload, const GameFrameMap &map,
++        uint32_t workloadIndex, uint64_t output, float weight,
++        bool processedTransforms, bool processedProjections);
++    bool geometryGPUEnabled();
++    void profileGeometryRasterState(uint32_t call, const hlslpp::float2 &resolution,
++        const RenderViewport &viewport, const RenderRect &scissor,
++        const hlslpp::float2 &scale, const hlslpp::float2 &offset, uint32_t flags,
++        const hlslpp::float2 &primDepth, const RenderMultisampling &multisampling);
++    void profileGeometryRasterSubmitted(uint32_t call);
++    std::unique_ptr<RenderBuffer> recordGeometryReadback(RenderWorker *worker,
++        const Workload &workload);
++    struct GeometryDepthReadback {
++        std::unique_ptr<RenderBuffer> gpu, readback;
++        std::unique_ptr<GeometryDepthDescriptorSet> descriptors;
++        uint32_t framebuffer = 0, width = 0, height = 0, samples = 0;
++    };
++    struct GeometryReadback {
++        std::unique_ptr<RenderBuffer> buffer;
++        uint64_t workloadId = 0, output = 0;
++        uint32_t vertexCount = 0;
++        bool pending = false;
++#ifdef RT64_PROFILER_CONFORMING_SUPPORT
++        std::vector<ConformingDerivedVertex> derived;
++#endif
++        std::vector<GeometryDepthReadback> depth;
++    };
++    bool geometryCoverageEnabled();
++    void recordGeometryDepth(RenderWorker *worker, RenderTarget &target,
++        const ShaderLibrary &shaders, uint32_t framebuffer, GeometryReadback &capture,
++        RenderTextureLayout restoreLayout);
++    void finishGeometryDepth(GeometryReadback &capture);
++    void finishGeometryReadback(GeometryReadback &readback);
++}
+diff --git a/src/render/rt64_geometry_profiler.cpp b/src/render/rt64_geometry_profiler.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_geometry_profiler.cpp
+@@ -0,0 +1,295 @@
++#include "rt64_geometry_profiler.h"
++#include "rt64_geometry_records.h"
++#include "common/rt64_performance_profiler.h"
++#include "hle/rt64_game_frame.h"
++#include "hle/rt64_workload.h"
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <type_traits>
++#include <utility>
++
++namespace RT64 {
++namespace {
++uint64_t pair(uint32_t a, uint32_t b) { return (uint64_t(a) << 32U) | b; }
++uint32_t bits(float value) { uint32_t v; std::memcpy(&v, &value, 4); return v; }
++uint64_t floats(float a, float b) { return pair(bits(a), bits(b)); }
++thread_local bool rasterCapture = false;
++thread_local uint64_t rasterWorkload = 0, rasterOutput = 0;
++template<class T, class = void> struct HasSourceAddresses : std::false_type {};
++template<class T> struct HasSourceAddresses<T, std::void_t<decltype(std::declval<T>().vertexSourceAddresses)>> : std::true_type {};
++template<class T> uint32_t sourceAddress(const T &draw, uint32_t vertex) {
++    if constexpr (HasSourceAddresses<T>::value) {
++        return vertex < draw.vertexSourceAddresses.size() ? draw.vertexSourceAddresses[vertex] : UINT32_MAX;
++    }
++    return UINT32_MAX;
++}
++template<class T> bool sourceIndexValid(const T &draw, uint32_t vertex) {
++    if constexpr (HasSourceAddresses<T>::value) return vertex < draw.vertexSourceAddresses.size();
++    return true;
++}
++template<class T, class = void> struct HasCameraAnchor : std::false_type {};
++template<class T> struct HasCameraAnchor<T, std::void_t<decltype(std::declval<T>().cameraAnchorWorkloadIndex)>> : std::true_type {};
++template<class T> bool cameraAnchored(const T &transform) {
++    if constexpr (HasCameraAnchor<T>::value) return transform.cameraAnchorWorkloadIndex != UINT32_MAX;
++    return false;
++}
++void rasterEvent(const char *name, uint32_t call, uint64_t value) {
++    PerformanceProfiler::recordCriticalInstant(PerformanceCategory::Counter,
++        name, rasterWorkload, pair(uint32_t(rasterOutput), call), value);
++}
++}
++
++bool geometryGPUEnabled() {
++    static const bool enabled = [] {
++        const char *value = std::getenv("RT64_PROFILE_GEOMETRY_GPU");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++bool profileGeometry(const Workload &workload, const GameFrameMap &map,
++        uint32_t workloadIndex, uint64_t output, float weight,
++        bool processedTransforms, bool processedProjections) {
++    rasterCapture = false;
++    static const bool enabled = [] {
++        const char *value = std::getenv("RT64_PROFILE_GEOMETRY");
++        const bool requested = value && std::strcmp(value, "1") == 0;
++        PerformanceProfiler::setMetadata("producer.geometry.supported", "1");
++        PerformanceProfiler::setMetadata("producer.geometry.enabled", requested ? "1" : "0");
++        PerformanceProfiler::setMetadata("producer.gpu_geometry.supported", "1");
++        PerformanceProfiler::setMetadata("producer.gpu_geometry.enabled", requested && geometryGPUEnabled() ? "1" : "0");
++        PerformanceProfiler::setMetadata("producer.depth_coverage.supported", "1");
++        PerformanceProfiler::setMetadata("producer.depth_coverage.enabled", requested && geometryGPUEnabled() && geometryCoverageEnabled() ? "1" : "0");
++        return requested;
++    }();
++    if (!enabled || !PerformanceProfiler::captureEnabled()) { return false; }
++    static const uint32_t interval = [] {
++        const char *value = std::getenv("RT64_PROFILE_GEOMETRY_INTERVAL");
++        if (!value) { return 64U; }
++        char *end = nullptr;
++        const unsigned long n = std::strtoul(value, &end, 10);
++        return end != value && *end == '\0' && n >= 1 && n <= 4096
++            ? uint32_t(n) : 64U;
++    }();
++    if (workload.workloadId % interval != 0) { return false; }
++    constexpr uint32_t MaxVertices = 32768;
++    const auto &draw = workload.drawData;
++    const uint32_t count = draw.vertexCount();
++    GeometryRecords records(workload.workloadId, output, false, std::min(size_t(count), size_t(MaxVertices)) * 10 + std::min(draw.faceIndices.size(), size_t(196608)) / 2 + 1024);
++    const auto event = [&](const char *name, uint64_t a, uint64_t b) { records.event(name, a, b); };
++    if (output > UINT32_MAX || count > MaxVertices || draw.faceIndices.size() > 196608) {
++        event("Geometry.Rejected", output, pair(count, uint32_t(draw.faceIndices.size())));
++        return false;
++    }
++    rasterCapture = geometryGPUEnabled();
++    rasterWorkload = workload.workloadId;
++    rasterOutput = output;
++    PerformanceScope scope(PerformanceCategory::CPU, "Geometry.Capture", workload.workloadId);
++    static const bool metadata = [] {
++        PerformanceProfiler::setMetadata("geometry_contract", "n64-geometry-v1");
++        PerformanceProfiler::setMetadata("geometry_numeric_encoding", "rt64-binary-records-v1");
++        PerformanceProfiler::setMetadata("geometry_position_stage", "CPU_INPUT_WITH_OPTIONAL_FENCE_RETIRED_GPU_READBACK");
++        return true;
++    }();
++    (void)metadata;
++    event("Geometry.Begin", output, pair(count, uint32_t(draw.faceIndices.size())));
++    if constexpr (!HasSourceAddresses<DrawData>::value) event("Geometry.SourceAddressUnavailable", output, count);
++    event("Geometry.Config", output, pair(bits(weight),
++        uint32_t(processedTransforms) | (uint32_t(processedProjections) << 1U) |
++        (uint32_t(geometryGPUEnabled()) << 2U) |
++        (uint32_t(geometryGPUEnabled() && geometryCoverageEnabled()) << 3U) |
++        16U | (uint32_t(geometryGPUEnabled()) << 5U)));
++
++    // Fixed scratch, reused only by the renderer producer.
++    thread_local std::array<uint32_t, MaxVertices> xy{}, z{};
++    thread_local std::array<uint8_t, MaxVertices> modified{};
++    std::fill_n(modified.begin(), count, uint8_t(0));
++    for (size_t i = 0; i + 1 < draw.modifyPosUints.size(); i += 2) {
++        const uint32_t key = draw.modifyPosUints[i], v = key >> 1U;
++        if (v >= count) { event("Geometry.InvalidModify", pair(uint32_t(output), uint32_t(i)), key); continue; }
++        const uint8_t flag = key & 1U ? 2U : 1U;
++        if (modified[v] & flag) {
++            event("Geometry.RepeatedModify", pair(uint32_t(output), v), key);
++        }
++        modified[v] |= flag;
++        (flag == 1 ? xy[v] : z[v]) = draw.modifyPosUints[i + 1];
++    }
++    const auto screen = [&](const hlslpp::float4 &position, uint32_t v, uint32_t projection) {
++        const auto &viewport = draw.rspViewports[projection];
++        const auto xyz = (position.xyz / hlslpp::float3(position.w, -position.w, position.w))
++            * viewport.scale + viewport.translate;
++        hlslpp::float4 result(xyz, position.w);
++        if (modified[v] & 1U) {
++            result[0] = int16_t(xy[v] >> 16U) / 4.0f;
++            result[1] = int16_t(xy[v]) / 4.0f;
++        }
++        if (modified[v] & 2U) { result[2] = z[v] / 65536.0f; }
++        return result;
++    };
++    for (uint32_t v = 0; v < count; ++v) {
++        const uint64_t key = pair(uint32_t(output), v);
++        if (v >= draw.viewProjIndices.size() || v >= draw.worldIndices.size()) {
++            event("Geometry.InvalidVertex", key, 1); continue;
++        }
++        const uint32_t t = draw.worldIndices[v];
++        const uint32_t p = draw.viewProjIndices[v];
++        if (size_t(v) * 3 + 2 >= draw.posFloats.size() || v >= draw.posScreen.size() ||
++                v >= draw.posTransformed.size() || !sourceIndexValid(draw, v) ||
++                t >= draw.worldTransforms.size() || p >= draw.viewProjTransforms.size() ||
++                p >= draw.rspViewports.size() ||
++                (processedTransforms && t >= draw.lerpWorldTransforms.size()) ||
++                (processedProjections && p >= draw.modViewProjTransforms.size())) {
++            event("Geometry.InvalidVertex", key, 2); continue;
++        }
++        const auto &native = draw.posScreen[v];
++        const hlslpp::float4 pos(draw.posFloats[v * 3], draw.posFloats[v * 3 + 1], draw.posFloats[v * 3 + 2], 1);
++        const auto rebuilt = screen(hlslpp::mul(pos,
++            hlslpp::mul(draw.worldTransforms[t], draw.viewProjTransforms[p])), v, p);
++        auto movingPos = pos;
++        if (size_t(v) * 3 + 2 < draw.velFloats.size()) {
++            for (uint32_t a = 0; a < 3; ++a) { movingPos[a] -= draw.velFloats[v * 3 + a] * (1 - weight); }
++        }
++        const auto &world = processedTransforms ? draw.lerpWorldTransforms[t] : draw.worldTransforms[t];
++        const auto &projection = processedProjections ? draw.modViewProjTransforms[p] : draw.viewProjTransforms[p];
++        const auto rendered = screen(hlslpp::mul(movingPos, hlslpp::mul(world, projection)), v, p);
++        event("Geometry.VertexOwner", key, pair(sourceAddress(draw, v), (t << 16U) | p));
++        event("Geometry.SourceXY", key, floats(pos[0], pos[1]));
++        event("Geometry.SourceZW", key, floats(pos[2], 1.0f));
++        event("Geometry.NativeXY", key, floats(native[0], native[1]));
++        event("Geometry.NativeZW", key, floats(native[2], draw.posTransformed[v][3]));
++        event("Geometry.RebuiltXY", key, floats(rebuilt[0], rebuilt[1]));
++        event("Geometry.RebuiltZW", key, floats(rebuilt[2], rebuilt[3]));
++        event("Geometry.RenderXY", key, floats(rendered[0], rendered[1]));
++        event("Geometry.RenderZW", key, floats(rendered[2], rendered[3]));
++        uint32_t flags = uint32_t(modified[v]) << 2U;
++        if (workloadIndex < map.workloads.size() && t < map.workloads[workloadIndex].transforms.size()) {
++            const auto &transform = map.workloads[workloadIndex].transforms[t];
++            flags |= uint32_t(transform.mapped) | (uint32_t(cameraAnchored(transform)) << 1U);
++        }
++        event("Geometry.VertexState", key, flags);
++    }
++    for (uint32_t i = 0; i < draw.faceIndices.size(); i += 2) {
++        event("Geometry.IndexPair", pair(uint32_t(output), i), pair(draw.faceIndices[i],
++            i + 1 < draw.faceIndices.size() ? draw.faceIndices[i + 1] : UINT32_MAX));
++    }
++    uint32_t calls = 0;
++    for (uint32_t f = 0; f < workload.fbPairCount; ++f) {
++        const auto &fb = workload.fbPairs[f];
++        for (uint32_t p = 0; p < fb.projectionCount; ++p) {
++            const auto &projection = fb.projections[p];
++            if (projection.type == Projection::Type::Rectangle) { continue; }
++            for (uint32_t c = 0; c < projection.gameCallCount; ++c) {
++                const auto &call = projection.gameCalls[c];
++                if (!call.callDesc.otherMode.zCmp() && !call.callDesc.otherMode.zUpd()) { continue; }
++                const uint64_t key = pair(uint32_t(output), calls++);
++                event("Geometry.DrawRange", key, pair(call.meshDesc.faceIndicesStart, call.callDesc.triangleCount * 3U));
++                event("Geometry.DrawOwner", key, pair(fb.colorImage.address, projection.transformsIndex));
++                event("Geometry.DrawMode", key, pair(call.callDesc.otherMode.H, call.callDesc.otherMode.L));
++                event("Geometry.DrawIdentity", key, pair(call.callDesc.callIndex, f));
++                event("Geometry.DrawCombiner", key, pair(call.callDesc.colorCombiner.L, call.callDesc.colorCombiner.H));
++                event("Geometry.DrawAlpha", key, floats(call.callDesc.rdpParams.primColor.w, call.callDesc.rdpParams.envColor.w));
++                event("Geometry.DrawAlphaCompare", key, floats(call.callDesc.rdpParams.blendColor.w, call.callDesc.rdpParams.primLOD.x));
++            }
++        }
++    }
++    if (!records.finish()) { rasterCapture = false; return false; }
++    event("Geometry.End", output, pair(count, calls));
++    return true;
++}
++
++std::unique_ptr<RenderBuffer> recordGeometryReadback(RenderWorker *worker, const Workload &workload) {
++    const uint64_t bytes = (uint64_t(workload.drawData.vertexCount())
++#ifdef RT64_PROFILER_CONFORMING_SUPPORT
++        + workload.conformingMesh.derived.size()
++#endif
++        ) * 4 * sizeof(float);
++    if (bytes == 0) { return nullptr; }
++    auto buffer = worker->device->createBuffer(RenderBufferDesc::ReadbackBuffer(bytes));
++    if (!buffer) { return nullptr; }
++    auto *source = workload.outputBuffers.screenPosBuffer.buffer.get();
++    const RenderBufferBarrier before[] = {
++        RenderBufferBarrier(source, RenderBufferAccess::READ),
++        RenderBufferBarrier(buffer.get(), RenderBufferAccess::WRITE)
++    };
++    worker->commandList->barriers(RenderBarrierStage::COPY, before, uint32_t(std::size(before)));
++    worker->commandList->copyBufferRegion(buffer.get(), source, bytes);
++    worker->commandList->barriers(RenderBarrierStage::GRAPHICS,
++        RenderBufferBarrier(source, RenderBufferAccess::READ));
++    return buffer;
++}
++
++void profileGeometryRasterState(uint32_t call, const hlslpp::float2 &resolution,
++        const RenderViewport &viewport, const RenderRect &scissor,
++        const hlslpp::float2 &scale, const hlslpp::float2 &offset, uint32_t flags,
++        const hlslpp::float2 &primDepth, const RenderMultisampling &multisampling) {
++    if (!rasterCapture) { return; }
++    rasterEvent("Geometry.RasterResolution", call, floats(resolution.x, resolution.y));
++    rasterEvent("Geometry.RasterViewportXY", call, floats(viewport.x, viewport.y));
++    rasterEvent("Geometry.RasterViewportWH", call, floats(viewport.width, viewport.height));
++    rasterEvent("Geometry.RasterScale", call, floats(scale.x, scale.y));
++    rasterEvent("Geometry.RasterOffset", call, floats(offset.x, offset.y));
++    rasterEvent("Geometry.RasterScissorLT", call, pair(uint32_t(scissor.left), uint32_t(scissor.top)));
++    rasterEvent("Geometry.RasterScissorRB", call, pair(uint32_t(scissor.right), uint32_t(scissor.bottom)));
++    rasterEvent("Geometry.RasterFlags", call, flags);
++    rasterEvent("Geometry.RasterPrimDepth", call, floats(primDepth.x, primDepth.y));
++    rasterEvent("Geometry.RasterSamples",call,pair(multisampling.sampleCount,multisampling.sampleLocationsEnabled?1:0));
++    static constexpr const char *patterns[]={"Geometry.RasterSamplePattern0","Geometry.RasterSamplePattern1",
++        "Geometry.RasterSamplePattern2","Geometry.RasterSamplePattern3"};
++    for (unsigned group=0;group<4;++group) {
++        uint64_t value=0;
++        for (unsigned i=0;i<4;++i) {
++            const auto &p=multisampling.sampleLocations[group*4+i];
++            value|=uint64_t(uint8_t(p.x))<<(i*16);
++            value|=uint64_t(uint8_t(p.y))<<(i*16+8);
++        }
++        rasterEvent(patterns[group],call,value);
++    }
++}
++
++void profileGeometryRasterSubmitted(uint32_t call) {
++    if (rasterCapture) { rasterEvent("Geometry.RasterSubmitted", call, 1); }
++}
++
++void finishGeometryReadback(GeometryReadback &readback) {
++    if (!readback.pending) { return; }
++    auto *buffer = readback.buffer.get();
++    const uint64_t output = readback.output;
++    GeometryRecords records(readback.workloadId, output, true, size_t(readback.vertexCount) * 2 + 8);
++    const auto event = [&](const char *name, uint64_t a, uint64_t b) { records.event(name, a, b); };
++    const uint32_t count = readback.vertexCount;
++    if (buffer) {
++        const size_t floatCount=(size_t(count)
++#ifdef RT64_PROFILER_CONFORMING_SUPPORT
++            + readback.derived.size()
++#endif
++            )*4;
++        RenderRange range{0, floatCount * sizeof(float)};
++        const auto *positions = static_cast<const float *>(buffer->map(0, &range));
++        if (positions) {
++            for (uint32_t v = 0; v < count; ++v) {
++                event("Geometry.GPUXY", pair(uint32_t(output), v), floats(positions[v * 4], positions[v * 4 + 1]));
++                event("Geometry.GPUZW", pair(uint32_t(output), v), floats(positions[v * 4 + 2], positions[v * 4 + 3]));
++            }
++#ifdef RT64_PROFILER_CONFORMING_SUPPORT
++            const auto validation=validateConformingPositions(count,readback.derived,positions,floatCount);
++            event("Renderer.ConformingGPUChecked",output,pair(validation.checked,validation.validMetadata?1:0));
++            event("Renderer.ConformingGPUErrors",output,pair(validation.referenceMismatches,validation.nonfiniteVertices));
++#endif
++            buffer->unmap();
++        }
++        else { event("Geometry.InvalidGPU", pair(uint32_t(output), 0), 1); }
++    }
++    else if (count != 0) { event("Geometry.InvalidGPU", pair(uint32_t(output), 0), 2); }
++    finishGeometryDepth(readback);
++    records.finish();
++    event("Geometry.GPUEnd", output, count);
++    readback.pending = false;
++    readback.buffer.reset();
++#ifdef RT64_PROFILER_CONFORMING_SUPPORT
++    readback.derived.clear();
++#endif
++}
++}
+diff --git a/src/render/rt64_geometry_depth_profiler.cpp b/src/render/rt64_geometry_depth_profiler.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_geometry_depth_profiler.cpp
+@@ -0,0 +1,103 @@
++#include "rt64_geometry_profiler.h"
++#include "rt64_render_target.h"
++#include "rt64_shader_library.h"
++#include "common/rt64_performance_profiler.h"
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++
++namespace RT64 {
++namespace {
++uint64_t packed(uint32_t a, uint32_t b) { return (uint64_t(a) << 32) | b; }
++void event(const GeometryReadback &capture, const char *name, uint32_t index, uint64_t value) {
++    PerformanceProfiler::recordCriticalInstant(PerformanceCategory::Counter, name,
++        capture.workloadId, packed(uint32_t(capture.output), index), value);
++}
++// Adler-32, matching Python's standard-library zlib implementation.
++uint32_t checksum(const uint8_t *data, size_t size) {
++    uint32_t a = 1, b = 0;
++    while (size) {
++        const size_t count = std::min<size_t>(size, 5552);
++        for (size_t i = 0; i < count; ++i) { a += *data++; b += a; }
++        a %= 65521; b %= 65521; size -= count;
++    }
++    return (b << 16) | a;
++}
++}
++
++bool geometryCoverageEnabled() {
++    static const bool enabled = [] {
++        const char *value = std::getenv("RT64_PROFILE_GEOMETRY_COVERAGE");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++void recordGeometryDepth(RenderWorker *worker, RenderTarget &target,
++        const ShaderLibrary &shaders, uint32_t framebuffer, GeometryReadback &capture,
++        RenderTextureLayout restoreLayout) {
++    if (!geometryCoverageEnabled()) { return; }
++    PerformanceScope measure(PerformanceCategory::CPU, "Geometry.DepthRecord", capture.workloadId);
++    const uint64_t pixels = uint64_t(target.width) * target.height;
++    const auto &shader = target.multisampling.sampleCount > 1 ? shaders.geometryDepthMS : shaders.geometryDepth;
++    if (pixels == 0 || pixels > 4194304 || capture.depth.size() >= 8 || !shader.pipeline) {
++        event(capture, "Geometry.InvalidDepth", framebuffer, 1);
++        return;
++    }
++    GeometryDepthReadback item;
++    item.framebuffer = framebuffer;
++    item.width = target.width; item.height = target.height;
++    item.samples = uint32_t(target.multisampling.sampleCount);
++    const uint64_t bytes = pixels * 2 * sizeof(float);
++    item.gpu = worker->device->createBuffer(RenderBufferDesc::DefaultBuffer(bytes,
++        RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS));
++    item.readback = worker->device->createBuffer(RenderBufferDesc::ReadbackBuffer(bytes));
++    item.descriptors = std::make_unique<GeometryDepthDescriptorSet>(worker->device);
++    if (!item.gpu || !item.readback) { event(capture, "Geometry.InvalidDepth", framebuffer, 2); return; }
++    item.descriptors->setTexture(item.descriptors->source, target.texture.get(),
++        RenderTextureLayout::SHADER_READ, target.textureView.get());
++    item.descriptors->setBuffer(item.descriptors->destination, item.gpu.get(), RenderBufferStructuredView(2 * sizeof(float)));
++    worker->commandList->barriers(RenderBarrierStage::COMPUTE,
++        RenderTextureBarrier(target.texture.get(), RenderTextureLayout::SHADER_READ));
++    worker->commandList->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(item.gpu.get(), RenderBufferAccess::WRITE));
++    const uint32_t constants[] = {item.width, item.height, item.samples};
++    worker->commandList->setPipeline(shader.pipeline.get());
++    worker->commandList->setComputePipelineLayout(shader.pipelineLayout.get());
++    worker->commandList->setComputeDescriptorSet(item.descriptors->get(), 0);
++    worker->commandList->setComputePushConstants(0, constants);
++    worker->commandList->dispatch((item.width + 7) / 8, (item.height + 7) / 8, 1);
++    const RenderBufferBarrier copies[] = {
++        RenderBufferBarrier(item.gpu.get(), RenderBufferAccess::READ),
++        RenderBufferBarrier(item.readback.get(), RenderBufferAccess::WRITE)};
++    worker->commandList->barriers(RenderBarrierStage::COPY, copies, 2);
++    worker->commandList->copyBufferRegion(item.readback.get(), item.gpu.get(), bytes);
++    worker->commandList->barriers(RenderBarrierStage::GRAPHICS,
++        RenderTextureBarrier(target.texture.get(), restoreLayout));
++    capture.depth.emplace_back(std::move(item));
++}
++
++void finishGeometryDepth(GeometryReadback &capture) {
++    const char *output = std::getenv("RT64_PROFILE_OUTPUT");
++    for (auto &item : capture.depth) {
++        const size_t bytes = size_t(item.width) * item.height * 2 * sizeof(float);
++        const RenderRange range{0, bytes};
++        const auto *data = static_cast<const uint8_t *>(item.readback->map(0, &range));
++        bool queued = false;
++        if (output && data) {
++            PerformanceScope measure(PerformanceCategory::CPU, "Geometry.DepthQueue", capture.workloadId);
++            const uint32_t hash = checksum(data, bytes);
++            const std::string suffix = ".depth-" + std::to_string(capture.workloadId) + "-" +
++                std::to_string(capture.output) + "-" + std::to_string(item.framebuffer) + ".f32";
++            queued = PerformanceProfiler::writeAttachment(suffix, data, bytes,
++                "Geometry.DepthContent", capture.workloadId,
++                packed(uint32_t(capture.output), item.framebuffer), packed(hash, item.samples));
++        }
++        if (data) { item.readback->unmap(); }
++        if (!queued) { event(capture, "Geometry.InvalidDepth", item.framebuffer, 3); continue; }
++        event(capture, "Geometry.DepthShape", item.framebuffer, packed(item.width, item.height));
++    }
++    capture.depth.clear();
++}
++}
+diff --git a/src/render/rt64_geometry_descriptor.inl b/src/render/rt64_geometry_descriptor.inl
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_geometry_descriptor.inl
+@@ -0,0 +1,11 @@
++    struct GeometryDepthDescriptorSet : RenderDescriptorSetBase {
++        uint32_t source, destination;
++        GeometryDepthDescriptorSet(RenderDevice *device = nullptr) {
++            builder.begin();
++            source = builder.addTexture(1);
++            destination = builder.addReadWriteStructuredBuffer(2);
++            builder.end();
++            if (device) { create(device); }
++        }
++    };
++
+diff --git a/src/render/rt64_geometry_pipelines.inl b/src/render/rt64_geometry_pipelines.inl
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_geometry_pipelines.inl
+@@ -0,0 +1,18 @@
++        // Diagnostic-only shaders have no production pipeline/allocation cost.
++        const char *depthCapture = std::getenv("RT64_PROFILE_GEOMETRY_COVERAGE");
++        if (depthCapture && std::strcmp(depthCapture, "1") == 0) {
++            for (unsigned ms = 0; ms < 2; ++ms) {
++                auto &record = ms ? geometryDepthMS : geometryDepth;
++                GeometryDepthDescriptorSet descriptorSet;
++                layoutBuilder.begin();
++                layoutBuilder.addPushConstant(0, 0, sizeof(uint32_t) * 3, RenderShaderStageFlag::COMPUTE);
++                layoutBuilder.addDescriptorSet(descriptorSet);
++                layoutBuilder.end();
++                record.pipelineLayout = layoutBuilder.create(device);
++                auto shader = ms
++                    ? device->createShader(CREATE_SHADER_INPUTS(GeometryDepthCSMSBlobDXIL, GeometryDepthCSMSBlobSPIRV, GeometryDepthCSMSBlobMSL, "CSMain", shaderFormat))
++                    : device->createShader(CREATE_SHADER_INPUTS(GeometryDepthCSBlobDXIL, GeometryDepthCSBlobSPIRV, GeometryDepthCSBlobMSL, "CSMain", shaderFormat));
++                record.pipeline = device->createComputePipeline(RenderComputePipelineDesc(record.pipelineLayout.get(), shader.get(), 8, 8, 1));
++            }
++        }
++
+diff --git a/src/shaders/GeometryDepthCS.hlsl b/src/shaders/GeometryDepthCS.hlsl
+new file mode 100644
+--- /dev/null
++++ b/src/shaders/GeometryDepthCS.hlsl
+@@ -0,0 +1,23 @@
++// Opt-in numeric profiler readback. Does not write the game's render targets.
++struct GeometryDepthCB { uint width; uint height; uint samples; };
++[[vk::push_constant]] ConstantBuffer<GeometryDepthCB> gConstants : register(b0);
++#ifdef MULTISAMPLING
++Texture2DMS<float> sourceDepth : register(t1);
++#else
++Texture2D<float> sourceDepth : register(t1);
++#endif
++RWStructuredBuffer<float2> depthExtrema : register(u2);
++[numthreads(8, 8, 1)]
++void CSMain(uint2 pixel : SV_DispatchThreadID) {
++    if (pixel.x >= gConstants.width || pixel.y >= gConstants.height) { return; }
++#ifdef MULTISAMPLING
++    float lo = sourceDepth.Load(pixel, 0), hi = lo;
++    for (uint s = 1; s < gConstants.samples; ++s) {
++        float z = sourceDepth.Load(pixel, s);
++        lo = min(lo, z); hi = max(hi, z);
++    }
++#else
++    float lo = sourceDepth.Load(uint3(pixel, 0)), hi = lo;
++#endif
++    depthExtrema[pixel.y * gConstants.width + pixel.x] = float2(lo, hi);
++}
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -385,6 +385,8 @@
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_bumble_shadow_renderer.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_framebuffer_renderer.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_geometry_mode.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_geometry_profiler.cpp"
++    "${PROJECT_SOURCE_DIR}/src/render/rt64_geometry_depth_profiler.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_look_at_processor.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_native_target.cpp"
+     "${PROJECT_SOURCE_DIR}/src/render/rt64_optimus.cpp"
+@@ -603,3 +605,6 @@
+ 
+ target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/src)
+ 
++
++build_compute_shader(rt64 "src/shaders/GeometryDepthCS.hlsl")
++build_compute_shader(rt64 "src/shaders/GeometryDepthCS.hlsl" "src/shaders/GeometryDepthCSMS.hlsl" "-D MULTISAMPLING")
+diff --git a/src/render/rt64_descriptor_sets.h b/src/render/rt64_descriptor_sets.h
+--- a/src/render/rt64_descriptor_sets.h
++++ b/src/render/rt64_descriptor_sets.h
+@@ -683,4 +683,5 @@
+             }
+         }
+     };
++#include "rt64_geometry_descriptor.inl"
+ };
+diff --git a/src/render/rt64_shader_library.h b/src/render/rt64_shader_library.h
+--- a/src/render/rt64_shader_library.h
++++ b/src/render/rt64_shader_library.h
+@@ -18,6 +18,7 @@
+         bool usesHardwareResolve = false;
+ 
+         // All shaders.
++        ShaderRecord geometryDepth, geometryDepthMS;
+         ShaderRecord bicubicScaling;
+         ShaderRecord boxFilter;
+         ShaderRecord compose;
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <cstring>
+ //
+ // RT64
+ //
+@@ -25,6 +27,8 @@
+ #include "shaders/HistogramSetCS.hlsl.spirv.h"
+ #include "shaders/IdleCS.hlsl.spirv.h"
+ #include "shaders/LuminanceHistogramCS.hlsl.spirv.h"
++#include "shaders/GeometryDepthCS.hlsl.spirv.h"
++#include "shaders/GeometryDepthCSMS.hlsl.spirv.h"
+ #include "shaders/RSPModifyCS.hlsl.spirv.h"
+ #include "shaders/RSPProcessCS.hlsl.spirv.h"
+ #include "shaders/RSPSmoothNormalCS.hlsl.spirv.h"
+@@ -71,6 +75,8 @@
+ #   include "shaders/HistogramSetCS.hlsl.dxil.h"
+ #   include "shaders/IdleCS.hlsl.dxil.h"
+ #   include "shaders/LuminanceHistogramCS.hlsl.dxil.h"
++#   include "shaders/GeometryDepthCS.hlsl.dxil.h"
++#   include "shaders/GeometryDepthCSMS.hlsl.dxil.h"
+ #   include "shaders/RSPModifyCS.hlsl.dxil.h"
+ #   include "shaders/RSPProcessCS.hlsl.dxil.h"
+ #   include "shaders/RSPSmoothNormalCS.hlsl.dxil.h"
+@@ -116,6 +122,8 @@
+ #   include "shaders/HistogramSetCS.hlsl.metal.h"
+ #   include "shaders/IdleCS.hlsl.metal.h"
+ #   include "shaders/LuminanceHistogramCS.hlsl.metal.h"
++#   include "shaders/GeometryDepthCS.hlsl.metal.h"
++#   include "shaders/GeometryDepthCSMS.hlsl.metal.h"
+ #   include "shaders/RSPModifyCS.hlsl.metal.h"
+ #   include "shaders/RSPProcessCS.hlsl.metal.h"
+ #   include "shaders/RSPSmoothNormalCS.hlsl.metal.h"
+@@ -511,6 +519,8 @@
+             RenderComputePipelineDesc pipelineDesc(luminanceHistogram.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             luminanceHistogram.pipeline = device->createComputePipeline(pipelineDesc);
+         }
++#include "rt64_geometry_pipelines.inl"
++
+ 
+         // RSP Modify.
+         {
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1,8 +1,10 @@
++#include "rt64_geometry_profiler.h"
+ //
+ // RT64
+ //
+ 
+ #include "rt64_framebuffer_renderer.h"
++#include "common/rt64_performance_profiler.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -2559,6 +2561,7 @@
+             }
+             const uint32_t firstQuery = drawQueryContext->nextQuery;
+             drawQueryContext->nextQuery += 2u;
++            PerformanceProfiler::noteGPUQueryCommand();
+             worker->commandList->writeTimestamp(
+                 drawQueryContext->queryPool,
+                 firstQuery
+@@ -2575,6 +2578,7 @@
+ 
+         auto endDrawDetail = [&](uint32_t firstQuery) {
+             if (firstQuery != UINT32_MAX) {
++                PerformanceProfiler::noteGPUQueryCommand();
+                 worker->commandList->writeTimestamp(
+                     drawQueryContext->queryPool,
+                     firstQuery + 1u
+@@ -2591,6 +2595,7 @@
+                 uint32_t(drawCall.triangles.shaderDesc.hash())
+             );
+             if (drawCall.type == InstanceDrawCall::Type::IndexedTriangles) {
++                profileGeometryRasterSubmitted(renderIndicesVector[renderIndex].instanceIndex);
+                 worker->commandList->drawIndexedInstanced(drawCall.triangles.faceCount * 3, 1, drawCall.triangles.indexStart, 0, renderIndex);
+             }
+             else {
+@@ -3605,7 +3610,7 @@
+         }
+     }
+ 
+-    void FramebufferRenderer::recordFramebuffer(RenderWorker *worker, uint32_t framebufferIndex, PerformanceDrawQueryContext *drawQueryContext) {
++    void FramebufferRenderer::recordFramebuffer(RenderWorker *worker, uint32_t framebufferIndex, PerformanceDrawQueryContext *drawQueryContext, RenderTextureLayout *finalDepthLayout) {
+         // Submit all transition barriers first.
+         thread_local std::vector<RenderTextureBarrier> startBarriers;
+         startBarriers.clear();
+@@ -3677,6 +3682,7 @@
+             }
+         }
+ 
++        if (finalDepthLayout) *finalDepthLayout = depthState ? RenderTextureLayout::DEPTH_READ : RenderTextureLayout::DEPTH_WRITE;
+     }
+ 
+     void FramebufferRenderer::waitForUploaders() {
+@@ -6632,6 +6638,13 @@
+                             triangles.scissor = viewportScissorIntersection(viewportClip, triangles.scissor);
+                         }
+                         
++                        if (instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles) {
++                            profileGeometryRasterState(call.callDesc.callIndex, fbParams.resolution,
++                                framebuffer.viewport, triangles.scissor, triangles.screenScale,
++                                triangles.screenOffset, triangles.shaderDesc.flags.value,
++                                call.callDesc.rdpParams.primDepth,
++                                p.fbStorage->colorTarget != nullptr ? p.fbStorage->colorTarget->multisampling : p.fbStorage->depthTarget->multisampling);
++                        }
+                         if (triangles.vertexTestZ && usesViewport) {
+                             instanceDrawCallVector[vertexTestZCallIndex].vertexTestZ.indexCount += call.callDesc.triangleCount * 3;
+                             vertexTestZFaceIndicesStart += call.callDesc.triangleCount * 3;
+diff --git a/src/render/rt64_framebuffer_renderer.h b/src/render/rt64_framebuffer_renderer.h
+--- a/src/render/rt64_framebuffer_renderer.h
++++ b/src/render/rt64_framebuffer_renderer.h
+@@ -337,7 +337,7 @@
+         void addFramebuffer(const DrawParams &p);
+         void endFramebuffers(RenderWorker *worker, const DrawBuffers *drawBuffers, const OutputBuffers *outputBuffers, bool rtEnabled);
+         void recordSetup(RenderWorker *worker, const std::vector<BufferUploader *> &bufferUploaders, RSPProcessor *rspProcessor, VertexProcessor *vertexProcessor, const OutputBuffers *outputBuffers, bool rtEnabled);
+-        void recordFramebuffer(RenderWorker *worker, uint32_t framebufferIndex, PerformanceDrawQueryContext *drawQueryContext = nullptr);
++        void recordFramebuffer(RenderWorker *worker, uint32_t framebufferIndex, PerformanceDrawQueryContext *drawQueryContext = nullptr, RenderTextureLayout *finalDepthLayout = nullptr);
+         void waitForUploaders();
+         void advanceFrame(bool rtEnabled);
+ 
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -9,6 +9,8 @@
+ #include <cstdlib>
+ 
+ #include "common/rt64_performance_profiler.h"
++#include "render/rt64_profiler_gpu_queries.h"
++#include "render/rt64_profiler_gpu_clocks.h"
+ #include "common/rt64_thread.h"
+ 
+ #include "rt64_present_queue.h"
+@@ -33,6 +35,9 @@
+         std::fflush(stderr);
+         stop();
+         join();
++        for (uint32_t i = 0; i < interpolationGraphicsWorkers.size(); ++i) {
++            if (interpolationGraphicsWorkers[i]) retireInterpolationWorker(i);
++        }
+         std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=workload_destructor_complete\n");
+         std::fflush(stderr);
+     }
+@@ -259,7 +264,7 @@
+             (performanceReportPath[0] != '\0');
+         performanceGPUInstrumentationEnabled =
+             performanceInstrumentationEnabled ||
+-            PerformanceProfiler::gpuInstrumentationEnabled();
++            PerformanceProfiler::gpuInstrumentationConfigured();
+         performanceGPUFrameInterval =
+             PerformanceProfiler::gpuFrameSampleInterval();
+         const char *drawDetail = std::getenv("RT64_PROFILE_DRAW_DETAIL");
+@@ -552,37 +557,48 @@
+         }
+         PerformanceGPUQuery &query = *queryStorage;
+             query.frameQueryPool->queryResults();
++            if (!ProfilerGpuQueries::validRead(query.frameQueryPool.get(), 0,
++                query.frameQueryPool->getCount(), query.presentationFrame, true)) {
++                query.pending = false;
++                return;
++            }
+             const uint64_t *timestamps =
+                 query.frameQueryPool->getResults();
+             const uint64_t gpuCompletion =
+                 PerformanceProfiler::nowNanoseconds();
+             if (query.drawDetailSampled) {
+-                query.drawQueryPool->queryResults();
+-                const uint64_t *drawTimestamps =
+-                    query.drawQueryPool->getResults();
+-                for (const auto &drawQuery : query.drawQueries) {
+-                    PerformanceProfiler::recordGPUDuration(
+-                        drawQuery.name,
+-                        drawTimestamps[drawQuery.firstQuery],
+-                        drawTimestamps[drawQuery.firstQuery + 1u],
+-                        gpuCompletion,
+-                        query.presentationFrame,
+-                        drawQuery.renderIndex,
+-                        (uint64_t(drawQuery.faceCount) << 32u) |
+-                            drawQuery.shaderHash
++                uint32_t usedQueries = 0;
++                for (const auto &draw : query.drawQueries) usedQueries = std::max(usedQueries, draw.firstQuery + 2u);
++                query.drawQueryPool->queryResults(0, usedQueries);
++                if (usedQueries > 0 && ProfilerGpuQueries::validRead(query.drawQueryPool.get(), 0, usedQueries, query.presentationFrame)) {
++                    const uint64_t *drawTimestamps =
++                        query.drawQueryPool->getResults();
++                    for (const auto &drawQuery : query.drawQueries) {
++                        PerformanceProfiler::recordGPUDuration(
++                            drawQuery.name,
++                            drawTimestamps[drawQuery.firstQuery],
++                            drawTimestamps[drawQuery.firstQuery + 1u],
++                            gpuCompletion,
++                            query.presentationFrame,
++                            drawQuery.renderIndex,
++                            (uint64_t(drawQuery.faceCount) << 32u) |
++                                drawQuery.shaderHash
++                        );
++                    }
++                    PerformanceProfiler::recordCounter(
++                        "Work.ProfiledDraws",
++                        static_cast<double>(query.drawQueries.size()),
++                        query.presentationFrame
+                     );
+-                }
+-                PerformanceProfiler::recordCounter(
+-                    "Work.ProfiledDraws",
+-                    static_cast<double>(query.drawQueries.size()),
+-                    query.presentationFrame
+-                );
+-                PerformanceProfiler::recordCounter(
+-                    "Work.UnprofiledDraws",
+-                    query.drawDetailSaturated ? 1.0 : 0.0,
+-                    query.presentationFrame
+-                );
+-            }
++                    PerformanceProfiler::recordCounter(
++                        "Work.UnprofiledDraws",
++                        query.drawDetailSaturated ? 1.0 : 0.0,
++                        query.presentationFrame
++                    );
++                }
++            }
++            ProfilerGpuClocks::recordFrame(interpolationGraphicsWorkers[workerIndex].get(),
++                query.presentationFrame, query.workloadId);
+             PerformanceProfiler::recordGPUDuration(
+                 "GPU.Frame",
+                 timestamps[0], timestamps[8], gpuCompletion,
+@@ -686,10 +702,12 @@
+             presentationFrameCounter,
+             workerIndex
+         );
++        // A sibling queue user may already have retired this fence.
++        collectPerformanceGPUQuery(workerIndex);
++        finishGeometryReadback(geometryReadbacks[workerIndex]);
+         if (!retired) {
+             return;
+         }
+-        collectPerformanceGPUQuery(workerIndex);
+         if (interpolationWorkerTextureLocks[workerIndex]) {
+             ext.textureCache->decrementLock();
+             interpolationWorkerTextureLocks[workerIndex] = false;
+@@ -773,6 +792,7 @@
+         const uint64_t presentationFrame = ++presentationFrameCounter;
+         const bool measureGPUFrame =
+             performanceGPUInstrumentationEnabled &&
++            (performanceInstrumentationEnabled || PerformanceProfiler::gpuInstrumentationEnabled()) &&
+             ((presentationFrame % performanceGPUFrameInterval) == 0u);
+         PerformanceScope frameScope(
+             PerformanceCategory::Frame,
+@@ -906,6 +926,11 @@
+ 
+         for (uint32_t w = 0; w < curFrame.workloads.size(); w++) {
+             Workload &workload = workloads[curFrame.workloads[w]];
++            const bool geometryCaptured = profileGeometry(workload, curFrame.frameMap, curFrame.workloads[w],
++                presentationFrame, curFrameWeight, processTransforms, processProjections);
++            const bool geometryReadback = geometryCaptured && geometryGPUEnabled();
++            GeometryReadback geometryCopy;
++
+ 
+             // There's no guarantee the RSP was processed if framebuffers were not rendered.
+             const bool processRSP = true;
+@@ -1295,16 +1320,27 @@
+             bool performanceDrawDetailSampled = false;
+             bool performanceDrawDetailSaturated = false;
+             if (performanceGPUQuery != nullptr) {
++                PerformanceProfiler::noteGPUQueryCommand();
+                 ext.workloadGraphicsWorker->commandList->resetQueryPool(
+                     frameQueryPool, 0, 9
+                 );
++                PerformanceProfiler::noteGPUQueryCommand();
+                 ext.workloadGraphicsWorker->commandList->writeTimestamp(
+                     frameQueryPool, 0
+                 );
+             }
+             framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
+             framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
++            if (geometryReadback) {
++                geometryCopy.buffer = recordGeometryReadback(ext.workloadGraphicsWorker, workload);
++                geometryCopy.workloadId = workload.workloadId;
++                geometryCopy.output = presentationFrame;
++                geometryCopy.vertexCount = workload.drawData.vertexCount();
++                geometryCopy.pending = true;
++            }
++
+             if (performanceGPUQuery != nullptr) {
++                PerformanceProfiler::noteGPUQueryCommand();
+                 ext.workloadGraphicsWorker->commandList->writeTimestamp(
+                     frameQueryPool, 1
+                 );
+@@ -1402,6 +1438,7 @@
+                     const uint32_t pairTimestampBase =
+                         2u + gpuMeasuredPairCount * 3u;
+                     if (measureThisFramebuffer) {
++                        PerformanceProfiler::noteGPUQueryCommand();
+                         ext.workloadGraphicsWorker->commandList
+                             ->writeTimestamp(frameQueryPool, pairTimestampBase);
+                     }
+@@ -1411,6 +1448,7 @@
+                         (presentationFrame % performanceDrawDetailInterval) ==
+                             0u;
+                     if (sampleDrawDetail) {
++                        PerformanceProfiler::noteGPUQueryCommand();
+                         ext.workloadGraphicsWorker->commandList->resetQueryPool(
+                             performanceGPUQuery->drawQueryPool.get(),
+                             0,
+@@ -1424,19 +1462,25 @@
+                         performanceDrawQueryContext.queries =
+                             &performanceGPUQuery->drawQueries;
+                     }
++                    RenderTextureLayout geometryDepthLayout = RenderTextureLayout::DEPTH_WRITE;
+                     framebufferRenderer->recordFramebuffer(
+                         ext.workloadGraphicsWorker,
+                         framebufferIndex++,
+                         sampleDrawDetail
+                             ? &performanceDrawQueryContext
+                             : nullptr
+-                    );
++                    , &geometryDepthLayout);
++                    if (geometryReadback && depthTarget != nullptr) {
++                        recordGeometryDepth(ext.workloadGraphicsWorker, *depthTarget,
++                            *ext.shaderLibrary, f, geometryCopy, geometryDepthLayout);
++                    }
+                     if (sampleDrawDetail) {
+                         performanceDrawDetailSaturated =
+                             performanceDrawQueryContext.nextQuery + 1u >=
+                                 PerformanceDrawQueryCount;
+                         while (performanceDrawQueryContext.nextQuery <
+                             PerformanceDrawQueryCount) {
++                            PerformanceProfiler::noteGPUQueryCommand();
+                             ext.workloadGraphicsWorker->commandList
+                                 ->writeTimestamp(
+                                     performanceGPUQuery->drawQueryPool.get(),
+@@ -1446,6 +1490,7 @@
+                         performanceDrawDetailSampled = true;
+                     }
+                     if (measureThisFramebuffer) {
++                        PerformanceProfiler::noteGPUQueryCommand();
+                         ext.workloadGraphicsWorker->commandList
+                             ->writeTimestamp(frameQueryPool, pairTimestampBase + 1u);
+                     }
+@@ -1504,6 +1549,7 @@
+                         overrideTarget->resolveFromTarget(ext.workloadGraphicsWorker, colorTarget, ext.shaderLibrary);
+                     }
+                     if (measureThisFramebuffer) {
++                        PerformanceProfiler::noteGPUQueryCommand();
+                         ext.workloadGraphicsWorker->commandList
+                             ->writeTimestamp(frameQueryPool, pairTimestampBase + 2u);
+                         ++gpuMeasuredPairCount;
+@@ -1539,18 +1585,22 @@
+                 while (gpuMeasuredPairCount < 2u) {
+                     const uint32_t pairTimestampBase =
+                         2u + gpuMeasuredPairCount * 3u;
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     ext.workloadGraphicsWorker->commandList
+                         ->writeTimestamp(frameQueryPool, pairTimestampBase);
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     ext.workloadGraphicsWorker->commandList
+                         ->writeTimestamp(
+                             frameQueryPool, pairTimestampBase + 1u
+                         );
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     ext.workloadGraphicsWorker->commandList
+                         ->writeTimestamp(
+                             frameQueryPool, pairTimestampBase + 2u
+                         );
+                     ++gpuMeasuredPairCount;
+                 }
++                PerformanceProfiler::noteGPUQueryCommand();
+                 ext.workloadGraphicsWorker->commandList->writeTimestamp(
+                     frameQueryPool, 8
+                 );
+@@ -1628,4 +1678,8 @@
+             }
+             assert(!interpolationWorkerTextureLocks[submission.workerIndex]);
+             interpolationWorkerTextureLocks[submission.workerIndex] = true;
++            if (geometryReadback) {
++                assert(!geometryReadbacks[submission.workerIndex].pending);
++                geometryReadbacks[submission.workerIndex] = std::move(geometryCopy);
++            }
+             // A non-interpolated framebuffer has no stable per-output target semaphore.
+@@ -1680,6 +1734,7 @@
+                 const uint64_t fenceWaitStart =
+                     PerformanceProfiler::nowNanoseconds();
+                 ext.workloadGraphicsWorker->wait();
++                finishGeometryReadback(geometryReadbacks[submission.workerIndex]);
+                 const uint64_t fenceWaitEnd =
+                     PerformanceProfiler::nowNanoseconds();
+                 if (measureFenceWait) {
+diff --git a/src/hle/rt64_workload_queue.h b/src/hle/rt64_workload_queue.h
+--- a/src/hle/rt64_workload_queue.h
++++ b/src/hle/rt64_workload_queue.h
+@@ -1,3 +1,4 @@
++#include "render/rt64_geometry_profiler.h"
+ //
+ // RT64
+ //
+@@ -115,6 +116,7 @@
+             SharedQueueResources::MaximumTrackedInterpolationTargets;
+         std::array<std::unique_ptr<RenderWorker>,
+             MaximumInterpolationFramesInFlight> interpolationGraphicsWorkers;
++        std::array<GeometryReadback, MaximumInterpolationFramesInFlight> geometryReadbacks;
+         std::array<bool, MaximumInterpolationFramesInFlight>
+             interpolationWorkerTextureLocks{};
+         std::mutex threadMutex;
+diff --git a/src/common/n64profiler_sources.json b/src/common/n64profiler_sources.json
+--- a/src/common/n64profiler_sources.json
++++ b/src/common/n64profiler_sources.json
+@@ -12,5 +12,14 @@
+     "src/render/rt64_profiler_gpu_queries.h": "3a664e49698bd2b90a034147113dd9b9de9ab0879a8aed5f6e66e232396e6f1d",
+     "src/render/rt64_profiler_gpu_clocks.h": "7b089ca8ff2648f56264181d7fb2ac5fc15b3e1aa4f5efa039e59db47ff9f6a9"
+   },
++  "geometry_files": {
++    "src/render/rt64_geometry_profiler.h": "1242d6085e9cfad2185af116262a1ef1b9945ad851ab09ba09b65152ede2f764",
++    "src/render/rt64_geometry_profiler.cpp": "d0e1d9dd51f4eb1c86d852d97cec9b1fa5827c0f4fce1d19ee5046a6bc49ea6f",
++    "src/render/rt64_geometry_records.h": "6b7609ee60a9246f7d7f6c69d347842393a595f61f3c59eb6c307cc1ffe5f1bb",
++    "src/render/rt64_geometry_depth_profiler.cpp": "760a2cb80709982a2b28900d4a09b1195f0b123ebea0ffb0d23907cfaffde17e",
++    "src/render/rt64_geometry_descriptor.inl": "6aa8099c24cee33ffa12f00707bcb26db43c38381ffd5bc6ebe24bcacb81d9bc",
++    "src/render/rt64_geometry_pipelines.inl": "0aa47f5917be92d0f14997169a2a0199e0d09ea1df58567a09c0209f4b04c8cf",
++    "src/shaders/GeometryDepthCS.hlsl": "42a50ac12ebeedade50d0bb1a361a67c35a6732d4333aac4118d717ad3de2fa5"
++  },
+   "hash_basis": "sha256-lf-normalized"
+ }
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -12,6 +12,7 @@
+ #include <limits>
+ #include "common/rt64_thread.h"
+ #include "common/rt64_performance_profiler.h"
++#include "render/rt64_profiler_gpu_queries.h"
+ #include "rhi/rt64_render_hooks.h"
+ 
+ #include "rt64_workload_queue.h"
+@@ -532,33 +533,35 @@
+         if (slot.measureGPU &&
+             (slot.performanceQueryPool != nullptr)) {
+             slot.performanceQueryPool->queryResults();
+-            const uint64_t *timestamps =
+-                slot.performanceQueryPool->getResults();
+-            PerformanceProfiler::recordGPUDuration(
+-                "GPU.Present",
+-                timestamps[0], timestamps[4], waitEnd,
+-                slot.presentId, slot.workloadId, slot.targetSetId
+-            );
+-            PerformanceProfiler::recordGPUDuration(
+-                "GPU.Present.Resolve",
+-                timestamps[0], timestamps[1], waitEnd,
+-                slot.presentId
+-            );
+-            PerformanceProfiler::recordGPUDuration(
+-                "GPU.Present.VideoInterface",
+-                timestamps[1], timestamps[2], waitEnd,
+-                slot.presentId
+-            );
+-            PerformanceProfiler::recordGPUDuration(
+-                "GPU.Present.RenderHooks",
+-                timestamps[2], timestamps[3], waitEnd,
+-                slot.presentId
+-            );
+-            PerformanceProfiler::recordGPUDuration(
+-                "GPU.Present.Finalize",
+-                timestamps[3], timestamps[4], waitEnd,
+-                slot.presentId
+-            );
++            if (ProfilerGpuQueries::validRead(slot.performanceQueryPool.get(), 0, slot.performanceQueryPool->getCount(), slot.presentId, true)) {
++                const uint64_t *timestamps =
++                    slot.performanceQueryPool->getResults();
++                PerformanceProfiler::recordGPUDuration(
++                    "GPU.Present",
++                    timestamps[0], timestamps[4], waitEnd,
++                    slot.presentId, slot.workloadId, slot.targetSetId
++                );
++                PerformanceProfiler::recordGPUDuration(
++                    "GPU.Present.Resolve",
++                    timestamps[0], timestamps[1], waitEnd,
++                    slot.presentId
++                );
++                PerformanceProfiler::recordGPUDuration(
++                    "GPU.Present.VideoInterface",
++                    timestamps[1], timestamps[2], waitEnd,
++                    slot.presentId
++                );
++                PerformanceProfiler::recordGPUDuration(
++                    "GPU.Present.RenderHooks",
++                    timestamps[2], timestamps[3], waitEnd,
++                    slot.presentId
++                );
++                PerformanceProfiler::recordGPUDuration(
++                    "GPU.Present.Finalize",
++                    timestamps[3], timestamps[4], waitEnd,
++                    slot.presentId
++                );
++            }
+         }
+ 
+         if (slot.frameCounters != nullptr) {
+@@ -794,7 +797,7 @@
+             (performanceReportPath[0] != '\0');
+         performanceGPUInstrumentationEnabled =
+             performanceInstrumentationEnabled ||
+-            PerformanceProfiler::gpuInstrumentationEnabled();
++            PerformanceProfiler::gpuInstrumentationConfigured();
+         performanceGPUFrameInterval =
+             PerformanceProfiler::gpuFrameSampleInterval();
+         PerformanceProfiler::startDisplayObservation(
+@@ -1236,6 +1239,7 @@
+                 firstFrameToPresent + uint32_t(i);
+             const bool measureGPUFrame =
+                 performanceGPUInstrumentationEnabled &&
++                (performanceInstrumentationEnabled || PerformanceProfiler::gpuInstrumentationEnabled()) &&
+                 ((++performanceGPUFrameCounter %
+                     performanceGPUFrameInterval) == 0u);
+             PresentationSlot *presentationSlot = nullptr;
+@@ -1510,9 +1514,11 @@
+                     frameWorker->commandList.get();
+                 commandList->begin();
+                 if (measureGPUFrame) {
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     commandList->resetQueryPool(
+                         framePerformanceQueryPool, 0, 5
+                     );
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     commandList->writeTimestamp(framePerformanceQueryPool, 0);
+                 }
+                 commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::COLOR_WRITE));
+@@ -1564,6 +1570,7 @@
+                     }
+                 }
+                 if (measureGPUFrame) {
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     commandList->writeTimestamp(framePerformanceQueryPool, 1);
+                 }
+                 
+@@ -1579,6 +1586,7 @@
+                     frameVIRenderer->render(renderParams);
+                 }
+                 if (measureGPUFrame) {
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     commandList->writeTimestamp(framePerformanceQueryPool, 2);
+                 }
+ 
+@@ -1593,6 +1601,7 @@
+                     );
+                 }
+                 if (measureGPUFrame) {
++                    PerformanceProfiler::noteGPUQueryCommand();
+                     commandList->writeTimestamp(framePerformanceQueryPool, 3);
+                 }
+ 
+@@ -1631,6 +1640,7 @@
+                     
+                     commandList->barriers(RenderBarrierStage::NONE, RenderTextureBarrier(swapChainTexture, RenderTextureLayout::PRESENT));
+                     if (measureGPUFrame) {
++                        PerformanceProfiler::noteGPUQueryCommand();
+                         commandList->writeTimestamp(
+                             framePerformanceQueryPool, 4
+                         );
+@@ -1953,40 +1963,42 @@
+                     }
+                     if (measureGPUFrame) {
+                         framePerformanceQueryPool->queryResults();
+-                        const uint64_t *timestamps =
+-                            framePerformanceQueryPool->getResults();
+-                        PerformanceProfiler::recordGPUDuration(
+-                            "GPU.Present",
+-                            timestamps[0], timestamps[4],
+-                            PerformanceProfiler::nowNanoseconds(),
+-                            present.presentId,
+-                            present.workloadId,
+-                            selectedTargetSetId
+-                        );
+-                        PerformanceProfiler::recordGPUDuration(
+-                            "GPU.Present.Resolve",
+-                            timestamps[0], timestamps[1],
+-                            PerformanceProfiler::nowNanoseconds(),
+-                            present.presentId
+-                        );
+-                        PerformanceProfiler::recordGPUDuration(
+-                            "GPU.Present.VideoInterface",
+-                            timestamps[1], timestamps[2],
+-                            PerformanceProfiler::nowNanoseconds(),
+-                            present.presentId
+-                        );
+-                        PerformanceProfiler::recordGPUDuration(
+-                            "GPU.Present.RenderHooks",
+-                            timestamps[2], timestamps[3],
+-                            PerformanceProfiler::nowNanoseconds(),
+-                            present.presentId
+-                        );
+-                        PerformanceProfiler::recordGPUDuration(
+-                            "GPU.Present.Finalize",
+-                            timestamps[3], timestamps[4],
+-                            PerformanceProfiler::nowNanoseconds(),
+-                            present.presentId
+-                        );
++                        if (ProfilerGpuQueries::validRead(framePerformanceQueryPool, 0, framePerformanceQueryPool->getCount(), present.presentId, true)) {
++                            const uint64_t *timestamps =
++                                framePerformanceQueryPool->getResults();
++                            PerformanceProfiler::recordGPUDuration(
++                                "GPU.Present",
++                                timestamps[0], timestamps[4],
++                                PerformanceProfiler::nowNanoseconds(),
++                                present.presentId,
++                                present.workloadId,
++                                selectedTargetSetId
++                            );
++                            PerformanceProfiler::recordGPUDuration(
++                                "GPU.Present.Resolve",
++                                timestamps[0], timestamps[1],
++                                PerformanceProfiler::nowNanoseconds(),
++                                present.presentId
++                            );
++                            PerformanceProfiler::recordGPUDuration(
++                                "GPU.Present.VideoInterface",
++                                timestamps[1], timestamps[2],
++                                PerformanceProfiler::nowNanoseconds(),
++                                present.presentId
++                            );
++                            PerformanceProfiler::recordGPUDuration(
++                                "GPU.Present.RenderHooks",
++                                timestamps[2], timestamps[3],
++                                PerformanceProfiler::nowNanoseconds(),
++                                present.presentId
++                            );
++                            PerformanceProfiler::recordGPUDuration(
++                                "GPU.Present.Finalize",
++                                timestamps[3], timestamps[4],
++                                PerformanceProfiler::nowNanoseconds(),
++                                present.presentId
++                            );
++                        }
+                     }
+                     PerformanceProfiler::recordDuration(
+                         PerformanceCategory::Wait,
+diff --git a/src/render/rt64_geometry_records.h b/src/render/rt64_geometry_records.h
+new file mode 100644
+--- /dev/null
++++ b/src/render/rt64_geometry_records.h
+@@ -0,0 +1,75 @@
++#pragma once
++#include "common/rt64_performance_profiler.h"
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace RT64 {
++// Fixed RT64 geometry fields, not a general event serialization protocol.
++inline constexpr const char *GeometryRecordNames[] = {
++    "Geometry.VertexOwner", "Geometry.SourceXY", "Geometry.SourceZW", "Geometry.NativeXY", "Geometry.NativeZW",
++    "Geometry.RebuiltXY", "Geometry.RebuiltZW", "Geometry.RenderXY", "Geometry.RenderZW", "Geometry.VertexState",
++    "Geometry.IndexPair", "Geometry.InvalidModify", "Geometry.RepeatedModify", "Geometry.InvalidVertex",
++    "Geometry.SourceAddressUnavailable", "Geometry.DrawRange", "Geometry.DrawMode", "Geometry.DrawOwner",
++    "Geometry.DrawIdentity", "Geometry.DrawAlpha", "Geometry.DrawAlphaCompare", "Geometry.DrawCombiner",
++    "Geometry.GPUXY", "Geometry.GPUZW", "Geometry.InvalidGPU"
++};
++class GeometryRecords {
++    struct Record { uint32_t field, reserved = 0; uint64_t a, b; };
++    static_assert(sizeof(Record) == 24);
++    static constexpr size_t Limit = (16 * 1024 * 1024) / sizeof(Record);
++    std::vector<Record> records;
++    uint64_t workload, output;
++    bool gpu, rejected = false;
++public:
++    GeometryRecords(uint64_t workload, uint64_t output, bool gpu, size_t expected) : workload(workload), output(output), gpu(gpu) {
++        try { records.reserve(std::min(Limit, expected)); }
++        catch (const std::bad_alloc &) { rejected = true; }
++    }
++    void event(const char *name, uint64_t a, uint64_t b) {
++        for (uint32_t field = 0; field < std::size(GeometryRecordNames); ++field) {
++            if (std::strcmp(name, GeometryRecordNames[field]) != 0) continue;
++            if (rejected || records.size() == Limit) { rejected = true; return; }
++            try {
++                if (records.size() == records.capacity()) records.reserve(std::min(Limit, std::max(size_t(64), records.capacity() * 2)));
++            }
++            catch (const std::bad_alloc &) { rejected = true; return; }
++            records.push_back({field, 0, a, b});
++            return;
++        }
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::Counter, name, workload, a, b);
++    }
++    bool finish() try {
++        if (rejected) {
++            PerformanceProfiler::recordCriticalInstant(PerformanceCategory::Counter, "Geometry.Rejected", workload, output, records.size());
++            return false;
++        }
++        // A zero-record workload still publishes a header.
++        struct Header { uint64_t magic, workload, output, count; };
++        const Header header{0x314f454734364eULL, workload, output, records.size()};
++        std::vector<uint8_t> bytes(sizeof(header) + records.size() * sizeof(Record));
++        std::memcpy(bytes.data(), &header, sizeof(header));
++        if (!records.empty()) std::memcpy(bytes.data() + sizeof(header), records.data(), records.size() * sizeof(Record));
++        static const auto table = [] {
++            std::array<uint32_t, 256> values{};
++            for (uint32_t i = 0; i < 256; ++i) {
++                uint32_t value = i;
++                for (unsigned bit = 0; bit < 8; ++bit) value = (value >> 1) ^ ((value & 1) ? 0xedb88320U : 0);
++                values[i] = value;
++            }
++            return values;
++        }();
++        uint32_t crc = UINT32_MAX;
++        for (uint8_t byte : bytes) crc = table[(crc ^ byte) & 255] ^ (crc >> 8);
++        crc ^= UINT32_MAX;
++        std::string suffix = std::string(".geometry-") + (gpu ? "gpu-" : "cpu-") + std::to_string(workload) + "-" + std::to_string(output) + ".bin";
++        return PerformanceProfiler::writeAttachment(suffix, bytes.data(), bytes.size(),
++            gpu ? "Geometry.BinaryGPU" : "Geometry.BinaryCPU", workload, output, crc);
++    } catch (const std::bad_alloc &) {
++        PerformanceProfiler::recordCriticalInstant(PerformanceCategory::Counter, "Geometry.Rejected", workload, output, records.size());
++        return false;
++    }
++};
++}

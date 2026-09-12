@@ -1,0 +1,1027 @@
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+index 9ba23d6..ef05cfb 100644
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -23,6 +23,7 @@
+ #include <sstream>
+ #include <string>
+ #include <thread>
++#include <type_traits>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -73,12 +74,29 @@ namespace RT64 {
+         constexpr uint64_t EventChunkSize = 1'024;
+ 
+         struct ThreadBuffer {
++            explicit ThreadBuffer(uint64_t maximumEvents) {
++                eventChunkCapacity = std::max<uint64_t>(
++                    1,
++                    (maximumEvents + EventChunkSize - 1) / EventChunkSize
++                );
++                eventChunks = std::make_unique<std::atomic<Event *>[]>(
++                    eventChunkCapacity
++                );
++                for (uint64_t index = 0; index < eventChunkCapacity; ++index) {
++                    eventChunks[index].store(nullptr, std::memory_order_relaxed);
++                }
++                eventChunkOwners.reserve(size_t(eventChunkCapacity));
++            }
++
+             uint32_t id = 0;
++            mutable std::mutex nameMutex;
+             std::string name;
+-            std::vector<std::unique_ptr<Event[]>> eventChunks;
+-            uint64_t eventCount = 0;
++            std::unique_ptr<std::atomic<Event *>[]> eventChunks;
++            std::vector<std::unique_ptr<Event[]>> eventChunkOwners;
++            uint64_t eventChunkCapacity = 0;
++            std::atomic<uint64_t> eventCount = 0;
+             uint64_t reservedEventsRemaining = 0;
+-            uint64_t droppedEvents = 0;
++            std::atomic<uint64_t> droppedEvents = 0;
+         };
+ 
+         struct Statistics {
+@@ -146,6 +164,7 @@ namespace RT64 {
+         };
+ 
+         struct SlowFrame {
++            uint64_t timestampNanoseconds = 0;
+             uint64_t presentId = 0;
+             uint64_t workloadId = 0;
+             uint64_t targetSetId = 0;
+@@ -162,6 +181,16 @@ namespace RT64 {
+             std::string confidence;
+         };
+ 
++        struct PresentationRegimeStatistics {
++            uint32_t sourceRate = 0;
++            uint32_t targetRate = 0;
++            uint64_t frameCount = 0;
++            uint64_t firstTimestampNanoseconds = 0;
++            uint64_t lastTimestampNanoseconds = 0;
++            std::vector<double> intervalsMilliseconds;
++            std::unordered_set<uint64_t> targetSetIds;
++        };
++
+         struct HostProcessUsage {
+             uint32_t processId = 0;
+             std::string name;
+@@ -208,6 +237,18 @@ namespace RT64 {
+             std::mutex hostObservationMutex;
+             std::atomic<bool> hostObservationRunning = false;
+             std::thread hostObservationThread;
++            uint64_t checkpointIntervalMilliseconds = 5'000;
++            uint64_t journalIntervalMilliseconds = 250;
++            std::filesystem::path journalPath;
++            std::filesystem::path livePath;
++            std::mutex checkpointMutex;
++            std::atomic<bool> checkpointStarted = false;
++            std::atomic<bool> checkpointRunning = false;
++            std::atomic<bool> journalHealthy = false;
++            std::atomic<uint64_t> journalEventsWritten = 0;
++            std::atomic<uint64_t> journalFlushCount = 0;
++            std::atomic<uint64_t> checkpointGeneration = 0;
++            std::thread checkpointThread;
+ #ifdef _WIN32
+             std::mutex displayObservationMutex;
+             std::atomic<bool> displayObservationRunning = false;
+@@ -217,6 +258,8 @@ namespace RT64 {
+ #endif
+         };
+ 
++        void startCheckpointObservation(ProfilerState &profiler);
++
+         const char *categoryName(PerformanceCategory category) {
+             switch (category) {
+             case PerformanceCategory::Frame: return "frame";
+@@ -318,6 +361,27 @@ namespace RT64 {
+                     newState->summaryPath = newState->outputPath;
+                     newState->summaryPath += ".summary.json";
+                 }
++                newState->journalPath = newState->outputPath;
++                newState->journalPath += ".journal.jsonl";
++                newState->livePath = newState->outputPath;
++                newState->livePath += ".live.json";
++                newState->checkpointIntervalMilliseconds =
++                    std::max<uint64_t>(
++                        1'000,
++                        parsePositiveInteger(
++                            "RT64_PROFILE_CHECKPOINT_INTERVAL_MS",
++                            newState->checkpointIntervalMilliseconds
++                        )
++                    );
++                newState->journalIntervalMilliseconds =
++                    std::clamp<uint64_t>(
++                        parsePositiveInteger(
++                            "RT64_PROFILE_JOURNAL_INTERVAL_MS",
++                            newState->journalIntervalMilliseconds
++                        ),
++                        25,
++                        5'000
++                    );
+ 
+                 newState->budgetMilliseconds = parsePositiveDouble(
+                     "RT64_PROFILE_BUDGET_MS",
+@@ -397,10 +461,11 @@ namespace RT64 {
+                 newState->accepting.store(true, std::memory_order_release);
+                 std::fprintf(
+                     stderr,
+-                    "RT64_PROFILE enabled=1 mode=%s output=%s summary=%s budget_ms=%.3f max_events=%llu warmup_frames=%llu cooldown_frames=%llu min_duration_us=%llu slow_duration_us=%llu duration_interval=%llu counter_interval=%llu low_overhead_min_duration_us=%llu gpu_instrumentation=%d\n",
++                    "RT64_PROFILE enabled=1 mode=%s output=%s summary=%s journal=%s budget_ms=%.3f max_events=%llu warmup_frames=%llu cooldown_frames=%llu min_duration_us=%llu slow_duration_us=%llu duration_interval=%llu counter_interval=%llu low_overhead_min_duration_us=%llu gpu_instrumentation=%d journal_interval_ms=%llu checkpoint_interval_ms=%llu\n",
+                     newState->lowOverhead ? "low_overhead" : "detailed",
+                     newState->outputPath.string().c_str(),
+                     newState->summaryPath.string().c_str(),
++                    newState->journalPath.string().c_str(),
+                     newState->budgetMilliseconds,
+                     static_cast<unsigned long long>(newState->maximumEvents),
+                     static_cast<unsigned long long>(newState->warmupFrames),
+@@ -420,12 +485,25 @@ namespace RT64 {
+                     static_cast<unsigned long long>(
+                         newState->lowOverheadMinimumDurationNanoseconds / 1'000
+                     ),
+-                    newState->gpuInstrumentation ? 1 : 0
++                    newState->gpuInstrumentation ? 1 : 0,
++                    static_cast<unsigned long long>(
++                        newState->journalIntervalMilliseconds
++                    ),
++                    static_cast<unsigned long long>(
++                        newState->checkpointIntervalMilliseconds
++                    )
+                 );
+                 std::fflush(stderr);
+                 std::atexit([]() { PerformanceProfiler::finish(); });
+                 return newState;
+             }();
++            if (instance->accepting.load(std::memory_order_acquire) &&
++                !instance->checkpointStarted.exchange(
++                    true,
++                    std::memory_order_acq_rel
++                )) {
++                startCheckpointObservation(*instance);
++            }
+             return *instance;
+         }
+ 
+@@ -437,7 +515,7 @@ namespace RT64 {
+ 
+             thread_local ThreadBuffer *buffer = nullptr;
+             if (buffer == nullptr) {
+-                buffer = new ThreadBuffer();
++                buffer = new ThreadBuffer(profiler.maximumEvents);
+                 buffer->name = "Thread";
+                 const std::scoped_lock lock(profiler.registryMutex);
+                 buffer->id = uint32_t(profiler.threadBuffers.size() + 1);
+@@ -473,7 +551,10 @@ namespace RT64 {
+                         std::memory_order_relaxed
+                     );
+                 if (reservationStart >= profiler.maximumEvents) {
+-                    ++buffer->droppedEvents;
++                    buffer->droppedEvents.fetch_add(
++                        1,
++                        std::memory_order_relaxed
++                    );
+                     return;
+                 }
+                 buffer->reservedEventsRemaining = std::min(
+@@ -482,30 +563,64 @@ namespace RT64 {
+                 );
+             }
+ 
+-            if ((buffer->eventCount % EventChunkSize) == 0) {
++            const uint64_t eventCount = buffer->eventCount.load(
++                std::memory_order_relaxed
++            );
++            const uint64_t chunkIndex = eventCount / EventChunkSize;
++            if (chunkIndex >= buffer->eventChunkCapacity) {
++                buffer->droppedEvents.fetch_add(
++                    1,
++                    std::memory_order_relaxed
++                );
++                return;
++            }
++
++            if ((eventCount % EventChunkSize) == 0) {
+                 std::unique_ptr<Event[]> chunk(
+                     new (std::nothrow) Event[EventChunkSize]
+                 );
+                 if (chunk == nullptr) {
+-                    ++buffer->droppedEvents;
++                    buffer->droppedEvents.fetch_add(
++                        1,
++                        std::memory_order_relaxed
++                    );
+                     return;
+                 }
+ 
+                 try {
+-                    buffer->eventChunks.emplace_back(std::move(chunk));
++                    Event *publishedChunk = chunk.get();
++                    buffer->eventChunkOwners.emplace_back(std::move(chunk));
++                    buffer->eventChunks[chunkIndex].store(
++                        publishedChunk,
++                        std::memory_order_release
++                    );
+                 }
+                 catch (const std::bad_alloc &) {
+-                    ++buffer->droppedEvents;
++                    buffer->droppedEvents.fetch_add(
++                        1,
++                        std::memory_order_relaxed
++                    );
+                     return;
+                 }
+             }
+ 
+             event.threadId = buffer->id;
+-            Event &destination = buffer->eventChunks[
+-                buffer->eventCount / EventChunkSize
+-            ][buffer->eventCount % EventChunkSize];
++            Event *chunk = buffer->eventChunks[chunkIndex].load(
++                std::memory_order_acquire
++            );
++            if (chunk == nullptr) {
++                buffer->droppedEvents.fetch_add(
++                    1,
++                    std::memory_order_relaxed
++                );
++                return;
++            }
++            Event &destination = chunk[eventCount % EventChunkSize];
+             destination = std::move(event);
+-            ++buffer->eventCount;
++            buffer->eventCount.store(
++                eventCount + 1,
++                std::memory_order_release
++            );
+             --buffer->reservedEventsRemaining;
+         }
+ 
+@@ -1039,9 +1154,10 @@ namespace RT64 {
+ #endif
+ 
+         const Event &eventAt(const ThreadBuffer &buffer, uint64_t index) {
+-            return buffer.eventChunks[index / EventChunkSize][
+-                index % EventChunkSize
+-            ];
++            Event *chunk = buffer.eventChunks[
++                index / EventChunkSize
++            ].load(std::memory_order_acquire);
++            return chunk[index % EventChunkSize];
+         }
+ 
+         uint64_t recordedEventCount(
+@@ -1049,7 +1165,7 @@ namespace RT64 {
+         ) {
+             uint64_t total = 0;
+             for (const ThreadBuffer *buffer : buffers) {
+-                total += buffer->eventCount;
++                total += buffer->eventCount.load(std::memory_order_acquire);
+             }
+             return total;
+         }
+@@ -1061,7 +1177,9 @@ namespace RT64 {
+             uint64_t total =
+                 profiler.droppedEvents.load(std::memory_order_relaxed);
+             for (const ThreadBuffer *buffer : buffers) {
+-                total += buffer->droppedEvents;
++                total += buffer->droppedEvents.load(
++                    std::memory_order_relaxed
++                );
+             }
+             return total;
+         }
+@@ -1136,12 +1254,250 @@ namespace RT64 {
+             }
+         }
+ 
++        bool replaceFileAtomically(
++            const std::filesystem::path &temporaryPath,
++            const std::filesystem::path &finalPath
++        ) {
++#ifdef _WIN32
++            return MoveFileExW(
++                temporaryPath.c_str(),
++                finalPath.c_str(),
++                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
++            ) != FALSE;
++#else
++            std::error_code error;
++            std::filesystem::rename(temporaryPath, finalPath, error);
++            return !error;
++#endif
++        }
++
++        void writeJournalEvent(std::ostream &output, const Event &event) {
++            output << "{\"record\":\"event\",\"name\":\""
++                << jsonEscape(event.name.data()) << "\",\"category\":\""
++                << categoryName(event.category) << "\",\"kind\":"
++                << unsigned(event.kind) << ",\"timestamp_ns\":"
++                << event.timestampNanoseconds << ",\"duration_ns\":"
++                << event.durationNanoseconds << ",\"thread_cpu_duration_ns\":"
++                << event.threadCpuDurationNanoseconds << ",\"correlation_id\":"
++                << event.correlationId << ",\"argument0\":"
++                << event.argument0 << ",\"argument1\":"
++                << event.argument1 << ",\"gpu_start_ns\":"
++                << event.gpuStartNanoseconds << ",\"gpu_end_ns\":"
++                << event.gpuEndNanoseconds << ",\"value\":"
++                << std::setprecision(17) << event.value << ",\"thread_id\":"
++                << event.threadId << ",\"gpu_clock\":"
++                << (event.gpuClock ? "true" : "false")
++                << ",\"thread_cpu_measured\":"
++                << (event.threadCpuMeasured ? "true" : "false") << "}\n";
++        }
++
++        bool writeLiveCheckpoint(
++            ProfilerState &profiler,
++            const std::vector<ThreadBuffer *> &buffers
++        ) {
++            std::filesystem::path temporaryPath = profiler.livePath;
++            temporaryPath += ".tmp";
++            ensureParentDirectory(temporaryPath);
++            std::ofstream output(temporaryPath, std::ios::binary);
++            if (!output.is_open()) {
++                return false;
++            }
++
++            uint64_t latestTimestampNanoseconds = 0;
++            for (const ThreadBuffer *buffer : buffers) {
++                const uint64_t count = buffer->eventCount.load(
++                    std::memory_order_acquire
++                );
++                if (count > 0) {
++                    latestTimestampNanoseconds = std::max(
++                        latestTimestampNanoseconds,
++                        eventAt(*buffer, count - 1).timestampNanoseconds
++                    );
++                }
++            }
++            const uint64_t generation =
++                profiler.checkpointGeneration.fetch_add(
++                    1,
++                    std::memory_order_relaxed
++                ) + 1;
++            output << "{\n"
++                << "  \"schema\": \"rt64-performance-live-v1\",\n"
++                << "  \"generation\": " << generation << ",\n"
++                << "  \"journal\": \""
++                << jsonEscape(profiler.journalPath.string()) << "\",\n"
++                << "  \"journal_healthy\": "
++                << (profiler.journalHealthy.load(std::memory_order_acquire)
++                    ? "true" : "false") << ",\n"
++                << "  \"journal_events_written\": "
++                << profiler.journalEventsWritten.load(
++                    std::memory_order_acquire
++                ) << ",\n"
++                << "  \"journal_flush_count\": "
++                << profiler.journalFlushCount.load(
++                    std::memory_order_acquire
++                ) << ",\n"
++                << "  \"recorded_events\": "
++                << recordedEventCount(buffers) << ",\n"
++                << "  \"dropped_events\": "
++                << droppedEventCount(profiler, buffers) << ",\n"
++                << "  \"latest_timestamp_ns\": "
++                << latestTimestampNanoseconds << "\n}\n";
++            output.flush();
++            const bool written = output.good();
++            output.close();
++            return written && replaceFileAtomically(
++                temporaryPath,
++                profiler.livePath
++            );
++        }
++
++        void startCheckpointObservation(ProfilerState &profiler) {
++            const std::scoped_lock startLock(profiler.checkpointMutex);
++            if (profiler.checkpointThread.joinable()) {
++                return;
++            }
++
++            ensureParentDirectory(profiler.journalPath);
++            {
++                const std::scoped_lock metadataLock(profiler.metadataMutex);
++                profiler.metadata["capture_durability"] =
++                    "incremental_jsonl_journal";
++                profiler.metadata["journal_path"] =
++                    profiler.journalPath.string();
++                profiler.metadata["journal_interval_ms"] =
++                    std::to_string(profiler.journalIntervalMilliseconds);
++                profiler.metadata["live_checkpoint_interval_ms"] =
++                    std::to_string(profiler.checkpointIntervalMilliseconds);
++            }
++            profiler.checkpointRunning.store(true, std::memory_order_release);
++            profiler.checkpointThread = std::thread([&profiler]() {
++                std::ofstream journal(
++                    profiler.journalPath,
++                    std::ios::binary | std::ios::trunc
++                );
++                if (!journal.is_open()) {
++                    std::fprintf(
++                        stderr,
++                        "RT64_PROFILE journal_open_failed=1 path=%s\n",
++                        profiler.journalPath.string().c_str()
++                    );
++                    std::fflush(stderr);
++                    return;
++                }
++
++                journal << "{\"record\":\"header\",\"schema\":\"rt64-performance-journal-v1\",\"clock\":\"steady_clock_nanoseconds\"}\n";
++                journal.flush();
++                profiler.journalHealthy.store(
++                    journal.good(),
++                    std::memory_order_release
++                );
++
++                std::unordered_map<ThreadBuffer *, uint64_t> cursors;
++                std::unordered_map<ThreadBuffer *, std::string> threadNames;
++                std::map<std::string, std::string> writtenMetadata;
++                auto nextLiveCheckpoint = Clock::now();
++                while (true) {
++                    std::vector<ThreadBuffer *> buffers;
++                    {
++                        const std::scoped_lock registryLock(
++                            profiler.registryMutex
++                        );
++                        buffers = profiler.threadBuffers;
++                    }
++
++                    std::map<std::string, std::string> metadata;
++                    {
++                        const std::scoped_lock metadataLock(
++                            profiler.metadataMutex
++                        );
++                        metadata = profiler.metadata;
++                    }
++                    for (const auto &[key, value] : metadata) {
++                        const auto previous = writtenMetadata.find(key);
++                        if ((previous == writtenMetadata.end()) ||
++                            (previous->second != value)) {
++                            journal << "{\"record\":\"metadata\",\"key\":\""
++                                << jsonEscape(key) << "\",\"value\":\""
++                                << jsonEscape(value) << "\"}\n";
++                            writtenMetadata[key] = value;
++                        }
++                    }
++
++                    uint64_t eventsWritten = 0;
++                    for (ThreadBuffer *buffer : buffers) {
++                        std::string name;
++                        {
++                            const std::scoped_lock nameLock(
++                                buffer->nameMutex
++                            );
++                            name = buffer->name;
++                        }
++                        const auto previousName = threadNames.find(buffer);
++                        if ((previousName == threadNames.end()) ||
++                            (previousName->second != name)) {
++                            journal << "{\"record\":\"thread\",\"thread_id\":"
++                                << buffer->id << ",\"name\":\""
++                                << jsonEscape(name) << "\"}\n";
++                            threadNames[buffer] = name;
++                        }
++
++                        uint64_t &cursor = cursors[buffer];
++                        const uint64_t count = buffer->eventCount.load(
++                            std::memory_order_acquire
++                        );
++                        while (cursor < count) {
++                            writeJournalEvent(
++                                journal,
++                                eventAt(*buffer, cursor)
++                            );
++                            ++cursor;
++                            ++eventsWritten;
++                        }
++                    }
++                    journal.flush();
++                    const bool healthy = journal.good();
++                    profiler.journalHealthy.store(
++                        healthy,
++                        std::memory_order_release
++                    );
++                    profiler.journalEventsWritten.fetch_add(
++                        eventsWritten,
++                        std::memory_order_release
++                    );
++                    profiler.journalFlushCount.fetch_add(
++                        1,
++                        std::memory_order_release
++                    );
++
++                    const auto now = Clock::now();
++                    if (now >= nextLiveCheckpoint) {
++                        writeLiveCheckpoint(profiler, buffers);
++                        nextLiveCheckpoint = now + std::chrono::milliseconds(
++                            profiler.checkpointIntervalMilliseconds
++                        );
++                    }
++
++                    if (!healthy ||
++                        !profiler.checkpointRunning.load(
++                            std::memory_order_acquire
++                        )) {
++                        break;
++                    }
++                    std::this_thread::sleep_for(std::chrono::milliseconds(
++                        profiler.journalIntervalMilliseconds
++                    ));
++                }
++                journal.close();
++            });
++        }
++
+         bool writeTrace(
+             const ProfilerState &profiler,
+-            const std::vector<ThreadBuffer *> &buffers
++            const std::vector<ThreadBuffer *> &buffers,
++            const std::filesystem::path &outputPath
+         ) {
+-            ensureParentDirectory(profiler.outputPath);
+-            std::ofstream output(profiler.outputPath, std::ios::binary);
++            ensureParentDirectory(outputPath);
++            std::ofstream output(outputPath, std::ios::binary);
+             if (!output.is_open()) {
+                 return false;
+             }
+@@ -1159,17 +1515,25 @@ namespace RT64 {
+             };
+ 
+             for (const ThreadBuffer *buffer : buffers) {
++                std::string threadName;
++                {
++                    const std::scoped_lock nameLock(buffer->nameMutex);
++                    threadName = buffer->name;
++                }
+                 separator();
+                 output << "    {\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":"
+                     << buffer->id << ",\"args\":{\"name\":\""
+-                    << jsonEscape(buffer->name) << "\"}}";
++                    << jsonEscape(threadName) << "\"}}";
+             }
+             separator();
+             output << "    {\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":4294967294,\"args\":{\"name\":\"RT64 GPU samples\"}}";
+ 
+             for (const ThreadBuffer *buffer : buffers) {
++                const uint64_t eventCount = buffer->eventCount.load(
++                    std::memory_order_acquire
++                );
+                 for (uint64_t eventIndex = 0;
+-                    eventIndex < buffer->eventCount;
++                    eventIndex < eventCount;
+                     ++eventIndex) {
+                     const Event &event = eventAt(*buffer, eventIndex);
+                     constexpr std::string_view DrawPrefix = "GPU.Draw.";
+@@ -1451,7 +1815,8 @@ namespace RT64 {
+ 
+         bool writeSummary(
+             const ProfilerState &profiler,
+-            const std::vector<ThreadBuffer *> &buffers
++            const std::vector<ThreadBuffer *> &buffers,
++            const std::filesystem::path &summaryPath
+         ) {
+             std::map<std::pair<PerformanceCategory, std::string>, Statistics> map;
+             std::map<std::string, ThreadExecutionStatistics>
+@@ -1473,6 +1838,7 @@ namespace RT64 {
+             std::vector<const Event *> runtimeVIIntervalEvents;
+             std::vector<const Event *> runtimeVIWakeDeadlineMissEvents;
+             std::vector<const Event *> manualPacingResultEvents;
++            std::vector<const Event *> contextEvents;
+             std::vector<double> runtimeVIIntervals;
+             std::vector<double> runtimeVIWakeDeadlineMisses;
+             uint64_t runtimeVISkippedRetraces = 0;
+@@ -1526,8 +1892,11 @@ namespace RT64 {
+             std::map<std::pair<std::string, uint32_t>, DrawHotspotStatistics>
+                 drawHotspotMap;
+             for (const ThreadBuffer *buffer : buffers) {
++                const uint64_t eventCount = buffer->eventCount.load(
++                    std::memory_order_acquire
++                );
+                 for (uint64_t eventIndex = 0;
+-                    eventIndex < buffer->eventCount;
++                    eventIndex < eventCount;
+                     ++eventIndex) {
+                     const Event &event = eventAt(*buffer, eventIndex);
+                     if ((event.kind == EventKind::Duration) &&
+@@ -1648,6 +2017,10 @@ namespace RT64 {
+                     }
+                     else if (event.kind == EventKind::Instant) {
+                         const std::string_view eventName(event.name.data());
++                        if ((eventName.size() >= 13u) &&
++                            (eventName.substr(0, 13u) == "Host.Context.")) {
++                            contextEvents.emplace_back(&event);
++                        }
+                         if ((event.category == PerformanceCategory::Frame) &&
+                             (eventName == "Present.Submitted")) {
+                             displayedEvents.emplace_back(&event);
+@@ -2292,4 +2665,75 @@ namespace RT64 {
+                 }
+             }
+ 
++            std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>>
++                workloadPresentationRates;
++            for (const Event *event : interpolationBatchEvents) {
++                if (event->argument0 > 1u) {
++                    workloadPresentationRates[event->correlationId] = {
++                        interpolationSourceRate(*event),
++                        interpolationTargetRate(*event)
++                    };
++                }
++            }
++            const auto presentationRates = [&](const Event *event) {
++                const auto found = workloadPresentationRates.find(
++                    event->argument0
++                );
++                return found != workloadPresentationRates.end()
++                    ? found->second
++                    : std::pair<uint32_t, uint32_t>{0u, 0u};
++            };
++            std::map<std::pair<uint32_t, uint32_t>,
++                PresentationRegimeStatistics> presentationRegimeMap;
++            for (size_t i = 0; i < displayedEvents.size(); ++i) {
++                const Event *current = displayedEvents[i];
++                const auto rates = presentationRates(current);
++                PresentationRegimeStatistics &regime =
++                    presentationRegimeMap[rates];
++                regime.sourceRate = rates.first;
++                regime.targetRate = rates.second;
++                regime.frameCount++;
++                regime.targetSetIds.insert(current->argument1);
++                if (regime.firstTimestampNanoseconds == 0u) {
++                    regime.firstTimestampNanoseconds =
++                        current->timestampNanoseconds;
++                }
++                regime.lastTimestampNanoseconds = current->timestampNanoseconds;
++                if (i == 0u) {
++                    continue;
++                }
++                const Event *previous = displayedEvents[i - 1u];
++                if ((presentationRates(previous) == rates) &&
++                    (current->timestampNanoseconds >
++                        previous->timestampNanoseconds)) {
++                    regime.intervalsMilliseconds.emplace_back(
++                        double(current->timestampNanoseconds -
++                            previous->timestampNanoseconds) / 1'000'000.0
++                    );
++                }
++            }
++            std::vector<const PresentationRegimeStatistics *>
++                presentationRegimes;
++            presentationRegimes.reserve(presentationRegimeMap.size());
++            for (const auto &[rates, regime] : presentationRegimeMap) {
++                presentationRegimes.emplace_back(&regime);
++            }
++            std::sort(
++                presentationRegimes.begin(),
++                presentationRegimes.end(),
++                [](const PresentationRegimeStatistics *left,
++                   const PresentationRegimeStatistics *right) {
++                    return left->firstTimestampNanoseconds <
++                        right->firstTimestampNanoseconds;
++                }
++            );
++            std::sort(
++                contextEvents.begin(),
++                contextEvents.end(),
++                [](const Event *left, const Event *right) {
++                    return left->timestampNanoseconds <
++                        right->timestampNanoseconds;
++                }
++            );
++
+             // A capture may cross frontend, loading, gameplay, and display-rate transitions.
+@@ -2998,6 +3442,8 @@ namespace RT64 {
+                     }
+ 
+                     SlowFrame slowFrame;
++                    slowFrame.timestampNanoseconds =
++                        current->timestampNanoseconds;
+                     slowFrame.presentId = current->correlationId;
+                     slowFrame.workloadId = current->argument0;
+                     slowFrame.targetSetId = current->argument1;
+@@ -3894,16 +4340,35 @@ namespace RT64 {
+                 }
+             );
+ 
+-            ensureParentDirectory(profiler.summaryPath);
+-            std::ofstream output(profiler.summaryPath, std::ios::binary);
++            ensureParentDirectory(summaryPath);
++            std::ofstream output(summaryPath, std::ios::binary);
+             if (!output.is_open()) {
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v39\",\n";
++            output << "{\n  \"schema\": \"rt64-performance-summary-v40\",\n";
+             output << "  \"capture_mode\": \""
+                 << (profiler.lowOverhead ? "low_overhead" : "detailed")
+                 << "\",\n";
++            output << "  \"durability\": {\"journal_schema\":\"rt64-performance-journal-v1\",\"journal_interval_ms\":"
++                << profiler.journalIntervalMilliseconds
++                << ",\"live_checkpoint_interval_ms\":"
++                << profiler.checkpointIntervalMilliseconds
++                << ",\"journal_healthy\":"
++                << (profiler.journalHealthy.load(std::memory_order_acquire)
++                    ? "true" : "false")
++                << ",\"journal_events_written\":"
++                << profiler.journalEventsWritten.load(
++                    std::memory_order_acquire
++                )
++                << ",\"journal_flush_count\":"
++                << profiler.journalFlushCount.load(
++                    std::memory_order_acquire
++                )
++                << ",\"checkpoint_generation\":"
++                << profiler.checkpointGeneration.load(
++                    std::memory_order_acquire
++                ) << "},\n";
+             output << "  \"metadata\": {";
+             size_t summaryMetadataIndex = 0;
+             for (const auto &[key, value] : profiler.metadata) {
+@@ -3922,6 +4387,84 @@ namespace RT64 {
+             output << "  \"budget_ms\": " << budget << ",\n";
+             output << "  \"target_hz\": "
+                 << dominantInterpolationTargetRate << ",\n";
++            output << "  \"presentation_regimes\": [";
++            for (size_t regimeIndex = 0;
++                 regimeIndex < presentationRegimes.size();
++                 ++regimeIndex) {
++                const PresentationRegimeStatistics &regime =
++                    *presentationRegimes[regimeIndex];
++                if (regimeIndex > 0u) {
++                    output << ',';
++                }
++                const double median = percentile(
++                    regime.intervalsMilliseconds,
++                    0.50
++                );
++                const double expected = regime.targetRate > 0u
++                    ? (1'000.0 / double(regime.targetRate))
++                    : median;
++                const double tolerance = std::max(0.75, expected * 0.12);
++                uint64_t lateIntervals = 0;
++                uint64_t longShortPairs = 0;
++                for (size_t intervalIndex = 0;
++                     intervalIndex < regime.intervalsMilliseconds.size();
++                     ++intervalIndex) {
++                    const double interval =
++                        regime.intervalsMilliseconds[intervalIndex];
++                    lateIntervals += interval > (expected + tolerance)
++                        ? 1u : 0u;
++                    if (intervalIndex > 0u) {
++                        const double previous =
++                            regime.intervalsMilliseconds[intervalIndex - 1u];
++                        const bool pair =
++                            ((previous > expected + tolerance) &&
++                             (interval < expected - tolerance)) ||
++                            ((interval > expected + tolerance) &&
++                             (previous < expected - tolerance));
++                        longShortPairs += pair ? 1u : 0u;
++                    }
++                }
++                output << "{\"basis\":\"present_submission\",\"physical_scanout\":false,\"source_hz\":"
++                    << regime.sourceRate
++                    << ",\"target_hz\":" << regime.targetRate
++                    << ",\"frames\":" << regime.frameCount
++                    << ",\"intervals\":"
++                    << regime.intervalsMilliseconds.size()
++                    << ",\"target_sets\":" << regime.targetSetIds.size()
++                    << ",\"first_timestamp_ns\":"
++                    << regime.firstTimestampNanoseconds
++                    << ",\"last_timestamp_ns\":"
++                    << regime.lastTimestampNanoseconds
++                    << ",\"expected_interval_ms\":" << expected
++                    << ",\"p50_ms\":" << median
++                    << ",\"p95_ms\":"
++                    << percentile(regime.intervalsMilliseconds, 0.95)
++                    << ",\"p99_ms\":"
++                    << percentile(regime.intervalsMilliseconds, 0.99)
++                    << ",\"max_ms\":"
++                    << percentile(regime.intervalsMilliseconds, 1.0)
++                    << ",\"irregular_submission_intervals\":"
++                    << lateIntervals
++                    << ",\"long_short_pairs\":" << longShortPairs
++                    << '}';
++            }
++            output << "],\n";
++            output << "  \"context_timeline\": [";
++            for (size_t contextIndex = 0;
++                 contextIndex < contextEvents.size();
++                 ++contextIndex) {
++                const Event &event = *contextEvents[contextIndex];
++                if (contextIndex > 0u) {
++                    output << ',';
++                }
++                output << "{\"timestamp_ns\":"
++                    << event.timestampNanoseconds << ",\"name\":\""
++                    << jsonEscape(event.name.data())
++                    << "\",\"sequence\":" << event.correlationId
++                    << ",\"argument0\":" << event.argument0
++                    << ",\"argument1\":" << event.argument1 << '}';
++            }
++            output << "],\n";
+             output << "  \"host_resources\": {\"available\":"
+                 << (!hostSystemCpu.empty() ? "true" : "false")
+                 << ",\"gpu_available\":"
+@@ -4580,7 +5123,9 @@ namespace RT64 {
+                 if (i > 0) {
+                     output << ",\n";
+                 }
+-                output << "    {\"present_id\":" << frame.presentId
++                output << "    {\"timestamp_ns\":"
++                    << frame.timestampNanoseconds
++                    << ",\"present_id\":" << frame.presentId
+                     << ",\"workload_id\":" << frame.workloadId
+                     << ",\"target_set_id\":" << frame.targetSetId
+                     << ",\"interval_ms\":" << frame.intervalMilliseconds
+@@ -5035,84 +5580,8 @@ namespace RT64 {
+         if (!profiler.accepting.load(std::memory_order_acquire)) {
+             return false;
+         }
+-        if (!profiler.lowOverhead) {
+-            return true;
+-        }
+-
+-        static const std::unordered_set<std::string_view> flightRecorderNames = {
+-            "Application.ProcessDisplayLists",
+-            "State.RDRAMCheck",
+-            "State.FullSync",
+-            "State.FullSyncFramebufferPairFinalize",
+-            "State.FullSyncDrawCallFinalize",
+-            "State.FullSyncResourcePreparation",
+-            "State.FullSyncFramebufferAndTextureProcessing",
+-            "State.FullSyncMaterialFinalize",
+-            "State.FullSyncWorkloadAdvance",
+-            "State.FullSyncEarlyPresentAndReset",
+-            "FrameProduction.ScreenUpdateActionQueueDelay",
+-            "FrameProduction.GraphicsTaskActionQueueDelay",
+-            "FrameProduction.ScreenUpdateActionWork",
+-            "FrameProduction.GraphicsTaskActionWork",
+-            "FrameProduction.RuntimeVIInterval",
+-            "FrameProduction.RuntimeVIWakeDeadlineMiss",
+-            "FrameProduction.GuestGraphicsTaskInterval",
+-            "FrameProduction.GuestGraphicsWaitAfterCompletion",
+-            "FrameProduction.GuestGraphicsSchedulerDelay",
+-            "FrameProduction.GraphicsTaskDispatchDelay",
+-            "FrameProduction.GraphicsActionQueueDelay",
+-            "FrameProduction.WorkloadProducerBackpressure",
+-            "FrameProduction.PresentProducerBackpressure",
+-            "FrameProduction.PresentQueueStarvation",
+-            "Workload.InterpolationBatch",
+-            "Workload.InterpolationReuseWait",
+-            "Workload.PreviousPresentWait",
+-            "Workload.PresentationTargetClaimWait",
+-            "Workload.PresentationEventQueueWait",
+-            "Workload.PresentationSetCommitWait",
+-            "Workload.FirstPresentationQueueWait",
+-            "Renderer.InterpolationBatchFenceDrain",
+-            "Renderer.InterpolationWorkerReuseWait",
+-            "Renderer.Frame",
+-            "Renderer.WorkloadMutexWait",
+-            "Renderer.WorkerMutexWait",
+-            "Renderer.CommandBuild",
+-            "Renderer.UploadWait",
+-            "Renderer.GPUFenceWait",
+-            "Renderer.WorkloadMutexRelock",
+-            "Present.WorkloadReadyWait",
+-            "Present.WorkloadManagerMutexWait",
+-            "Present.InterpolationWait",
+-            "Present.SwapChainAcquire",
+-            "Present.CommandBuildAndSubmit",
+-            "Present.ManualPacing",
+-            "Present.FrameLatencyWait",
+-            "Present.DriverPresentCall",
+-            "Present.GPUFenceWait",
+-            "Present.PresentationSlotReuseWait",
+-            "Present.PresentationSlotGPUCompletion",
+-            "Present.PresentationSlotResizeWait",
+-            "Present.PresentationSlotShutdownWait",
+-            "Present.ActualScanoutInterval",
+-            "Present.DesktopOutputChangeInterval",
+-            "Present.DisplayVBlankInterval",
+-            "Present.EstimatedDisplayedFrameInterval",
+-            "Present.PresentWaitCompletionInterval",
+-            "Present.SwapChainImageReleaseObservationInterval",
+-            "Shader.SpecializedCompileMutexWait",
+-            "Shader.ProvisionalPipelineCompile",
+-            "Shader.NativePipelineCompile",
+-            "Shader.SpecializedModuleCreate",
+-            "Shader.NativeModuleCreate",
+-            "Shader.SpecializedPipelineCreate",
+-            "Texture.StreamAndDecode",
+-            "Texture.StreamFileLoad",
+-            "Texture.StreamGPUCreateAndUpload",
+-            "Texture.UploadBatch",
+-            "Texture.UploadDrainWait",
+-            "Buffer.UploadBatch"
+-        };
+-        return flightRecorderNames.find(name) != flightRecorderNames.end();
++        // Retain causal events and long outliers; filter short scopes to bound recording cost.
++        return true;
+    }
+ 
+     bool PerformanceProfiler::gpuInstrumentationEnabled() {
+@@ -5657,6 +6126,7 @@ namespace RT64 {
+     void PerformanceProfiler::setThreadName(std::string_view name) {
+         ThreadBuffer *buffer = threadBuffer();
+         if (buffer != nullptr) {
++            const std::scoped_lock nameLock(buffer->nameMutex);
+             buffer->name.assign(name.data(), name.size());
+         }
+     }
+@@ -5861,6 +6331,8 @@ namespace RT64 {
+             return;
+         }
+         if (lowOverheadEnabled() &&
++            !((name.size() >= 13u) &&
++                (name.substr(0, 13u) == "Host.Context.")) &&
+             (name != "Present.Submitted") &&
+             (name != "Present.Enqueued") &&
+             (name != "Present.Dequeued") &&
+@@ -5952,6 +6424,15 @@ namespace RT64 {
+             }
+         }
+ #endif
++        profiler.checkpointRunning.store(false, std::memory_order_release);
++        {
++            const std::scoped_lock checkpointLock(
++                profiler.checkpointMutex
++            );
++            if (profiler.checkpointThread.joinable()) {
++                profiler.checkpointThread.join();
++            }
++        }
+         profiler.accepting.store(false, std::memory_order_release);
+         std::vector<ThreadBuffer *> buffers;
+         {
+@@ -5960,13 +6441,51 @@ namespace RT64 {
+         }
+         {
+             const std::scoped_lock lock(profiler.metadataMutex);
+-            const bool summaryWritten = writeSummary(profiler, buffers);
+-            const bool traceWritten = writeTrace(profiler, buffers);
++            std::filesystem::path summaryTemporary = profiler.summaryPath;
++            summaryTemporary += ".final.tmp";
++            std::filesystem::path traceTemporary = profiler.outputPath;
++            traceTemporary += ".final.tmp";
++            const bool summarySerialized = writeSummary(
++                profiler,
++                buffers,
++                summaryTemporary
++            );
++            const bool traceSerialized = writeTrace(
++                profiler,
++                buffers,
++                traceTemporary
++            );
++            const bool summaryWritten = summarySerialized &&
++                replaceFileAtomically(
++                    summaryTemporary,
++                    profiler.summaryPath
++                );
++            const bool traceWritten = traceSerialized &&
++                replaceFileAtomically(
++                    traceTemporary,
++                    profiler.outputPath
++                );
++            if (summaryWritten && traceWritten) {
++                std::error_code removeError;
++                std::filesystem::remove(
++                    profiler.journalPath,
++                    removeError
++                );
++                removeError.clear();
++                std::filesystem::remove(profiler.livePath, removeError);
++            }
+             std::fprintf(
+                 stderr,
+-                "RT64_PROFILE finished=1 trace_written=%d summary_written=%d events=%llu dropped=%llu trace=%s summary=%s\n",
++                "RT64_PROFILE finished=1 trace_written=%d summary_written=%d journal_healthy=%d journal_events=%llu events=%llu dropped=%llu trace=%s summary=%s\n",
+                 traceWritten ? 1 : 0,
+                 summaryWritten ? 1 : 0,
++                profiler.journalHealthy.load(std::memory_order_acquire)
++                    ? 1 : 0,
++                static_cast<unsigned long long>(
++                    profiler.journalEventsWritten.load(
++                        std::memory_order_acquire
++                    )
++                ),
+                 static_cast<unsigned long long>(recordedEventCount(buffers)),
+                 static_cast<unsigned long long>(
+                     droppedEventCount(profiler, buffers)
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+index ef05cfb..f0d7d7e 100644
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -5561,8 +5561,7 @@ namespace RT64 {
+ 
+     bool PerformanceProfiler::enabled() {
+         const ProfilerState &profiler = state();
+-        return profiler.accepting.load(std::memory_order_acquire) &&
+-            !profiler.lowOverhead;
++        return profiler.accepting.load(std::memory_order_acquire);
+     }
+ 
+     bool PerformanceProfiler::captureEnabled() {

@@ -1,0 +1,169 @@
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 8208477..9f8950c 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -491,4 +491,7 @@ namespace RT64 {
+     constexpr uint32_t BumbleMaterialWater = 2u;
+     constexpr uint32_t BumbleMaterialLegacyWaterOverlay = 3u;
+     constexpr uint32_t BumbleMaterialToxicWater = 4u;
++    constexpr uint32_t BumbleMaterialRedFluid = 5u;
++    constexpr uint32_t BumbleMaterialAmberFluid = 6u;
++    constexpr uint32_t BumbleMaterialWaterTransition = 7u;
+     // The animated caustic sheet is a large 6x6 surface.
+@@ -510,7 +513,8 @@ namespace RT64 {
+ 
+     constexpr bool bumbleWaterMaterialClass(uint32_t materialClass) {
+         return materialClass == BumbleMaterialWater ||
+-            materialClass == BumbleMaterialToxicWater;
++            (materialClass >= BumbleMaterialToxicWater &&
++             materialClass <= BumbleMaterialWaterTransition);
+     }
+ 
+     static ShaderDescription bumbleRasterShaderDescription(
+@@ -665,5 +669,13 @@ namespace RT64 {
+         case 0xCC7485594FD45B51ull: // shallow blue water
+             return BumbleMaterialWater;
+         case 0x84A4BEEECB821765ull: // toxic green water waves
++        case 0x1445CFB7CDC44CEEull: // bright green fluid waves
+             return BumbleMaterialToxicWater;
++        case 0xE346AA0FF977851Full: // red fluid waves
++            return BumbleMaterialRedFluid;
++        case 0xA22DFFAB0646A01Full: // amber fluid waves
++            return BumbleMaterialAmberFluid;
++        case 0x517DF32A90611DC5ull: // green/blue fluid corner
++        case 0xEC55F2C622470E22ull: // green/blue fluid edge
++            return BumbleMaterialWaterTransition;
+         // Representative identities from eight consecutive traced Level 7 submissions.
+@@ -942,4 +954,10 @@ namespace RT64 {
+             const uint32_t candidate = bumbleMaterialClassForHash(
+                 drawTile.tmemHashOrID
+             );
++            // The fluid/fluid palette uses TEXEL0.
++            if (candidate == BumbleMaterialWaterTransition &&
++                (tile != 0u || !call.shaderDesc.flags.usesTexture0 ||
++                 call.callDesc.otherMode.textLOD() == G_TL_LOD)) {
++                continue;
++            }
+             // Water is deliberately strongest because a mipmapped call can carry more than one tile.
+@@ -2410,6 +2429,15 @@ namespace RT64 {
+             if (indices.modernMaterialClass == 4u) {
+                 return "GPU.Draw.Water.Toxic";
+             }
++            if (indices.modernMaterialClass == 5u) {
++                return "GPU.Draw.Water.Red";
++            }
++            if (indices.modernMaterialClass == 6u) {
++                return "GPU.Draw.Water.Amber";
++            }
++            if (indices.modernMaterialClass == 7u) {
++                return "GPU.Draw.Water.Transition";
++            }
+             if (indices.modernLightingEligible != 0u) {
+                 if (indices.modernUsesAuthoredNormal != 0u) {
+                     return indices.modernMaterialClass == 1u
+diff --git a/src/render/rt64_shader_common.cpp b/src/render/rt64_shader_common.cpp
+index a2504b0..6c49cad 100644
+--- a/src/render/rt64_shader_common.cpp
++++ b/src/render/rt64_shader_common.cpp
+@@ -42,6 +42,7 @@ namespace RT64 {
+         constexpr uint32_t MaterialWater = 2u;
+         constexpr uint32_t MaterialLegacyWaterOverlay = 3u;
+         constexpr uint32_t MaterialToxicWater = 4u;
++        constexpr uint32_t MaterialWaterTransition = 7u;
+         constexpr uint32_t FamilyGeneric = 0u;
+         constexpr uint32_t FamilyWorld = 1u;
+         constexpr uint32_t FamilyWater = 2u;
+@@ -55,7 +56,7 @@ namespace RT64 {
+         const uint32_t material =
+             (variant >> MaterialShift) & MaterialMask;
+         if (material == MaterialWater ||
+-            material == MaterialToxicWater) {
++            (material >= MaterialToxicWater && material <= MaterialWaterTransition)) {
+             return FamilyWater;
+         }
+         if (material == MaterialLegacyWaterOverlay) {
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index a698153..e4527dd 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -405,11 +405,9 @@ LIBRARY_EXPORT bool RasterPS(
+     const bool modernWaterSurface =
+         bumbleWaterShaderFamily &&
+         modernMaterialShadersEnabled &&
+-        (bumbleMaterialClass == 2u || bumbleMaterialClass == 4u) &&
++        (bumbleMaterialClass == 2u || bumbleMaterialClass >= 4u) &&
+         !renderFlagRect(rp.flags) &&
+         (otherMode.cycleType() != G_CYC_COPY);
+-    const bool modernToxicWaterSurface =
+-        modernWaterSurface && bumbleMaterialClass == 4u;
+     int2 pixelPosSeed = floor(vertexPosition.xy);
+     uint randomSeed = initRand(FrParams.frameCount, instanceIndex * pixelPosSeed.y * pixelPosSeed.x, 16); // TODO: Review seed.
+ 
+@@ -513,6 +511,13 @@ LIBRARY_EXPORT bool RasterPS(
+         texVal1 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, oneCycleHardwareBug);
+     }
+     
++    // Only the reviewed fluid/fluid transition tiles use their existing sample to select a palette.
++    const bool modernToxicWaterSurface = modernWaterSurface &&
++        (bumbleMaterialClass == 4u ||
++         (bumbleMaterialClass == 7u && texVal0.g > texVal0.b));
++    const bool modernRedFluid = modernWaterSurface && bumbleMaterialClass == 5u;
++    const bool modernAmberFluid = modernWaterSurface && bumbleMaterialClass == 6u;
++
+     // Color combiner.
+     float4 shadeColor = vertexColor;
+     float4 combinerColor;
+@@ -740,8 +746,12 @@ LIBRARY_EXPORT bool RasterPS(
+             const float3 deepWaterTint = modernToxicWaterSurface
+                 ? float3(0.004f, 0.105f, 0.012f)
++                : modernRedFluid ? float3(0.155f, 0.004f, 0.008f)
++                : modernAmberFluid ? float3(0.155f, 0.065f, 0.004f)
+                 : float3(0.004f, 0.026f, 0.155f);
+             const float3 shallowWaterTint = modernToxicWaterSurface
+                 ? float3(0.035f, 0.620f, 0.070f)
++                : modernRedFluid ? float3(0.620f, 0.025f, 0.040f)
++                : modernAmberFluid ? float3(0.620f, 0.350f, 0.020f)
+                 : float3(0.015f, 0.135f, 0.390f);
+             const float apparentDepth = saturate(
+                 (1.0f - viewReception) * 0.64f +
+@@ -769,6 +779,8 @@ LIBRARY_EXPORT bool RasterPS(
+             const float opticalDepth = lerp(1.20f, 5.80f, bodyDepth);
+             const float3 waterAbsorption = modernToxicWaterSurface
+                 ? float3(0.72f, 0.055f, 0.62f)
++                : modernRedFluid ? float3(0.050f, 0.62f, 0.58f)
++                : modernAmberFluid ? float3(0.050f, 0.20f, 0.62f)
+                 : float3(0.58f, 0.28f, 0.050f);
+             const float3 waterTransmission = exp(
+                 -waterAbsorption * opticalDepth
+@@ -780,6 +792,8 @@ LIBRARY_EXPORT bool RasterPS(
+             );
+             const float3 submergedLight = modernToxicWaterSurface
+                 ? float3(0.012f, 0.310f, 0.025f)
++                : modernRedFluid ? float3(0.310f, 0.012f, 0.025f)
++                : modernAmberFluid ? float3(0.310f, 0.160f, 0.012f)
+                 : float3(0.025f, 0.140f, 0.280f);
+             float3 waterBody = saturate(
+                 submergedLight * waterTransmission +
+@@ -1238,6 +1252,9 @@ LIBRARY_EXPORT bool RasterPS(
+                     ? float3(1.0f, 0.0f, 1.0f)
+                     : bumbleMaterialClass == 4u
+                         ? float3(0.25f, 1.0f, 0.0f)
++                        : bumbleMaterialClass == 5u ? float3(1.0f, 0.15f, 0.15f)
++                        : bumbleMaterialClass == 6u ? float3(1.0f, 0.65f, 0.0f)
++                        : bumbleMaterialClass == 7u ? float3(0.0f, 0.65f, 0.45f)
+                         : float3(0.0f, 0.0f, 0.0f);
+     }
+     else if (waterReflectionDebugEnabled &&
+diff --git a/src/shaders/RasterVS.hlsl b/src/shaders/RasterVS.hlsl
+index fb3ec38..e8e9b14 100644
+--- a/src/shaders/RasterVS.hlsl
++++ b/src/shaders/RasterVS.hlsl
+@@ -130,7 +130,7 @@ LIBRARY_EXPORT void RasterVS(
+         : materialIndices.modernUsesAuthoredNormal != 0u;
+     const bool modernWaterSurface =
+         (bumbleFeatureFlags & 0x2u) != 0u &&
+-        (bumbleMaterialClass == 2u || bumbleMaterialClass == 4u) &&
++        (bumbleMaterialClass == 2u || bumbleMaterialClass >= 4u) &&
+         !renderFlagRect(rp.flags) && !copyMode;
+     const bool modernWorldSurface =
+         (bumbleFeatureFlags & 0x1u) != 0u &&

@@ -1,0 +1,155 @@
+diff --git a/src/render/rt64_bumble_sky.cpp b/src/render/rt64_bumble_sky.cpp
+index ea24da5..6996e03 100644
+--- a/src/render/rt64_bumble_sky.cpp
++++ b/src/render/rt64_bumble_sky.cpp
+@@ -180,13 +180,14 @@ namespace RT64 {
+         bool usesHDR
+     ) {
+         assert(worker != nullptr);
+-        if (pipeline != nullptr && shaderFormat == format &&
++        if (pipeline != nullptr && boundaryPipeline != nullptr && shaderFormat == format &&
+             sampleCount == multisampling.sampleCount &&
+             pipelineUsesHDR == usesHDR) {
+             return true;
+         }
+ 
+         pipeline.reset();
++        boundaryPipeline.reset();
+         pipelineLayout.reset();
+         vertexShader.reset();
+         pixelShader.reset();
+@@ -240,6 +241,13 @@ namespace RT64 {
+         desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+         desc.renderTargetCount = 1;
+         pipeline = worker->device->createGraphicsPipeline(desc);
++        // Keep the existing opaque sky pipeline unchanged.
++        desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
++        desc.renderTargetBlend[0].renderTargetWriteMask =
++            uint8_t(RenderColorWriteEnable::RED) |
++            uint8_t(RenderColorWriteEnable::GREEN) |
++            uint8_t(RenderColorWriteEnable::BLUE);
++        boundaryPipeline = worker->device->createGraphicsPipeline(desc);
+ 
+         shaderFormat = format;
+         sampleCount = multisampling.sampleCount;
+@@ -258,7 +268,7 @@ namespace RT64 {
+             );
+             std::fflush(stderr);
+         }
+-        return pipeline != nullptr;
++        return pipeline != nullptr && boundaryPipeline != nullptr;
+     }
+ 
+     uint32_t BumbleSkyRenderer::addDraw(
+@@ -271,8 +281,10 @@ namespace RT64 {
+         uint64_t submissionFrame,
+         bool modernLightingActive
+     ) {
++        const bool boundaryOnly = snapshot.mode == BumbleSkyModeBoundaryOnly &&
++            snapshot.preset == 0u;
+         if (snapshot.mode == 0u ||
+-            !reviewedPresetForLevel(snapshot.levelIndex, snapshot.preset) ||
++            (!boundaryOnly && !reviewedPresetForLevel(snapshot.levelIndex, snapshot.preset)) ||
+             scissor.isEmpty() || !std::isfinite(viewportWidth) ||
+             !std::isfinite(viewportHeight) || viewportWidth <= 0.0f ||
+             viewportHeight <= 0.0f ||
+@@ -356,7 +368,7 @@ namespace RT64 {
+             rayUpStep.x,
+             rayUpStep.y,
+             rayUpStep.z,
+-            0.0f,
++            boundaryOnly ? 1.0f : 0.0f,
+         };
+         draw.constants.horizonPreset = {
+             byteToUnit(snapshot.horizonRgb, 24u),
+@@ -461,7 +473,8 @@ namespace RT64 {
+         }
+ 
+         worker->commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+-        worker->commandList->setPipeline(pipeline.get());
++        worker->commandList->setPipeline(draw.constants.rayUpStep.w != 0.0f
++            ? boundaryPipeline.get() : pipeline.get());
+         worker->commandList->setScissors(draw.scissor);
+         worker->commandList->setVertexBuffers(0, nullptr, 0, nullptr);
+         worker->commandList->setIndexBuffer(nullptr);
+diff --git a/src/render/rt64_bumble_sky.h b/src/render/rt64_bumble_sky.h
+index 3296df2..39e33ff 100644
+--- a/src/render/rt64_bumble_sky.h
++++ b/src/render/rt64_bumble_sky.h
+@@ -16,6 +16,7 @@
+ namespace RT64 {
+     constexpr uint32_t BumbleSkyPresetCloudyDay = 1u;
+     constexpr uint32_t BumbleSkyPresetDarkOvercast = 2u;
++    constexpr uint32_t BumbleSkyModeBoundaryOnly = 2u;
+     constexpr uint32_t BumbleSkyInvalidDraw = UINT32_MAX;
+ 
+     struct BumbleSkyDirection {
+@@ -62,5 +63,6 @@ namespace RT64 {
+             interop::float4 rayRightStepAspect;
+             // xyz: exact world-space ray delta from NDC center to (0, 1).
++            // w: boundary-only mode; preserve the authored background.
+             interop::float4 rayUpStep;
+             // rgb: authored horizon; w: camera eye Z.
+             interop::float4 horizonPreset;
+@@ -94,6 +96,7 @@ namespace RT64 {
+         std::unique_ptr<RenderShader> vertexShader;
+         std::unique_ptr<RenderShader> pixelShader;
+         std::unique_ptr<RenderPipeline> pipeline;
++        std::unique_ptr<RenderPipeline> boundaryPipeline;
+         RenderShaderFormat shaderFormat = RenderShaderFormat::UNKNOWN;
+         RenderSampleCounts sampleCount = 0;
+         bool pipelineUsesHDR = false;
+diff --git a/src/shaders/BumbleSkyPS.hlsl b/src/shaders/BumbleSkyPS.hlsl
+index 8d80044..d1a058f 100644
+--- a/src/shaders/BumbleSkyPS.hlsl
++++ b/src/shaders/BumbleSkyPS.hlsl
+@@ -84,22 +84,21 @@ float honeycombEdgeDistance(float2 worldXZ) {
+ float honeycombBarrierOpacity(float3 direction) {
+     const float ceilingY = 800.0f;
+     const float playerGap = max(ceilingY - gSky.cloudShape.y, 0.0f);
+-    // The proximity curve is exactly zero at and beyond this distance.
+-    [branch]
+-    if (playerGap >= 165.0f) {
+-        return 0.0f;
+-    }
+     const float3 eye = float3(
+         gSky.cloudShape.w,
+         gSky.shaftParams.w,
+         gSky.horizonPreset.w
+     );
+     const float cameraGap = ceilingY - eye.y;
+-    if (direction.y <= 0.025f || cameraGap <= 0.0f) {
++    // The camera can cross the ceiling while Buck remains below it.
++    if (abs(direction.y) <= 0.025f || cameraGap * direction.y <= 0.0f) {
+         return 0.0f;
+     }
+ 
+     const float rayDistance = cameraGap / direction.y;
++    if (rayDistance >= 8200.0f) {
++        return 0.0f;
++    }
+     const float2 worldXZ = eye.xz + direction.xz * rayDistance;
+     const float edgeDistance = honeycombEdgeDistance(worldXZ);
+     const float antialias = max(fwidth(edgeDistance), 0.0015f);
+@@ -119,6 +117,6 @@ float honeycombBarrierOpacity(float3 direction) {
+     const float proximity = 1.0f - smoothstep(35.0f, 165.0f, playerGap);
+-    const float proximityVisibility = proximity * proximity;
+-    const float viewFade = smoothstep(0.025f, 0.115f, direction.y);
++    const float proximityVisibility = lerp(0.18f, 1.0f, proximity * proximity);
++    const float viewFade = smoothstep(0.025f, 0.115f, abs(direction.y));
+     const float distanceFade = 1.0f - smoothstep(
+         5200.0f,
+         8200.0f,
+@@ -132,6 +130,12 @@ float honeycombBarrierOpacity(float3 direction) {
+ 
+ float4 PSMain(PSInput input) : SV_Target {
+     const float3 direction = normalize(input.direction);
++    [branch]
++    if (gSky.rayUpStep.w != 0.0f) {
++        // No invented sky/cloud preset for indoor or otherwise unreviewed backgrounds.
++        const float opacity = honeycombBarrierOpacity(direction);
++        return float4(1.0f, 0.88f, 0.035f, saturate(opacity * 1.95f));
++    }
+     const float elevation = saturate(direction.y * 0.92f + 0.08f);
+     const float horizonWeight = pow(elevation, 0.62f);
+     const float overcastMix = 1.0f - step(0.48f, gSky.cloudShape.x);

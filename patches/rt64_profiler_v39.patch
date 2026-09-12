@@ -1,0 +1,771 @@
+diff --git a/src/common/rt64_performance_profiler.cpp b/src/common/rt64_performance_profiler.cpp
+index 372c685c28506368402915f3c7045df360b6a348..9ba23d60dc57b7a5392403d5c2294afcf5aadc70 100644
+--- a/src/common/rt64_performance_profiler.cpp
++++ b/src/common/rt64_performance_profiler.cpp
+@@ -790,6 +790,8 @@ namespace RT64 {
+ #elif defined(__linux__)
+         struct HostResourceSamplerState {
+             std::unordered_map<uint32_t, uint64_t> previousProcessCpu;
++            std::unordered_map<uint32_t, uint64_t>
++                previousProcessGpuNanoseconds;
+             uint64_t previousSystemTotal = 0;
+             uint64_t previousSystemIdle = 0;
+             long clockTicks = std::max<long>(sysconf(_SC_CLK_TCK), 1);
+@@ -862,6 +864,61 @@ namespace RT64 {
+             return true;
+         }
+ 
++        bool readLinuxProcessGpuNanoseconds(
++            uint32_t processId,
++            uint64_t &gpuNanoseconds
++        ) {
++            gpuNanoseconds = 0;
++            const std::string fdInfoRoot = "/proc/" +
++                std::to_string(processId) + "/fdinfo";
++            DIR *directory = opendir(fdInfoRoot.c_str());
++            if (directory == nullptr) {
++                return false;
++            }
++
++            bool available = false;
++            for (dirent *entry = readdir(directory);
++                 entry != nullptr;
++                 entry = readdir(directory)) {
++                char *end = nullptr;
++                std::strtoul(entry->d_name, &end, 10);
++                if (end == entry->d_name || *end != '\0') {
++                    continue;
++                }
++
++                std::ifstream input(fdInfoRoot + "/" + entry->d_name);
++                std::string line;
++                while (std::getline(input, line)) {
++                    constexpr std::string_view EnginePrefix =
++                        "drm-engine-";
++                    if (line.compare(
++                            0,
++                            EnginePrefix.size(),
++                            EnginePrefix
++                        ) != 0) {
++                        continue;
++                    }
++
++                    const size_t separator = line.find(':');
++                    if (separator == std::string::npos) {
++                        continue;
++                    }
++                    std::istringstream valueStream(
++                        line.substr(separator + 1u)
++                    );
++                    uint64_t value = 0;
++                    std::string unit;
++                    if ((valueStream >> value >> unit) &&
++                        ((unit == "ns") || (unit == "nanoseconds"))) {
++                        gpuNanoseconds += value;
++                        available = true;
++                    }
++                }
++            }
++            closedir(directory);
++            return available;
++        }
++
+         bool sampleHostResources(HostResourceSamplerState &sampler,
+             double elapsedSeconds, HostResourceSnapshot &snapshot) {
+             uint64_t systemTotal = 0, systemIdle = 0;
+@@ -892,6 +949,8 @@ namespace RT64 {
+                 }
+             }
+             std::unordered_map<uint32_t, uint64_t> currentProcessCpu;
++            std::unordered_map<uint32_t, uint64_t>
++                currentProcessGpuNanoseconds;
+             DIR *directory = opendir("/proc");
+             if (directory == nullptr) {
+                 return false;
+@@ -923,6 +982,14 @@ namespace RT64 {
+                     continue;
+                 }
+                 currentProcessCpu[processId] = cpuTicks;
++                uint64_t gpuNanoseconds = 0;
++                const bool gpuAvailable = readLinuxProcessGpuNanoseconds(
++                    processId,
++                    gpuNanoseconds
++                );
++                if (gpuAvailable) {
++                    currentProcessGpuNanoseconds[processId] = gpuNanoseconds;
++                }
+                 const auto previous = sampler.previousProcessCpu.find(
+                     processId
+                 );
+@@ -942,13 +1009,31 @@ namespace RT64 {
+                     100.0
+                 );
+                 usage.workingSetMiB = workingSetMiB;
++                const auto previousGpu =
++                    sampler.previousProcessGpuNanoseconds.find(processId);
++                if (gpuAvailable &&
++                    (previousGpu !=
++                        sampler.previousProcessGpuNanoseconds.end()) &&
++                    (gpuNanoseconds >= previousGpu->second)) {
++                    usage.gpuPercent = std::clamp(
++                        double(gpuNanoseconds - previousGpu->second) /
++                            (elapsedSeconds * 1'000'000'000.0) * 100.0,
++                        0.0,
++                        100.0
++                    );
++                }
+                 snapshot.externalCpuPercent += usage.cpuPercent;
+-                if (usage.cpuPercent >= 0.25 || workingSetMiB >= 256.0) {
++                snapshot.externalGpuPercent += usage.gpuPercent;
++                if (usage.cpuPercent >= 0.25 ||
++                    usage.gpuPercent >= 0.25 ||
++                    workingSetMiB >= 256.0) {
+                     snapshot.processes.emplace_back(std::move(usage));
+                 }
+             }
+             closedir(directory);
+             sampler.previousProcessCpu = std::move(currentProcessCpu);
++            sampler.previousProcessGpuNanoseconds =
++                std::move(currentProcessGpuNanoseconds);
+             return true;
+         }
+ #endif
+@@ -1232,6 +1317,11 @@ namespace RT64 {
+             }
+ 
+             const std::string_view name(event.name.data());
++            // These spans begin when the guest creates a graphics task and end when its scheduler phase dispatches it.
++            if ((name == "FrameProduction.GuestGraphicsSchedulerDelay") ||
++                (name == "FrameProduction.GraphicsTaskDispatchDelay")) {
++                return false;
++            }
+             if (isFrameContainer(name) || isConcurrentBackgroundStage(event) ||
+                 isFrameProductionCadenceObservation(event) ||
+                 isDisplayCadenceObservation(event)) {
+@@ -1414,6 +1508,19 @@ namespace RT64 {
+             std::vector<double> scanoutIntervals;
+             std::vector<double> presentWaitCompletionIntervals;
+             std::vector<double> imageReacquireCompletionIntervals;
++            uint64_t interpolationCoverageSamples = 0;
++            uint64_t interpolationViewProjectionTotal = 0;
++            uint64_t interpolationViewProjectionMapped = 0;
++            uint64_t interpolationTransformTotal = 0;
++            uint64_t interpolationTransformMapped = 0;
++            uint64_t interpolationDynamicVertexSamples = 0;
++            uint64_t interpolationDynamicVertexChangedTransforms = 0;
++            uint64_t interpolationDynamicVertexInterpolatedTransforms = 0;
++            uint64_t interpolationDynamicVertexSkippedTransforms = 0;
++            uint64_t interpolationDynamicVertexCountMismatchTransforms = 0;
++            uint64_t interpolationDynamicVertexChangedVertices = 0;
++            uint64_t interpolationDynamicVertexInterpolatedVertices = 0;
++            uint64_t interpolationDynamicVertexSkippedVertices = 0;
+             std::unordered_map<uint64_t, GPUWorkloadAccumulator>
+                 gpuWorkloads;
+             std::map<std::pair<std::string, uint32_t>, DrawHotspotStatistics>
+@@ -1549,6 +1656,39 @@ namespace RT64 {
+                             "Workload.InterpolationDecision") {
+                             interpolationDecisionEvents.emplace_back(&event);
+                         }
++                        else if (eventName ==
++                            "Workload.InterpolationCoverage") {
++                            interpolationCoverageSamples++;
++                            interpolationViewProjectionTotal +=
++                                uint32_t(event.argument0 >> 32u);
++                            interpolationViewProjectionMapped +=
++                                uint32_t(event.argument0);
++                            interpolationTransformTotal +=
++                                uint32_t(event.argument1 >> 32u);
++                            interpolationTransformMapped +=
++                                uint32_t(event.argument1);
++                        }
++                        else if (eventName ==
++                            "Workload.InterpolationDynamicVertices") {
++                            interpolationDynamicVertexSamples++;
++                            interpolationDynamicVertexChangedTransforms +=
++                                uint32_t(event.argument0 >> 32u);
++                            interpolationDynamicVertexInterpolatedTransforms +=
++                                uint32_t(event.argument0);
++                            interpolationDynamicVertexSkippedTransforms +=
++                                uint32_t(event.argument1 >> 32u);
++                            interpolationDynamicVertexCountMismatchTransforms +=
++                                uint32_t(event.argument1);
++                        }
++                        else if (eventName ==
++                            "Workload.InterpolationDynamicVertexCounts") {
++                            interpolationDynamicVertexChangedVertices +=
++                                uint32_t(event.argument0 >> 32u);
++                            interpolationDynamicVertexInterpolatedVertices +=
++                                uint32_t(event.argument0);
++                            interpolationDynamicVertexSkippedVertices +=
++                                uint32_t(event.argument1);
++                        }
+                         else if (eventName ==
+                             "Workload.InterpolationReuseBlocked") {
+                             interpolationReuseBlockedEvents.emplace_back(&event);
+@@ -2152,6 +2292,73 @@ namespace RT64 {
+                 }
+             }
+ 
++            // A capture may cross frontend, loading, gameplay, and display-rate transitions.
++            std::unordered_set<uint64_t> dominantInterpolationWorkloadIds;
++            for (size_t i = interpolationAnalysisStart;
++                 i < interpolationAnalysisEnd; i++) {
++                const Event &event = *interpolationBatchEvents[i];
++                const uint32_t sourceRate = uint32_t(event.argument1 >> 32u);
++                const uint32_t targetRate = uint32_t(event.argument1);
++                if ((event.argument0 > 1u) &&
++                    (sourceRate == dominantInterpolationSourceRate) &&
++                    (targetRate == dominantInterpolationTargetRate)) {
++                    dominantInterpolationWorkloadIds.insert(
++                        event.correlationId
++                    );
++                }
++            }
++            std::unordered_set<uint64_t> dominantInterpolationTargetSetIds;
++            for (const Event *displayed : displayedEvents) {
++                if ((displayed->argument1 != 0u) &&
++                    (dominantInterpolationWorkloadIds.find(
++                        displayed->argument0
++                    ) != dominantInterpolationWorkloadIds.end())) {
++                    dominantInterpolationTargetSetIds.insert(
++                        displayed->argument1
++                    );
++                }
++            }
++
++            const bool steadyInterpolationRegimeAvailable =
++                (dominantInterpolationTargetRate > 0u) &&
++                !dominantInterpolationTargetSetIds.empty();
++            std::vector<double> steadyScanoutIntervals;
++            for (size_t i = scanoutAnalysisStart;
++                 i < scanoutAnalysisEnd; i++) {
++                const Event *scanout = actualScanoutEvents[i];
++                if (!steadyInterpolationRegimeAvailable ||
++                    (dominantInterpolationTargetSetIds.find(
++                        scanout->argument1
++                    ) != dominantInterpolationTargetSetIds.end())) {
++                    steadyScanoutIntervals.emplace_back(
++                        double(scanout->durationNanoseconds) / 1'000'000.0
++                    );
++                }
++            }
++            std::vector<double> steadyPresentationSubmissionIntervals;
++            for (size_t i = std::max<size_t>(1, analysisStart);
++                 i < analysisEnd; i++) {
++                const Event *previous = displayedEvents[i - 1];
++                const Event *current = displayedEvents[i];
++                if (current->timestampNanoseconds <=
++                    previous->timestampNanoseconds) {
++                    continue;
++                }
++                if (steadyInterpolationRegimeAvailable &&
++                    ((dominantInterpolationTargetSetIds.find(
++                        previous->argument1
++                    ) == dominantInterpolationTargetSetIds.end()) ||
++                     (dominantInterpolationTargetSetIds.find(
++                        current->argument1
++                    ) == dominantInterpolationTargetSetIds.end()))) {
++                    continue;
++                }
++                steadyPresentationSubmissionIntervals.emplace_back(
++                    double(current->timestampNanoseconds -
++                        previous->timestampNanoseconds) / 1'000'000.0
++                );
++            }
++
+             auto sortByTimestamp = [](std::vector<const Event *> &events) {
+                 std::sort(
+                     events.begin(), events.end(),
+@@ -2360,7 +2572,7 @@ namespace RT64 {
+             );
+ 
+             const bool completedScanoutAvailable =
+-                scanoutIntervals.size() >= 30;
++                steadyScanoutIntervals.size() >= 30;
+             const bool desktopOutputAvailable =
+                 desktopOutputIntervals.size() >= 30;
+             const bool displayVBlankAvailable =
+@@ -2373,12 +2585,12 @@ namespace RT64 {
+                 imageReacquireCompletionIntervals.size() >= 30;
+             const std::vector<double> &observedIntervals =
+                 completedScanoutAvailable
+-                    ? scanoutIntervals
++                    ? steadyScanoutIntervals
+                     : desktopOutputAvailable
+                         ? desktopOutputIntervals
+                         : estimatedDisplayedFramesAvailable
+                             ? estimatedDisplayedFrameIntervals
+-                            : presentationSubmissionIntervals;
++                            : steadyPresentationSubmissionIntervals;
+             const char *observedIntervalSource = completedScanoutAvailable
+                 ? "completed_scanout"
+                 : desktopOutputAvailable
+@@ -2512,11 +2724,20 @@ namespace RT64 {
+             std::vector<SlowFrame> slowFrames;
+             std::map<std::string, double> diagnosisWeights;
+             std::map<std::pair<std::string, std::string>, double> stageWeights;
+-            if (presentationSubmissionIntervals.size() >= 30) {
++            if (steadyPresentationSubmissionIntervals.size() >= 30) {
+                 for (size_t i = std::max<size_t>(1, analysisStart);
+                      i < analysisEnd; i++) {
+                     const Event *previous = displayedEvents[i - 1];
+                     const Event *current = displayedEvents[i];
++                    if (steadyInterpolationRegimeAvailable &&
++                        ((dominantInterpolationTargetSetIds.find(
++                            previous->argument1
++                        ) == dominantInterpolationTargetSetIds.end()) ||
++                         (dominantInterpolationTargetSetIds.find(
++                            current->argument1
++                        ) == dominantInterpolationTargetSetIds.end()))) {
++                        continue;
++                    }
+                     if (current->timestampNanoseconds <=
+                         previous->timestampNanoseconds) {
+                         continue;
+@@ -2968,6 +3189,12 @@ namespace RT64 {
+             for (size_t i = scanoutAnalysisStart;
+                  i < scanoutAnalysisEnd; i++) {
+                 const Event *event = actualScanoutEvents[i];
++                if (steadyInterpolationRegimeAvailable &&
++                    (dominantInterpolationTargetSetIds.find(
++                        event->argument1
++                    ) == dominantInterpolationTargetSetIds.end())) {
++                    continue;
++                }
+                 if ((double(event->durationNanoseconds) / 1'000'000.0) >
+                     stutterThreshold) {
+                     slowScanoutEvents.emplace_back(event);
+@@ -3547,13 +3774,40 @@ namespace RT64 {
+                 primaryStage = "Present.ManualPacingResult";
+                 primaryP95 = manualPacingOvershootP95;
+             }
++            const bool viewProjectionCoverageGap =
++                (interpolationCoverageSamples >= 30u) &&
++                (interpolationViewProjectionTotal > 0u) &&
++                (interpolationViewProjectionMapped * 100u <
++                    interpolationViewProjectionTotal * 99u);
++            const bool dynamicVertexCoverageGap =
++                (interpolationDynamicVertexSamples >= 30u) &&
++                (interpolationDynamicVertexChangedVertices >= 100u) &&
++                (interpolationDynamicVertexSkippedVertices * 100u >=
++                    interpolationDynamicVertexChangedVertices);
+             if (observedCadenceWithinTolerance &&
+                 !hardInterpolationFailure &&
+                 !observedOutputContradiction) {
+-                diagnosis = "WITHIN_OBSERVED_CADENCE_TOLERANCE";
+-                confidence = "high";
+-                primaryStage.clear();
+-                primaryP95 = 0.0;
++                if (dynamicVertexCoverageGap) {
++                    diagnosis =
++                        "INTERPOLATION_DYNAMIC_VERTEX_COVERAGE_GAP";
++                    confidence = "high";
++                    primaryStage =
++                        "Workload.InterpolationDynamicVertices";
++                    primaryP95 = 0.0;
++                }
++                else if (viewProjectionCoverageGap) {
++                    diagnosis =
++                        "INTERPOLATION_VIEW_PROJECTION_COVERAGE_GAP";
++                    confidence = "high";
++                    primaryStage = "Workload.InterpolationCoverage";
++                    primaryP95 = 0.0;
++                }
++                else {
++                    diagnosis = "WITHIN_OBSERVED_CADENCE_TOLERANCE";
++                    confidence = "high";
++                    primaryStage.clear();
++                    primaryP95 = 0.0;
++                }
+             }
+             if (!exactOutputTimingAvailable &&
+                 !modeledOutputTimingAvailable && fifoPresentMode) {
+@@ -3646,7 +3900,7 @@ namespace RT64 {
+                 return false;
+             }
+ 
+-            output << "{\n  \"schema\": \"rt64-performance-summary-v38\",\n";
++            output << "{\n  \"schema\": \"rt64-performance-summary-v39\",\n";
+             output << "  \"capture_mode\": \""
+                 << (profiler.lowOverhead ? "low_overhead" : "detailed")
+                 << "\",\n";
+@@ -3922,13 +4176,28 @@ namespace RT64 {
+                 << ",\"submission_timing_is_scanout_timing\":false},\n";
+             output << "  \"scanout_intervals\": {\"available\":"
+                 << (completedScanoutAvailable ? "true" : "false")
+-                << ", \"count\":" << scanoutIntervals.size()
+-                << ", \"p50_ms\":" << percentile(scanoutIntervals, 0.50)
+-                << ", \"p95_ms\":" << percentile(scanoutIntervals, 0.95)
+-                << ", \"p99_ms\":" << percentile(scanoutIntervals, 0.99)
+-                << ", \"max_ms\":" << percentile(scanoutIntervals, 1.0)
++                << ", \"regime\":\"dominant_steady_interpolation\""
++                << ", \"target_hz\":" << dominantInterpolationTargetRate
++                << ", \"target_set_count\":"
++                << dominantInterpolationTargetSetIds.size()
++                << ", \"count\":" << steadyScanoutIntervals.size()
++                << ", \"p50_ms\":" << percentile(steadyScanoutIntervals, 0.50)
++                << ", \"p95_ms\":" << percentile(steadyScanoutIntervals, 0.95)
++                << ", \"p99_ms\":" << percentile(steadyScanoutIntervals, 0.99)
++                << ", \"max_ms\":" << percentile(steadyScanoutIntervals, 1.0)
+                 << ", \"stutter_count\":" << slowScanoutEvents.size()
+                 << "},\n";
++            output << "  \"scanout_intervals_all_regimes\": {"
++                << "\"count\":" << scanoutIntervals.size()
++                << ",\"p50_ms\":" << percentile(scanoutIntervals, 0.50)
++                << ",\"p95_ms\":" << percentile(scanoutIntervals, 0.95)
++                << ",\"p99_ms\":" << percentile(scanoutIntervals, 0.99)
++                << ",\"max_ms\":" << percentile(scanoutIntervals, 1.0)
++                << ",\"excluded_from_headline\":"
++                << (scanoutIntervals.size() >= steadyScanoutIntervals.size()
++                    ? scanoutIntervals.size() - steadyScanoutIntervals.size()
++                    : 0u)
++                << "},\n";
+             output << "  \"desktop_output_intervals\": {\"available\":"
+                 << (desktopOutputAvailable ? "true" : "false")
+                 << ", \"source\":\"dxgi_output_duplication\""
+@@ -4106,6 +4375,55 @@ namespace RT64 {
+                     0.95
+                 )
+                 << "},\n";
++            const double viewProjectionCoverage =
++                interpolationViewProjectionTotal > 0u
++                    ? double(interpolationViewProjectionMapped) /
++                        double(interpolationViewProjectionTotal)
++                    : 0.0;
++            const double transformCoverage =
++                interpolationTransformTotal > 0u
++                    ? double(interpolationTransformMapped) /
++                        double(interpolationTransformTotal)
++                    : 0.0;
++            const double dynamicVertexCoverage =
++                interpolationDynamicVertexChangedVertices > 0u
++                    ? double(interpolationDynamicVertexInterpolatedVertices) /
++                        double(interpolationDynamicVertexChangedVertices)
++                    : 1.0;
++            output << "  \"interpolation_coverage\": {"
++                << "\"available\":"
++                << (interpolationCoverageSamples > 0u ? "true" : "false")
++                << ",\"samples\":" << interpolationCoverageSamples
++                << ",\"view_projection_gap\":"
++                << (viewProjectionCoverageGap ? "true" : "false")
++                << ",\"dynamic_vertex_gap\":"
++                << (dynamicVertexCoverageGap ? "true" : "false")
++                << ",\"view_projections\":{\"mapped\":"
++                << interpolationViewProjectionMapped
++                << ",\"total\":" << interpolationViewProjectionTotal
++                << ",\"ratio\":" << viewProjectionCoverage << '}'
++                << ",\"transforms\":{\"mapped\":"
++                << interpolationTransformMapped
++                << ",\"total\":" << interpolationTransformTotal
++                << ",\"ratio\":" << transformCoverage << '}'
++                << ",\"dynamic_vertices\":{\"samples\":"
++                << interpolationDynamicVertexSamples
++                << ",\"changed_transforms\":"
++                << interpolationDynamicVertexChangedTransforms
++                << ",\"interpolated_transforms\":"
++                << interpolationDynamicVertexInterpolatedTransforms
++                << ",\"skipped_transforms\":"
++                << interpolationDynamicVertexSkippedTransforms
++                << ",\"count_mismatch_transforms\":"
++                << interpolationDynamicVertexCountMismatchTransforms
++                << ",\"changed_vertices\":"
++                << interpolationDynamicVertexChangedVertices
++                << ",\"interpolated_vertices\":"
++                << interpolationDynamicVertexInterpolatedVertices
++                << ",\"skipped_vertices\":"
++                << interpolationDynamicVertexSkippedVertices
++                << ",\"coverage_ratio\":" << dynamicVertexCoverage
++                << "}},\n";
+             output << "  \"gpu_interpolation_transactions\": {"
+                 << "\"available\":"
+                 << (!gpuInterpolationTransactionMilliseconds.empty()
+@@ -5555,6 +5873,9 @@ namespace RT64 {
+             (name != "Present.FifoRateCalibrationObservation") &&
+             (name != "Present.FifoRateCalibrated") &&
+             (name != "Workload.InterpolationDecision") &&
++            (name != "Workload.InterpolationCoverage") &&
++            (name != "Workload.InterpolationDynamicVertices") &&
++            (name != "Workload.InterpolationDynamicVertexCounts") &&
+             (name != "Workload.InterpolationSetPublished") &&
+             (name != "State.FullSyncEarlyPresentDecision") &&
+             (name != "Workload.InterpolationReuseBlocked") &&
+diff --git a/src/hle/rt64_game_frame.cpp b/src/hle/rt64_game_frame.cpp
+index d154e7fc0bce01fc33cb085f27e9e9f9e35d40cf..b549a896af56716011ede50bd3ef0117fd4fb069 100644
+--- a/src/hle/rt64_game_frame.cpp
++++ b/src/hle/rt64_game_frame.cpp
+@@ -3,6 +3,7 @@
+ //
+ 
+ #include "common/rt64_math.h"
++#include "common/rt64_performance_profiler.h"
+ 
+ #include "rt64_game_frame.h"
+ #include "rt64_workload_queue.h"
+@@ -281,6 +282,7 @@ namespace RT64 {
+     void GameFrame::match(RenderWorker *worker, WorkloadQueue &workloadQueue, const GameFrame &prevFrame, BufferUploader *velocityUploader, bool &velocityUploaderUsed, bool &tileInterpolationUsed, bool &lookAtInterpolationUsed) {
+         tileInterpolationUsed = false;
+         lookAtInterpolationUsed = false;
++        matchStatistics.clear();
+         matched = true;
+ 
+         thread_local std::unordered_map<uint32_t, ModifiedBuffers> workloadsModified;
+@@ -400,6 +402,52 @@ namespace RT64 {
+         matchScenes(perspectiveScenes, prevFrame.perspectiveScenes);
+         matchScenes(orthographicScenes, prevFrame.orthographicScenes);
+ 
++        if (PerformanceProfiler::captureEnabled()) {
++            constexpr float MovementTolerance = 1e-6f;
++            for (uint32_t w = 0; w < workloads.size(); w++) {
++                if (w >= prevFrame.workloads.size()) {
++                    continue;
++                }
++
++                const uint32_t curWorkloadIndex = workloads[w];
++                const GameFrameMap::WorkloadMap &workloadMap =
++                    frameMap.workloads[curWorkloadIndex];
++                if (!workloadMap.mapped) {
++                    continue;
++                }
++
++                const Workload &curWorkload =
++                    workloadQueue.workloads[curWorkloadIndex];
++                const Workload &prevWorkload =
++                    workloadQueue.workloads[workloadMap.prevWorkloadIndex];
++                matchStatistics.transformTotal +=
++                    workloadMap.transforms.size();
++                for (uint32_t transformIndex = 0;
++                     transformIndex < workloadMap.transforms.size();
++                     transformIndex++) {
++                    const GameFrameMap::TransformMap &transformMap =
++                        workloadMap.transforms[transformIndex];
++                    if (!transformMap.mapped ||
++                        (transformMap.prevTransformIndex >=
++                            prevWorkload.drawData.worldTransforms.size())) {
++                        continue;
++                    }
++
++                    matchStatistics.transformMapped++;
++                    if ((transformIndex <
++                            curWorkload.drawData.worldTransforms.size()) &&
++                        (matrixDifference(
++                            curWorkload.drawData.worldTransforms[
++                                transformIndex],
++                            prevWorkload.drawData.worldTransforms[
++                                transformMap.prevTransformIndex]
++                        ) > MovementTolerance)) {
++                        matchStatistics.transformMoved++;
++                    }
++                }
++            }
++        }
++
+         if (!workloadsModified.empty()) {
+             thread_local std::vector<BufferUploader::Upload> uploads;
+             uploads.clear();
+@@ -525,6 +573,14 @@ namespace RT64 {
+             }
+         }
+ 
++        if (PerformanceProfiler::captureEnabled()) {
++            matchStatistics.viewProjectionTotal += curScene.projections.size();
++            matchStatistics.viewProjectionMapped +=
++                (mappedViewProjIndex < UINT32_MAX)
++                    ? curScene.projections.size()
++                    : 0u;
++        }
++
+         for (uint32_t p = 0; p < prevScene.projections.size(); p++) {
+             const GameIndices::Projection &prevProjIndices = prevScene.projections[p];
+             const Workload &prevWorkload = workloadQueue.workloads[prevProjIndices.workloadIndex];
+@@ -827,6 +883,17 @@ namespace RT64 {
+         uint32_t curVertexCount = curWorkload.drawData.worldTransformVertexCount(curTransformIndex);
+         uint32_t prevVertexIndex = prevWorkload.drawData.worldTransformVertexIndices[prevTransformIndex];
+         uint32_t prevVertexCount = prevWorkload.drawData.worldTransformVertexCount(prevTransformIndex);
++        const bool collectMatchStatistics =
++            PerformanceProfiler::captureEnabled();
++        const bool matchingVertexCounts =
++            curVertexCount == prevVertexCount;
++        if (collectMatchStatistics && !matchingVertexCounts &&
++            ((curVertexCount > 0u) || (prevVertexCount > 0u))) {
++            matchStatistics.dynamicVertexCountMismatchTransforms++;
++        }
+-        if (((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) || (curGroup.texcoordInterpolation == G_EX_COMPONENT_AUTO)) && (curVertexCount == prevVertexCount)) {
++        if ((curVertexCount > 0u) &&
++            ((curGroup.vertexInterpolation != G_EX_COMPONENT_SKIP) ||
++                (curGroup.texcoordInterpolation == G_EX_COMPONENT_AUTO)) &&
++            matchingVertexCounts) {
+             const std::vector<float> &curPosFloats = curWorkload.drawData.posFloats;
+             const std::vector<float> &prevPosFloats = prevWorkload.drawData.posFloats;
+@@ -848,6 +915,41 @@ namespace RT64 {
+             }
+         }
+ 
++        if (collectMatchStatistics && matchingVertexCounts &&
++            (curVertexCount > 0u)) {
++            if ((curVertexHash == 0u) && (prevVertexHash == 0u)) {
++                const std::vector<float> &curPosFloats =
++                    curWorkload.drawData.posFloats;
++                const std::vector<float> &prevPosFloats =
++                    prevWorkload.drawData.posFloats;
++                curVertexHash = XXH3_64bits(
++                    &curPosFloats[curVertexIndex * 3],
++                    curVertexCount * 3 * sizeof(float)
++                );
++                prevVertexHash = XXH3_64bits(
++                    &prevPosFloats[prevVertexIndex * 3],
++                    prevVertexCount * 3 * sizeof(float)
++                );
++            }
++
++            if (curVertexHash != prevVertexHash) {
++                matchStatistics.dynamicVertexChangedTransforms++;
++                matchStatistics.dynamicVertexChangedVertices += curVertexCount;
++                if (curGroup.vertexInterpolation == G_EX_COMPONENT_SKIP) {
++                    matchStatistics.dynamicVertexSkippedTransforms++;
++                    matchStatistics.dynamicVertexSkippedVertices +=
++                        curVertexCount;
++                }
++                else {
++                    matchStatistics.dynamicVertexInterpolatedTransforms++;
++                    matchStatistics.dynamicVertexInterpolatedVertices +=
++                        curVertexCount;
++                }
++            }
++        }
++
+-        if ((curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) && (curVertexCount == prevVertexCount)) {
++        if ((curVertexCount > 0u) &&
++            (curGroup.texcoordInterpolation != G_EX_COMPONENT_SKIP) &&
++            matchingVertexCounts) {
+             const std::vector<float> &curTcFloats = curWorkload.drawData.tcFloats;
+             const std::vector<float> &prevTcFloats = prevWorkload.drawData.tcFloats;
+diff --git a/src/hle/rt64_game_frame.h b/src/hle/rt64_game_frame.h
+index 675a3e7757070e09fb65295549420069efcb38bc..5123bbf87f0b95a4734dd29da5028918c3316fa9 100644
+--- a/src/hle/rt64_game_frame.h
++++ b/src/hle/rt64_game_frame.h
+@@ -114,12 +114,32 @@ namespace RT64 {
+         }
+     };
+ 
++    struct GameFrameMatchStatistics {
++        uint64_t viewProjectionTotal = 0;
++        uint64_t viewProjectionMapped = 0;
++        uint64_t transformTotal = 0;
++        uint64_t transformMapped = 0;
++        uint64_t transformMoved = 0;
++        uint64_t dynamicVertexChangedTransforms = 0;
++        uint64_t dynamicVertexInterpolatedTransforms = 0;
++        uint64_t dynamicVertexSkippedTransforms = 0;
++        uint64_t dynamicVertexCountMismatchTransforms = 0;
++        uint64_t dynamicVertexChangedVertices = 0;
++        uint64_t dynamicVertexInterpolatedVertices = 0;
++        uint64_t dynamicVertexSkippedVertices = 0;
++
++        void clear() {
++            *this = GameFrameMatchStatistics{};
++        }
++    };
++
+     struct GameFrame {
+         PresetScene presetScene;
+         GameFrameMap frameMap;
+         std::vector<GameScene> perspectiveScenes;
+         std::vector<GameScene> orthographicScenes;
+         std::vector<uint32_t> workloads;
++        GameFrameMatchStatistics matchStatistics;
+         bool matched = false;
+ 
+         bool areFramebufferPairsCompatible(const WorkloadQueue &workloadQueue, const GameIndices::FramebufferPair &first, const GameIndices::FramebufferPair &second);
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 8b15dec0a3a82e967f946ff72f391f4c2b8a67b2..38bf7f048b58929749421c413a11b39b1e840ce5 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -779,12 +779,14 @@ namespace RT64 {
+             PerformanceProfiler::gpuInstrumentationEnabled();
+         performanceGPUFrameInterval =
+             PerformanceProfiler::gpuFrameSampleInterval();
+-#ifdef _WIN32
+         PerformanceProfiler::startDisplayObservation(
++#ifdef _WIN32
+             static_cast<void *>(ext.swapChain->getWindow()),
++#else
++            nullptr,
++#endif
+             ext.swapChain->getTextureCount()
+         );
+-#endif
+         if (performanceGPUInstrumentationEnabled) {
+             performanceQueryPool = ext.device->createQueryPool(5);
+         }
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 49c4801725b950aa722a44f7960a7aed27d22bb7..4be76d0776bbc7f3829ef0531f0332c0ff201eb0 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -2083,6 +2083,67 @@ namespace RT64 {
+                         matchingProfiler.start();
+                     }
+                     curFrame.match(ext.workloadGraphicsWorker, *this, prevFrame, ext.workloadVelocityUploader, velocityUploaderUsed, tileInterpolationUsed, lookAtInterpolationUsed);
++                    const GameFrameMatchStatistics &matchStatistics =
++                        curFrame.matchStatistics;
++                    PerformanceProfiler::recordInstant(
++                        PerformanceCategory::Counter,
++                        "Workload.InterpolationCoverage",
++                        workload.workloadId,
++                        (std::min<uint64_t>(
++                            matchStatistics.viewProjectionTotal,
++                            UINT32_MAX
++                        ) << 32u) |
++                            std::min<uint64_t>(
++                                matchStatistics.viewProjectionMapped,
++                                UINT32_MAX
++                            ),
++                        (std::min<uint64_t>(
++                            matchStatistics.transformTotal,
++                            UINT32_MAX
++                        ) << 32u) |
++                            std::min<uint64_t>(
++                                matchStatistics.transformMapped,
++                                UINT32_MAX
++                            )
++                    );
++                    PerformanceProfiler::recordInstant(
++                        PerformanceCategory::Counter,
++                        "Workload.InterpolationDynamicVertices",
++                        workload.workloadId,
++                        (std::min<uint64_t>(
++                            matchStatistics.dynamicVertexChangedTransforms,
++                            UINT32_MAX
++                        ) << 32u) |
++                            std::min<uint64_t>(
++                                matchStatistics.dynamicVertexInterpolatedTransforms,
++                                UINT32_MAX
++                            ),
++                        (std::min<uint64_t>(
++                            matchStatistics.dynamicVertexSkippedTransforms,
++                            UINT32_MAX
++                        ) << 32u) |
++                            std::min<uint64_t>(
++                                matchStatistics.dynamicVertexCountMismatchTransforms,
++                                UINT32_MAX
++                            )
++                    );
++                    PerformanceProfiler::recordInstant(
++                        PerformanceCategory::Counter,
++                        "Workload.InterpolationDynamicVertexCounts",
++                        workload.workloadId,
++                        (std::min<uint64_t>(
++                            matchStatistics.dynamicVertexChangedVertices,
++                            UINT32_MAX
++                        ) << 32u) |
++                            std::min<uint64_t>(
++                                matchStatistics.dynamicVertexInterpolatedVertices,
++                                UINT32_MAX
++                            ),
++                        std::min<uint64_t>(
++                            matchStatistics.dynamicVertexSkippedVertices,
++                            UINT32_MAX
++                        )
++                    );
+                     if (performanceInstrumentationEnabled) {
+                         matchingProfiler.end();
+                         matchingProfiler.log();
