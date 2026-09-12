@@ -31,6 +31,9 @@ Saves and settings stay in your user-data folder when you replace the executable
 - Optional modern lighting, water effects, terrain textures and grass.
 - Switch between modern and original visuals during play.
 - Local saves and settings, with no account or online connection needed to play.
+- Mid mission checkpoints.
+- Weapon enhancements
+- Portal standby indication
 
 ## PC controls
 
