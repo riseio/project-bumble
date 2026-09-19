@@ -1,0 +1,185 @@
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index bc42bf5..c1c2495 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -1003,7 +1003,8 @@ namespace RT64 {
+         const Workload &workload,
+         uint32_t submittedCallCount,
+         uint32_t levelIndex,
+-        std::unordered_map<const GameCall *, uint32_t> &materialClassCache
++        std::unordered_map<const GameCall *, uint32_t> &materialClassCache,
++        BumbleShadowGeometryCache &geometryCache
+     ) {
+         uint64_t hash = bumbleShadowHashMix(
+             1469598103934665603ull,
+@@ -1029,7 +1030,6 @@ namespace RT64 {
+                      ++drawIndex, ++callCursor) {
+                     if (callCursor >= callLimit) {
+                         hash = bumbleShadowHashMix(hash, casterCount);
+-                        hash = bumbleShadowHashMix(hash, callCursor);
+                         return hash;
+                     }
+                     const GameCall &call = projection.gameCalls[drawIndex];
+@@ -1048,64 +1048,13 @@ namespace RT64 {
+                         continue;
+                     }
+                     ++casterCount;
+-                    hash = bumbleShadowHashMix(hash, bumbleShadowGeometryKey(
++                    hash = bumbleShadowHashMix(hash, geometryCache.key(
+                         workload.drawData, call.meshDesc.faceIndicesStart,
+                         uint64_t(call.callDesc.triangleCount) * 3));
+-                    hash = bumbleShadowHashMix(hash, pairIndex);
+-                    hash = bumbleShadowHashMix(hash, projectionIndex);
+-                    hash = bumbleShadowHashMix(
+-                        hash,
+-                        call.callDesc.callIndex
+-                    );
+-                    hash = bumbleShadowHashMix(
+-                        hash,
+-                        call.meshDesc.faceIndicesStart
+-                    );
+-                    hash = bumbleShadowHashMix(
+-                        hash,
+-                        call.callDesc.triangleCount
+-                    );
+-                    hash = bumbleShadowHashMix(
+-                        hash,
+-                        (static_cast<uint64_t>(
+-                            call.callDesc.minWorldMatrix
+-                        ) << 32u) | call.callDesc.maxWorldMatrix
+-                    );
+-                    // AUTO/IGNORE transforms can own doors, elevators, and other engine geometry.
+-                    const uint32_t firstMatrix =
+-                        call.callDesc.minWorldMatrix;
+-                    const uint32_t lastMatrix =
+-                        call.callDesc.maxWorldMatrix;
+-                    if (firstMatrix <= lastMatrix &&
+-                        lastMatrix < workload.drawData.worldTransforms.size()) {
+-                        for (uint32_t matrixIndex = firstMatrix;
+-                             matrixIndex <= lastMatrix;
+-                             ++matrixIndex) {
+-                            const interop::float4x4 &matrix =
+-                                workload.drawData.worldTransforms[matrixIndex];
+-                            static_assert(
+-                                sizeof(matrix) % sizeof(uint64_t) == 0u
+-                            );
+-                            const auto *matrixBytes =
+-                                reinterpret_cast<const unsigned char *>(&matrix);
+-                            for (size_t byte = 0u;
+-                                 byte < sizeof(matrix);
+-                                 byte += sizeof(uint64_t)) {
+-                                uint64_t matrixWord = 0u;
+-                                std::memcpy(
+-                                    &matrixWord,
+-                                    matrixBytes + byte,
+-                                    sizeof(matrixWord)
+-                                );
+-                                hash = bumbleShadowHashMix(hash, matrixWord);
+-                            }
+-                        }
+-                    }
+                 }
+             }
+         }
+         hash = bumbleShadowHashMix(hash, casterCount);
+-        hash = bumbleShadowHashMix(hash, callCursor);
+         return hash;
+     }
+ 
+@@ -1122,16 +1071,21 @@ namespace RT64 {
+         };
+         thread_local const Workload *cachedWorkload = nullptr;
+         thread_local uint64_t cachedSubmissionFrame = UINT64_MAX;
++        thread_local uint64_t cachedWorkloadId = UINT64_MAX;
+         thread_local uint32_t cachedLevelIndex = UINT32_MAX;
+         thread_local std::vector<CachedKey> cachedKeys;
++        thread_local BumbleShadowGeometryCache geometryCache;
+ 
+         if (cachedWorkload != &workload ||
+             cachedSubmissionFrame != submissionFrame ||
++            cachedWorkloadId != workload.workloadId ||
+             cachedLevelIndex != levelIndex) {
+             cachedWorkload = &workload;
+             cachedSubmissionFrame = submissionFrame;
++            cachedWorkloadId = workload.workloadId;
+             cachedLevelIndex = levelIndex;
+             cachedKeys.clear();
++            geometryCache.reset(workload.drawData);
+         }
+         const auto existing = std::find_if(
+             cachedKeys.begin(),
+@@ -1148,7 +1102,8 @@ namespace RT64 {
+             workload,
+             submittedCallCount,
+             levelIndex,
+-            materialClassCache
++            materialClassCache,
++            geometryCache
+         );
+         cachedKeys.push_back({ submittedCallCount, value });
+         return value;
+diff --git a/src/render/rt64_bumble_shadow_geometry.h b/src/render/rt64_bumble_shadow_geometry.h
+index 0ade913..31fdbe6 100644
+--- a/src/render/rt64_bumble_shadow_geometry.h
++++ b/src/render/rt64_bumble_shadow_geometry.h
+@@ -28,24 +28,43 @@ namespace RT64 {
+         return false;
+     }
+ 
+-    // Source geometry is immutable within a workload, not across workloads.
+-    inline uint64_t bumbleShadowGeometryKey(const DrawData &data,
+-        uint64_t first, uint64_t count) {
+-        if (first > data.faceIndices.size() || count > data.faceIndices.size() - first)
+-            throw std::runtime_error("Invalid shadow caster index range");
+-        XXH3_state_t state{};
+-        XXH3_64bits_reset(&state);
+-        for (uint64_t i = first; i < first + count; ++i) {
+-            const uint32_t vertex = data.faceIndices[i];
+-            const uint64_t position = uint64_t(vertex) * 3;
+-            if (vertex >= data.worldIndices.size() || position + 3 > data.posFloats.size())
+-                throw std::runtime_error("Invalid shadow caster vertex");
+-            XXH3_64bits_update(&state, &vertex, sizeof(vertex));
+-            XXH3_64bits_update(&state, &data.worldIndices[vertex], sizeof(data.worldIndices[vertex]));
+-            XXH3_64bits_update(&state, &data.posFloats[position], 3 * sizeof(float));
++    struct BumbleShadowGeometryCache {
++        std::vector<uint64_t> vertices, transforms, corners;
++
++        void reset(const DrawData &data) {
++            vertices.assign(data.worldIndices.size(), 0);
++            transforms.assign(data.worldTransforms.size(), 0);
+         }
+-        return XXH3_64bits_digest(&state);
+-    }
++
++        uint64_t key(const DrawData &data, uint64_t first, uint64_t count) {
++            if (first > data.faceIndices.size() || count > data.faceIndices.size() - first)
++                throw std::runtime_error("Invalid shadow caster index range");
++            corners.resize(count);
++            for (uint64_t i = 0; i < count; ++i) {
++                const uint32_t vertex = data.faceIndices[first + i];
++                const uint64_t position = uint64_t(vertex) * 3;
++                if (vertex >= vertices.size() || position + 3 > data.posFloats.size())
++                    throw std::runtime_error("Invalid shadow caster vertex");
++                uint64_t &vertexKey = vertices[vertex];
++                if (vertexKey == 0) {
++                    const uint32_t matrix = data.worldIndices[vertex];
++                    if (matrix >= transforms.size())
++                        throw std::runtime_error("Invalid shadow caster transform");
++                    uint64_t &transformKey = transforms[matrix];
++                    if (transformKey == 0)
++                        transformKey = XXH3_64bits(&data.worldTransforms[matrix],
++                            sizeof(data.worldTransforms[matrix]));
++                    // Hash source content, not transient buffer indices.
++                    uint32_t content[5];
++                    std::memcpy(content, &data.posFloats[position], 3 * sizeof(float));
++                    std::memcpy(content + 3, &transformKey, sizeof(transformKey));
++                    vertexKey = XXH3_64bits(content, sizeof(content));
++                }
++                corners[i] = vertexKey;
++            }
++            return XXH3_64bits(corners.data(), corners.size() * sizeof(uint64_t));
++        }
++    };
+ 
+     inline bool bumbleShadowGeometryMoving(const DrawData &data,
+         uint64_t first, uint64_t count) {

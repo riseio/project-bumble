@@ -159,21 +159,43 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     geometry.velFloats.resize(9, 0);
     geometry.worldIndices = {0, 0, 0};
     geometry.faceIndices = {0, 1, 2};
-    const uint64_t meshKey = RT64::bumbleShadowGeometryKey(geometry, 0, 3);
+    geometry.worldTransforms.emplace_back(hlslpp::float4x4::identity());
+    geometry.worldTransforms.emplace_back(hlslpp::float4x4::identity());
+    geometry.worldTransforms[1][3][0] = 32.0f;
+    RT64::BumbleShadowGeometryCache shadowCache;
+    auto geometryKey = [&]() {
+        shadowCache.reset(geometry);
+        return shadowCache.key(geometry, 0, 3);
+    };
+    const uint64_t meshKey = geometryKey();
     require(!RT64::bumbleShadowGeometryMoving(geometry, 0, 3));
     geometry.posFloats[0] = 2;
-    require(RT64::bumbleShadowGeometryKey(geometry, 0, 3) != meshKey);
+    require(geometryKey() != meshKey);
     geometry.posFloats[0] = 0;
     geometry.worldIndices[0] = 1;
-    require(RT64::bumbleShadowGeometryKey(geometry, 0, 3) != meshKey);
+    require(geometryKey() != meshKey);
     geometry.worldIndices[0] = 0;
     std::swap(geometry.faceIndices[0], geometry.faceIndices[1]);
-    require(RT64::bumbleShadowGeometryKey(geometry, 0, 3) != meshKey);
+    require(geometryKey() != meshKey);
     std::swap(geometry.faceIndices[0], geometry.faceIndices[1]);
-    require(RT64::bumbleShadowGeometryKey(geometry, 0, 3) == meshKey);
+    require(geometryKey() == meshKey);
+    require(shadowCache.key(geometry, 0, 3) == meshKey);
+    geometry.worldTransforms[1] = geometry.worldTransforms[0];
+    geometry.worldIndices = {1, 1, 1};
+    require(geometryKey() == meshKey);
+    geometry.posFloats.insert(geometry.posFloats.begin(), {7, 8, 9});
+    geometry.worldIndices.insert(geometry.worldIndices.begin(), 0);
+    geometry.faceIndices = {1, 2, 3};
+    require(geometryKey() == meshKey);
+    require(shadowCache.key(geometry, 0, 2) != meshKey);
+    geometry.worldTransforms[1][3][0] = 64.0f;
+    require(geometryKey() != meshKey);
+    geometry.posFloats.erase(geometry.posFloats.begin(), geometry.posFloats.begin() + 3);
+    geometry.worldIndices = {0, 0, 0};
+    geometry.faceIndices = {0, 1, 2};
+    require(geometryKey() == meshKey);
     geometry.velFloats[7] = .1f;
     require(RT64::bumbleShadowGeometryMoving(geometry, 0, 3));
-    geometry.worldTransforms.emplace_back(hlslpp::float4x4::identity());
     geometry.worldTransformGroups = {0};
     geometry.transformGroups.resize(1);
     geometry.transformGroups[0].matrixId = 0x80012340u;
@@ -193,7 +215,7 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     geometry.prevWorldTransforms.clear();
     require(!RT64::bumbleShadowTransformsMoving(geometry, 0, 0));
     std::fprintf(stderr, "BUMBLE_SHADOW_MOTION_CONTRACT result=pass stationary_object_id=1 moving_endpoints=1 presentation_independent=1 unmatched_static=1\n");
-    std::fprintf(stderr, "BUMBLE_SHADOW_GEOMETRY_CONTRACT result=pass same_count_position_index_transform_changes=1 deformation_dynamic=1\n");
+    std::fprintf(stderr, "BUMBLE_SHADOW_GEOMETRY_CONTRACT result=pass content_changes=1 relocation_reuse=1 partial_range=1 deformation_dynamic=1\n");
     constexpr std::array<float, 16> gradients{
         0, 1e-20f, .25f, 1, 1.41421356237f, 2, 4, 8,
         16, 64, 256, 65536, 1e30f, .5f, 1.4141f, 1.4143f

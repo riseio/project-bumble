@@ -1,0 +1,52 @@
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index c366286..280031f 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -90,7 +90,7 @@ float sampleBumbleDirectionalShadow(
+                 gNearestClampClampSampler, shadowUv);
+             const float filteredStaticVisibility = bumbleShadowReceiverVisibility(
+                 depths, shadowClip.xyz, inverseResolution.xx,
+-                shadowDepthGradient, receiverBias, false);
++                shadowDepthGradient, receiverBias, true);
+             staticVisibility = lerp(
+                 1.0f,
+                 filteredStaticVisibility,
+@@ -1071,36 +1071,15 @@ LIBRARY_EXPORT bool RasterPS(
+             minimumLighting.xxx,
+             maximumLighting.xxx
+         );
+-        // Recover sampled colour only as direct sunlight disappears.
+-        const bool primaryMaterialTextured =
+-            renderFlagUsesTexture0(rp.flags);
+         const float3 materialAuthoredColor = authoredWorldColor;
+-        const float3 sampledMaterialColor = primaryMaterialTextured
+-            ? texVal0.rgb
+-            : materialAuthoredColor;
+-        const float3 shadowMaterialColor = max(
+-            materialAuthoredColor,
+-            sampledMaterialColor
+-        );
+-        const float materialRecovery = directShadowOcclusion *
+-            (primaryMaterialTextured ? 0.85f : 0.0f);
+-        const float3 relitMaterialColor = lerp(
+-            materialAuthoredColor,
+-            shadowMaterialColor,
+-            materialRecovery
+-        );
+         // The product exposes modern lighting as an on/off feature and the enabled path owns a strength of exactly 1.0.
+-        resultColor.rgb = relitMaterialColor * lighting;
++        resultColor.rgb = materialAuthoredColor * lighting;
+         const float sunlitLift = 1.0f +
+             0.22f * directReception * directShadowVisibility;
+         resultColor.rgb *= sunlitLift;
+         const float sunlitExposure =
+             lightingIndices.modernLightingGrade.w;
+-        const float sunlitVisibility = smoothstep(
+-            0.86f,
+-            0.985f,
+-            directShadowVisibility
+-        );
++        const float sunlitVisibility = directShadowVisibility;
+         const float3 sunlitExposureFloor = materialAuthoredColor *
+             sunlitExposure;
+         resultColor.rgb = lerp(

@@ -47,7 +47,7 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
         const float depth = .6f + dot(expectedGradient, uv);
         const float4 depths = receiverPlane.Gather(immutableFirst, uv);
         const float self = bumbleShadowReceiverVisibility(depths, float3(uv, depth),
-            .125f.xx, gradient, .000001f, false);
+            .125f.xx, gradient, .000001f, true);
         const float occluded = bumbleShadowReceiverVisibility(depths, float3(uv, depth + .02f),
             .125f.xx, gradient, .000001f, true);
         const float4 oldDepths = receiverPlane.Gather(immutableFirst, uv + .0625f);
