@@ -2,6 +2,7 @@
 #include "shaders/TextureSampler.hlsli"
 #include "shaders/BumbleSurfaceFog.hlsli"
 #include "shaders/BumbleShadowReceiver.hlsli"
+#include "shaders/BumbleLightingGrade.hlsli"
 RWStructuredBuffer<float4> outputValues : register(u1);
 Texture2D<float4> beforeSamplers : register(t0, space2);
 SamplerState immutableFirst : register(s1, space2);
@@ -15,6 +16,19 @@ static const float gradients[16] = {
 [numthreads(64, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
+    if (i < 32) {
+        const float slope = float(i + 1) * 1024.0f;
+        const float3 receiver = float3(.49f, .51f, .5f);
+        const float2 gradient = float2(slope, -slope);
+        const float empty = bumbleShadowReceiverVisibility(1.0f.xxxx, receiver,
+            .125f.xx, gradient, 0, true);
+        const float oldEmpty = bumbleShadowReceiverVisibility(.999f.xxxx, receiver,
+            .125f.xx, gradient, 0, true);
+        const float x = float(i) / 31.0f;
+        const float expected = lerp(x, x * x * (3 - 2 * x), .5f);
+        const float3 graded = bumbleLightingContrast(x.xxx);
+        outputValues[372 + i] = float4(empty, oldEmpty, graded.x, abs(graded.x - expected));
+    }
     OtherMode fogMode = (OtherMode)0;
     fogMode.H = G_CYC_2CYCLE;
     fogMode.L = ((3u << 14) | (2u << 10)) << 16;

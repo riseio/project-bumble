@@ -220,7 +220,51 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         0, 1e-20f, .25f, 1, 1.41421356237f, 2, 4, 8,
         16, 64, 256, 65536, 1e30f, .5f, 1.4141f, 1.4143f
     };
-    constexpr uint64_t bytes = 372 * 4 * sizeof(float);
+    RT64::BumbleShadowOwnership ownership;
+    ownership.beginLevel(1);
+    geometry.worldTransformMotion.resize(geometry.worldTransforms.size(), 0);
+    geometry.worldTransformGroups.resize(geometry.worldTransforms.size(), 0);
+    geometry.velFloats.assign(geometry.velFloats.size(), 0);
+    ownership.observe(geometry);
+    ownership.assign(geometry);
+    require(!RT64::bumbleShadowCasterDynamic(geometry, 0, 0));
+    auto wing = geometry;
+    wing.worldTransformMotion[0] = 1;
+    ownership.observe(geometry);
+    ownership.observe(wing);
+    ownership.assign(geometry);
+    ownership.assign(wing);
+    require(RT64::bumbleShadowCasterDynamic(geometry, 0, 0));
+    require(RT64::bumbleShadowCasterDynamic(wing, 0, 0));
+    wing.worldTransformMotion[0] = 0;
+    wing.prevWorldTransforms.clear();
+    ownership.observe(wing);
+    ownership.assign(wing);
+    require(RT64::bumbleShadowCasterDynamic(wing, 0, 0));
+    require(!ownership.beginLevel(1));
+    ownership.observe(wing);
+    ownership.assign(wing);
+    require(RT64::bumbleShadowCasterDynamic(wing, 0, 0));
+    require(ownership.beginLevel(2));
+    ownership.observe(wing);
+    ownership.assign(wing);
+    require(!RT64::bumbleShadowCasterDynamic(wing, 0, 0));
+    wing.velFloats[0] = 1;
+    ownership.observe(geometry);
+    ownership.observe(wing);
+    ownership.assign(geometry);
+    require(RT64::bumbleShadowCasterDynamic(geometry, 0, 0));
+    for (uint32_t id : {uint32_t(G_EX_ID_AUTO), uint32_t(G_EX_ID_IGNORE)}) {
+        ownership.beginLevel(ownership.level + 1);
+        geometry.transformGroups[0].matrixId = id;
+        wing.transformGroups[0].matrixId = id;
+        ownership.observe(geometry);
+        ownership.observe(wing);
+        ownership.assign(geometry);
+        require(!RT64::bumbleShadowCasterDynamic(geometry, 0, 0));
+    }
+    std::fprintf(stderr, "BUMBLE_SHADOW_OWNERSHIP_CONTRACT result=pass hierarchy=1 pause=1 unmatched=1 deformation=1 level_reset=1\n");
+    constexpr uint64_t bytes = 404 * 4 * sizeof(float);
     RT64::RenderWorker worker(device, "Bumble Texture Contract", RenderCommandListType::DIRECT);
     std::unique_ptr<RenderBuffer> upload;
     for (size_t length = 0; length < 4; ++length) {
@@ -381,13 +425,21 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         oldSelfShadowObserved |= values[i * 4 + 3] < 1;
     }
     shadowPassed &= oldSelfShadowObserved;
+    bool contrastPassed = true;
+    for (uint32_t i = 372; i < 404; ++i) {
+        shadowPassed &= values[i * 4] == 1 && values[i * 4 + 1] < 1;
+        contrastPassed &= values[i * 4 + 3] < 1e-6f;
+        if (i > 372) contrastPassed &= values[i * 4 + 2] > values[(i - 1) * 4 + 2];
+    }
+    matches &= contrastPassed;
+    std::fprintf(stderr, "BUMBLE_LIGHTING_CONTRAST_CONTRACT result=%s cases=32\n", contrastPassed ? "pass" : "fail");
     matches &= fogPassed && shadowPassed;
     std::fprintf(stderr, "BUMBLE_FOG_COMPOSITION_CONTRACT result=%s cases=16\n", fogPassed ? "pass" : "fail");
     std::fprintf(stderr, "BUMBLE_SHADOW_RECEIVER_CONTRACT result=%s cases=32 old_self_shadow_reproduced=%d\n",
         shadowPassed ? "pass" : "fail", oldSelfShadowObserved);
     std::fprintf(stderr, "BUMBLE_MIXED_DESCRIPTOR_GPU_CONTRACT result=%s immutable_samplers=2 sampled_before_and_after=1\n", mixedPassed ? "pass" : "fail");
     if (!matches) {
-        for (uint32_t i = 256; i < 372; ++i)
+        for (uint32_t i = 256; i < 404; ++i)
             std::fprintf(stderr, "BUMBLE_TEXTURE_GPU_CONTRACT sample=%u value=%.9g,%.9g,%.9g,%.9g\n", i,
                 values[i * 4], values[i * 4 + 1], values[i * 4 + 2], values[i * 4 + 3]);
     }

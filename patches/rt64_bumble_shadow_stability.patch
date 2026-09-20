@@ -1,0 +1,365 @@
+diff --git a/src/hle/rt64_workload.cpp b/src/hle/rt64_workload.cpp
+index 74649bd..72a4c81 100644
+--- a/src/hle/rt64_workload.cpp
++++ b/src/hle/rt64_workload.cpp
+@@ -89,6 +89,8 @@ namespace RT64 {
+         drawData.loadOperations.clear();
+         drawData.worldTransforms.clear();
+         drawData.worldTransformMotion.clear();
++        drawData.shadowDynamicTransforms.clear();
++        drawData.shadowOwnershipPrepared = false;
+         drawData.viewTransforms.clear();
+         drawData.projTransforms.clear();
+         drawData.viewProjTransforms.clear();
+diff --git a/src/hle/rt64_workload.h b/src/hle/rt64_workload.h
+index ec4ca3a..fd33c0a 100644
+--- a/src/hle/rt64_workload.h
++++ b/src/hle/rt64_workload.h
+@@ -58,6 +58,8 @@ namespace RT64 {
+         std::vector<interop::float4x4> worldTransforms;
+         // Source-endpoint motion, independent of interpolated presentation weights.
+         std::vector<uint8_t> worldTransformMotion;
++        std::vector<uint8_t> shadowDynamicTransforms;
++        bool shadowOwnershipPrepared = false;
+         std::vector<interop::float4x4> prevWorldTransforms;
+         std::vector<interop::float4x4> invTWorldTransforms;
+         std::vector<interop::float4x4> lerpWorldTransforms;
+diff --git a/src/render/rt64_bumble_shadow_geometry.h b/src/render/rt64_bumble_shadow_geometry.h
+index 31fdbe6..4afc2ff 100644
+--- a/src/render/rt64_bumble_shadow_geometry.h
++++ b/src/render/rt64_bumble_shadow_geometry.h
+@@ -4,8 +4,71 @@
+ #include "xxHash/xxh3.h"
+ #include <stdexcept>
+ #include <cstring>
++#include <unordered_set>
+ 
+ namespace RT64 {
++    struct BumbleShadowOwnership {
++        uint32_t level = UINT32_MAX;
++        std::unordered_set<uint32_t> movingGroups;
++
++        bool beginLevel(uint32_t nextLevel) {
++            if (level == nextLevel) return false;
++            level = nextLevel;
++            movingGroups.clear();
++            return true;
++        }
++
++        static uint32_t groupId(const DrawData &data, size_t matrix) {
++            if (matrix >= data.worldTransformGroups.size()) return G_EX_ID_AUTO;
++            const uint32_t group = data.worldTransformGroups[matrix];
++            return group < data.transformGroups.size()
++                ? data.transformGroups[group].matrixId : G_EX_ID_AUTO;
++        }
++
++        static bool explicitId(uint32_t id) {
++            return id != G_EX_ID_AUTO && id != G_EX_ID_IGNORE;
++        }
++
++        void observe(DrawData &data) {
++            data.shadowDynamicTransforms = data.worldTransformMotion;
++            if (data.shadowDynamicTransforms.size() != data.worldTransforms.size() ||
++                data.velFloats.size() < data.worldIndices.size() * 3)
++                throw std::runtime_error("Invalid shadow motion streams");
++            for (size_t vertex = 0; vertex < data.worldIndices.size(); ++vertex) {
++                const size_t p = vertex * 3;
++                if (data.velFloats[p] == 0 && data.velFloats[p + 1] == 0 &&
++                    data.velFloats[p + 2] == 0) continue;
++                const uint32_t matrix = data.worldIndices[vertex];
++                if (matrix >= data.shadowDynamicTransforms.size())
++                    throw std::runtime_error("Invalid shadow motion transform");
++                data.shadowDynamicTransforms[matrix] = 1;
++            }
++            for (size_t matrix = 0; matrix < data.shadowDynamicTransforms.size(); ++matrix) {
++                const uint32_t id = groupId(data, matrix);
++                if (data.shadowDynamicTransforms[matrix] && explicitId(id))
++                    movingGroups.insert(id);
++            }
++            data.shadowOwnershipPrepared = true;
++        }
++
++        // Observe all workloads before assigning a shared actor hierarchy.
++        void assign(DrawData &data) const {
++            for (size_t matrix = 0; matrix < data.shadowDynamicTransforms.size(); ++matrix) {
++                const uint32_t id = groupId(data, matrix);
++                if (explicitId(id) && movingGroups.count(id))
++                    data.shadowDynamicTransforms[matrix] = 1;
++            }
++        }
++    };
++
++    inline bool bumbleShadowCasterDynamic(const DrawData &data, uint32_t first, uint32_t last) {
++        if (first > last || last >= data.shadowDynamicTransforms.size())
++            throw std::runtime_error("Invalid shadow ownership range");
++        for (uint32_t matrix = first; matrix <= last; ++matrix)
++            if (data.shadowDynamicTransforms[matrix]) return true;
++        return false;
++    }
++
+     inline bool bumbleWorldPerspectiveGeometry(const Projection &projection,
+         const GameCall &call) {
+         return projection.type == Projection::Type::Perspective &&
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 38a775d..c6b4aef 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -539,29 +539,8 @@ namespace RT64 {
+         const Workload &workload,
+         const GameCall &call
+     ) {
+-        const DrawData &drawData = workload.drawData;
+-        const uint32_t first = call.callDesc.minWorldMatrix;
+-        const uint32_t last = call.callDesc.maxWorldMatrix;
+-        // A stable object ID owns matching, not motion: level shells have IDs too.
+-        if (bumbleShadowTransformsMoving(drawData, first, last)) return true;
+-        // motion above is also source-owned. Do not scan
+-        thread_local const Workload *cachedWorkload = nullptr;
+-        thread_local uint64_t cachedSubmission = UINT64_MAX;
+-        thread_local uint64_t cachedWorkloadId = UINT64_MAX;
+-        thread_local std::unordered_map<const GameCall *, bool> motion;
+-        if (cachedWorkload != &workload || cachedSubmission != workload.submissionFrame ||
+-            cachedWorkloadId != workload.workloadId) {
+-            motion.clear();
+-            cachedWorkload = &workload;
+-            cachedSubmission = workload.submissionFrame;
+-            cachedWorkloadId = workload.workloadId;
+-        }
+-        const auto found = motion.find(&call);
+-        if (found != motion.end()) return found->second;
+-        const bool moving = bumbleShadowGeometryMoving(drawData, call.meshDesc.faceIndicesStart,
+-            uint64_t(call.callDesc.triangleCount) * 3);
+-        motion.emplace(&call, moving);
+-        return moving;
++        return bumbleShadowCasterDynamic(workload.drawData,
++            call.callDesc.minWorldMatrix, call.callDesc.maxWorldMatrix);
+     }
+ 
+     static bool bumbleMaterialShadersDisabled() {
+@@ -1705,32 +1684,6 @@ namespace RT64 {
+         return found;
+     }
+ 
+-    static uint32_t bumbleShadowDebugMode() {
+-        static const uint32_t mode = []() {
+-            const char *text = std::getenv("BUMBLE_SHADOW_DEBUG_MODE");
+-            if (text == nullptr || text[0] == '\0') {
+-                return 0u;
+-            }
+-            char *end = nullptr;
+-            const unsigned long parsed = std::strtoul(text, &end, 10);
+-            return end != text && *end == '\0'
+-                ? std::min<uint32_t>(static_cast<uint32_t>(parsed), 3u)
+-                : 0u;
+-        }();
+-        return mode;
+-    }
+-
+-    static bool bumbleShadowsDisabledForPerformanceProbe() {
+-        // Process-local performance discriminator.
+-        static const bool disabled = []() {
+-            const char *text = std::getenv(
+-                "BUMBLE_SHADOWS_DISABLE"
+-            );
+-            return text != nullptr && text[0] != '\0' && text[0] != '0';
+-        }();
+-        return disabled;
+-    }
+-
+     static interop::float4x4 bumbleShadowViewProjection(
+         hlslpp::float3 lightDirection,
+         hlslpp::float3 focus,
+@@ -3713,7 +3666,6 @@ namespace RT64 {
+         }
+         const bool staticShadowResourcesReady =
+             modernLightingActive && shadowProjectionFound &&
+-            !bumbleShadowsDisabledForPerformanceProbe() &&
+             bumbleShadowRenderer->ensureResources(
+                 p.worker,
+                 p.rasterShaderCache->shaderFormat
+@@ -3968,11 +3920,8 @@ namespace RT64 {
+             environmentProfile.groundColor.z,
+             environmentProfile.hemisphereStrength,
+         };
+-        const uint32_t shadowDebugMode = bumbleShadowDebugMode();
+         fbParams.modernShadowParams = {
+-            shadowPrepared
+-                ? 1.0f + static_cast<float>(shadowDebugMode)
+-                : 0.0f,
++            shadowPrepared ? 1.0f : 0.0f,
+             1.0f / static_cast<float>(
+                 BumbleShadowRenderer::StaticResolution
+             ),
+@@ -6586,7 +6535,6 @@ namespace RT64 {
+                     " strength=%.2f shadow_map=%d"
+                     " shadow_resolution=%" PRIu32
+                     " pcf=4tap_static_plus_1tap_dynamic"
+-                    " shadow_debug=%" PRIu32
+                     " level=%" PRIu32 " profile=%" PRIu32 "\n",
+                     modernLightingActive ? 1 : 0,
+                     materialShadersActive ? 1 : 0,
+@@ -6602,7 +6550,6 @@ namespace RT64 {
+                     static_cast<double>(fbParams.modernLightingStrength),
+                     shadowPrepared ? 1 : 0,
+                     BumbleShadowRenderer::StaticResolution,
+-                    shadowDebugMode,
+                     environment.levelIndex,
+                     static_cast<uint32_t>(environment.profile)
+                 );
+diff --git a/src/render/rt64_transform_processor.cpp b/src/render/rt64_transform_processor.cpp
+index d57eb00..2a8b189 100644
+--- a/src/render/rt64_transform_processor.cpp
++++ b/src/render/rt64_transform_processor.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "rt64_transform_processor.h"
+ #include "rt64_bumble_shadow_geometry.h"
++#include "rt64_bumble_environment.h"
+ 
+ #include "common/rt64_math.h"
+ #include "hle/rt64_game_frame.h"
+@@ -75,6 +76,20 @@ namespace RT64 {
+     }
+     
+     void TransformProcessor::upload(const ProcessParams &p) {
++        const bool changedLevel = shadowOwnership.beginLevel(
++            bumble::graphics_options::lighting_environment().levelIndex);
++        bool changedOwnership = changedLevel;
++        for (uint32_t w : p.curFrame->workloads) {
++            DrawData &data = p.workloadQueue->workloads[w].drawData;
++            if (changedLevel || !data.shadowOwnershipPrepared) {
++                shadowOwnership.observe(data);
++                changedOwnership = true;
++            }
++        }
++        if (changedOwnership) {
++            for (uint32_t w : p.curFrame->workloads)
++                shadowOwnership.assign(p.workloadQueue->workloads[w].drawData);
++        }
+         uploads.clear();
+ 
+         for (uint32_t w : p.curFrame->workloads) {
+diff --git a/src/render/rt64_transform_processor.h b/src/render/rt64_transform_processor.h
+index f1f0aa5..1fbe365 100644
+--- a/src/render/rt64_transform_processor.h
++++ b/src/render/rt64_transform_processor.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include "rt64_buffer_uploader.h"
++#include "rt64_bumble_shadow_geometry.h"
+ 
+ namespace RT64 {
+     struct GameFrame;
+@@ -13,6 +14,7 @@ namespace RT64 {
+     struct TransformProcessor {
+         std::unique_ptr<BufferUploader> bufferUploader;
+         std::vector<BufferUploader::Upload> uploads;
++        BumbleShadowOwnership shadowOwnership;
+ 
+         struct ProcessParams {
+             RenderWorker *worker = nullptr;
+diff --git a/src/shaders/BumbleShadowReceiver.hlsli b/src/shaders/BumbleShadowReceiver.hlsli
+index c5baf70..14411b2 100644
+--- a/src/shaders/BumbleShadowReceiver.hlsli
++++ b/src/shaders/BumbleShadowReceiver.hlsli
+@@ -22,7 +22,7 @@ float bumbleShadowReceiverVisibility(float4 depths, float3 coordinate,
+         inverseSize.y * 0.5f, 1.0f - inverseSize.y * 0.5f) - coordinate.y;
+     const float4 references = coordinate.z - bias +
+         depthGradient.x * offsetX + depthGradient.y * offsetY;
+-    const float4 visible = float4(references <= depths);
++    const float4 visible = float4((depths >= 1.0f) | (references <= depths));
+     if (bilinear) {
+         return lerp(lerp(visible.w, visible.z, fraction.x),
+             lerp(visible.x, visible.y, fraction.x), fraction.y);
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index 280031f..ac5ac43 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -11,6 +11,7 @@
+ #include "Library.hlsli"
+ #include "BumbleSurfaceFog.hlsli"
+ #include "BumbleShadowReceiver.hlsli"
++#include "BumbleLightingGrade.hlsli"
+ #include "Random.hlsli"
+ #include "TextureSampler.hlsli"
+ 
+@@ -1072,7 +1073,6 @@ LIBRARY_EXPORT bool RasterPS(
+             maximumLighting.xxx
+         );
+         const float3 materialAuthoredColor = authoredWorldColor;
+-        // The product exposes modern lighting as an on/off feature and the enabled path owns a strength of exactly 1.0.
+         resultColor.rgb = materialAuthoredColor * lighting;
+         const float sunlitLift = 1.0f +
+             0.22f * directReception * directShadowVisibility;
+@@ -1097,7 +1097,7 @@ LIBRARY_EXPORT bool RasterPS(
+         const float daylightHeadroomGain = 1.0f +
+             2.0f * daylightHeadroomStrength * sunlitVisibility *
+             (1.0f - saturate(daylightLuma));
+-        resultColor.rgb = saturate(
++        resultColor.rgb = bumbleLightingContrast(
+             resultColor.rgb * daylightHeadroomGain
+         );
+ 
+@@ -1106,48 +1106,6 @@ LIBRARY_EXPORT bool RasterPS(
+                 blInputs, resultColor.rgb, combinerColor.a);
+         }
+ 
+-        // Development-only visibility modes selected through BUMBLE_SHADOW_DEBUG_MODE.
+-        const float shadowDebugMode =
+-            floor(max(FbParams.modernShadowParams.x - 1.0f, 0.0f) + 0.5f);
+-        [branch]
+-        if (shadowDebugMode >= 1.0f) {
+-            const float4 debugCoordinate = vertexShadowPosition;
+-            const float2 debugUv = debugCoordinate.xy;
+-            const bool debugInside = debugCoordinate.w >= 0.5f &&
+-                debugCoordinate.z > 0.0f && debugCoordinate.z < 1.0f &&
+-                all(debugUv > 0.0f) && all(debugUv < 1.0f);
+-            const float debugResolution = rcp(max(
+-                FbParams.modernShadowParams.y,
+-                1.0e-6f
+-            ));
+-            const int2 debugMaximum = int2(
+-                debugResolution - 1.0f,
+-                debugResolution - 1.0f
+-            );
+-            const int2 debugTexel = clamp(
+-                int2(debugUv * debugResolution),
+-                int2(0, 0),
+-                debugMaximum
+-            );
+-            const float debugMapDepth = debugInside
+-                ? gBumbleShadowMap.Load(int3(debugTexel, 0))
+-                : 1.0f;
+-            if (shadowDebugMode < 1.5f) {
+-                resultColor.rgb = debugInside
+-                    ? float3(0.0f, 1.0f, debugMapDepth < 0.9999f ? 1.0f : 0.0f)
+-                    : float3(1.0f, 0.0f, 0.0f);
+-            }
+-            else if (shadowDebugMode < 2.5f) {
+-                resultColor.rgb = debugInside
+-                    ? debugMapDepth.xxx
+-                    : float3(1.0f, 0.0f, 0.0f);
+-            }
+-            else {
+-                resultColor.rgb = debugInside
+-                    ? shadowVisibility.xxx
+-                    : float3(1.0f, 0.0f, 0.0f);
+-            }
+-        }
+ 
+         }
+ 
+diff --git a/src/shaders/BumbleLightingGrade.hlsli b/src/shaders/BumbleLightingGrade.hlsli
+new file mode 100644
+index 0000000..7602dd4
+--- /dev/null
++++ b/src/shaders/BumbleLightingGrade.hlsli
+@@ -0,0 +1,7 @@
++#pragma once
++
++float3 bumbleLightingContrast(float3 color) {
++    const float luma = dot(saturate(color), float3(.2126f, .7152f, .0722f));
++    const float gain = 1.0f + .5f * (1.0f - luma) * (2.0f * luma - 1.0f);
++    return saturate(color * gain);
++}
