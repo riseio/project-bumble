@@ -16,6 +16,8 @@ double horizontal_expansion_scale();
 bool visibility_expansion_enabled();
 
 bool extended_ui_enabled();
+void invalidate_world_camera_history();
+void invalidate_scene_history();
 
 struct VisibilityCameraXZ {
     float eye_x = 0.0f;
@@ -95,7 +97,7 @@ extern "C" void bumble_configure_single_player_color_clear(
 extern "C" void bumble_configure_single_player_world_aperture(
     uint8_t* rdram,
     recomp_context* context
-);
+) noexcept(false);
 extern "C" void bumble_restore_split_screen_world_aperture(
     uint8_t* rdram,
     recomp_context* context

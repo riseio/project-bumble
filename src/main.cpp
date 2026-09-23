@@ -1366,7 +1366,9 @@ int main(int argc, char** argv) {
         return 6;
     }
     log_stage("stored_rom_preflight_passed");
-    if (!bumble::first_run::ensure_assets(data_root, rom_path)) {
+    const auto assets = bumble::first_run::ensure_assets(data_root, rom_path, !replay_path.empty());
+    if (assets == bumble::first_run::AssetResult::Cancelled) return 0;
+    if (assets != bumble::first_run::AssetResult::Ready) {
         log_stage("first_run_asset_generation_failed");
         return 8;
     }

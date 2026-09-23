@@ -432,6 +432,26 @@ before_vram = 0x8005508C
 text = "bumble_emit_modern_sky_pass(rdram, ctx);"
 
 [[patches.hook]]
+func = "func_80054EC8"
+before_vram = 0x800551E0
+text = "bumble_end_world_camera_scope(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009BC60"
+before_vram = 0x8009BEC8
+text = "bumble_publish_script_camera_history(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80095C08"
+before_vram = 0x80095C78
+text = "bumble_invalidate_world_camera_history(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80095CA0"
+before_vram = 0x80095D24
+text = "bumble_invalidate_world_camera_history(rdram, ctx);"
+
+[[patches.hook]]
 func = "func_80055204"
 before_vram = 0x80055204
 text = "bumble_restore_split_screen_world_aperture(rdram, ctx);"
@@ -1202,6 +1222,51 @@ text = "bumble_object_cull_distance_reject_probe(rdram, ctx);"
 func = "func_8009D868"
 before_vram = 0x8009DA5C
 text = "bumble_record_rendered_actor(); bumble_begin_actor_matrix_group(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009F968"
+before_vram = 0x8009F998
+text = "bumble_register_actor_history(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009F94C"
+before_vram = 0x8009F94C
+text = "bumble_unregister_actor_history(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80052560"
+before_vram = 0x80052714
+text = "bumble_begin_model_part(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80052560"
+before_vram = 0x80052654
+text = "bumble_end_model_part(rdram);"
+
+[[patches.hook]]
+func = "func_80052560"
+before_vram = 0x80052794
+text = "bumble_end_model_part(rdram);"
+
+[[patches.hook]]
+func = "func_80057950"
+before_vram = 0x800583FC
+text = "bumble_set_model_role(1);"
+
+[[patches.hook]]
+func = "func_80057950"
+before_vram = 0x80058404
+text = "bumble_set_model_role(0);"
+
+[[patches.hook]]
+func = "gfx_build_and_submit_task"
+before_vram = 0x800543F0
+text = "bumble_wait_graphics_input(rdram, 0);"
+
+[[patches.hook]]
+func = "func_8008B004"
+before_vram = 0x8008B004
+text = "bumble_wait_graphics_input(rdram, 1);"
 
 [[patches.hook]]
 func = "func_8009D868"

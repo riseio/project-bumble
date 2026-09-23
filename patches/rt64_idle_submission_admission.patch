@@ -1,0 +1,30 @@
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -2658,6 +2658,10 @@
+                     (ext.presentGraphicsWorker->pendingQueueSubmissions->load(
+                         std::memory_order_acquire
+                     ) != 0u);
++                if (realGPUWorkPending) {
++                    Thread::sleepMilliseconds(1);
++                    continue;
++                }
+                 commandList->begin();
+                 commandList->resetQueryPool(
+                     idleClockQueryPool.get(),
+@@ -2669,11 +2673,10 @@
+                 commandList->dispatch(1, 1, 1);
+                 commandList->writeTimestamp(idleClockQueryPool.get(), 1);
+                 commandList->end();
+-                idleGraphicsWorker->execute();
+-                idleSubmissionCount++;
+-                idleSubmissionWithVisibleWorkCount +=
+-                    realGPUWorkPending ? 1u : 0u;
+-                idleGraphicsWorker->wait();
++                if (idleGraphicsWorker->executeIfQueueIdle()) {
++                    idleSubmissionCount++;
++                    idleGraphicsWorker->wait();
++                }
+                 
+                 Thread::sleepMilliseconds(1);
+             }

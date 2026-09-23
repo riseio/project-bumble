@@ -1,8 +1,16 @@
 #include "native_renderer_contracts.hpp"
 #include "native_first_run_assets.hpp"
+#include "native_texture_reconstruction.hpp"
+#include "native_electric_effect.hpp"
+#include "hle/rt64_framebuffer_manager.h"
+#include "hle/rt64_rdp.h"
+#include "xxHash/xxh3.h"
+#include "common/rt64_tmem_hasher.h"
+#include "common/rt64_recording_mutex.h"
 #include "render/rt64_texture_cache.h"
 #include "render/rt64_shader_compiler.h"
 #include "render/rt64_bumble_shadow_geometry.h"
+#include "render/rt64_bumble_shadow_renderer.h"
 #include "shared/rt64_texture_lod.h"
 #include "shared/rt64_raster_params.h"
 #include "native_texture_contract.spirv.h"
@@ -30,8 +38,210 @@ namespace dxil {
 #include <cstring>
 #include <stdexcept>
 #include <utility>
+#include <thread>
 
 namespace {
+void validate_recording_mutex() {
+    RT64::RecordingMutex recording;
+    std::mutex manager;
+    unsigned count = 0;
+    auto run = [&]() {
+        for (unsigned i = 0; i < 1000; ++i) {
+            std::unique_lock<RT64::RecordingMutex> recordLock(recording, std::defer_lock);
+            std::unique_lock<std::mutex> managerLock(manager, std::defer_lock);
+            std::lock(recordLock, managerLock);
+            ++count;
+        }
+    };
+    std::thread worker(run);
+    run();
+    worker.join();
+    if (count != 2000 || !recording.try_lock()) {
+        throw std::runtime_error("Recording lock contract failed");
+    }
+    const bool duplicate = recording.try_lock();
+    recording.unlock();
+    if (duplicate) throw std::runtime_error("Recording lock admitted two owners");
+    std::fprintf(stderr, "BUMBLE_RECORDING_LOCK_CONTRACT result=pass\n");
+}
+
+void validate_tmem_contracts() {
+    auto require = [](bool ok) { if (!ok) throw std::runtime_error("TMEM ownership contract failed"); };
+    RT64::LoadTile tile{};
+    tile.line = 8;
+    tile.siz = G_IM_SIZ_8b;
+    tile.fmt = G_IM_FMT_CI;
+    require(!RT64::TMEMHasher::requiresRawTMEM(tile, 64, 32, 2));
+    require(RT64::TMEMHasher::requiresRawTMEM(tile, 64, 33, 2));
+    require(!RT64::TMEMHasher::requiresRawTMEM(tile, 64, 33, 0));
+    tile.line = 0;
+    require(RT64::TMEMHasher::requiresRawTMEM(tile, 1, 1, 0));
+
+    RT64::FramebufferManager manager;
+    RT64::FramebufferManager::RegionTMEM region{};
+    region.tmemStart = 16;
+    region.tmemEnd = 24;
+    region.syncRequired = true;
+    manager.activeRegionsTMEM.push_back(region);
+    auto check = [&](uint32_t first, uint32_t end, uint8_t siz = G_IM_SIZ_8b,
+                     uint8_t fmt = G_IM_FMT_CI, bool tlut = false, uint8_t palette = 0) {
+        return manager.checkRegionsTMEM(first, end, 8, siz, fmt, 0, tlut, palette);
+    };
+    require(check(0, 17).syncRequired);
+    require(!check(0, 16).syncRequired);
+    require(!check(24, 25).syncRequired);
+    manager.synchronizeRegionsTMEM();
+    require(!check(0, 32).syncRequired);
+
+    manager.activeRegionsTMEM.clear();
+    region.tmemStart = 0;
+    region.tmemEnd = 8;
+    region.syncRequired = false;
+    region.fbTile = {0, G_IM_SIZ_8b, G_IM_FMT_CI, 0, 0, 8, 8, 8, 0};
+    region.tileCopyId = 1;
+    manager.activeRegionsTMEM.push_back(region);
+    require(check(0, 8).valid());
+    require(!check(0, 9).valid());
+    region = {};
+    region.tmemStart = 288;
+    region.tmemEnd = 304;
+    region.syncRequired = true;
+    manager.activeRegionsTMEM.push_back(region);
+    require(check(0, 8, G_IM_SIZ_8b, G_IM_FMT_CI, true).syncRequired);
+    require(check(0, 8, G_IM_SIZ_4b, G_IM_FMT_CI, true, 2).syncRequired);
+    require(!check(0, 8, G_IM_SIZ_4b, G_IM_FMT_CI, true, 1).syncRequired);
+    require(check(32, 40, G_IM_SIZ_32b, G_IM_FMT_RGBA).syncRequired);
+    std::fprintf(stderr, "BUMBLE_TMEM_CONTRACT result=pass\n");
+}
+
+bool validate_shadow_material(RenderDevice* device, RenderShaderFormat format) {
+    RT64::SamplerLibrary samplers;
+    auto fill = [&](RT64::SamplerSet &set) {
+        for (auto* slot : {&set.wrapWrap, &set.wrapMirror, &set.wrapClamp,
+                &set.mirrorWrap, &set.mirrorMirror, &set.mirrorClamp,
+                &set.clampWrap, &set.clampMirror, &set.clampClamp, &set.borderBorder}) {
+            *slot = device->createSampler(RenderSamplerDesc{});
+        }
+    };
+    fill(samplers.linear);
+    fill(samplers.nearest);
+    samplers.shadowComparison = device->createSampler(RenderSamplerDesc{});
+    RT64::RenderWorker worker(device, "Bumble Shadow Material Contract", RenderCommandListType::DIRECT);
+    RT64::BumbleShadowRenderer shadow(RT64::BumbleShadowRenderer::CachePolicy::DynamicPerPresentation,
+        "Shadow material contract", 8);
+    if (!shadow.ensureResources(&worker, format, samplers)) return false;
+    RT64::FramebufferRendererDescriptorCommonSet common(samplers, false, device);
+    RT64::FramebufferRendererDescriptorTextureSet textures(device, 1);
+    auto upload = [&](const void* data, size_t bytes, RenderBufferFlags flags) {
+        auto result = device->createBuffer(RenderBufferDesc::UploadBuffer(bytes, flags));
+        std::memcpy(result->map(), data, bytes);
+        result->unmap();
+        return result;
+    };
+    const float positions[] = {-1, -1, .5f, 1, -1, 3, .5f, 1, 3, -1, .5f, 1};
+    const float uv[] = {0, 0, 0, 0, 0, 0};
+    const uint32_t indices[] = {0, 1, 2};
+    auto vertices = upload(positions, sizeof(positions), RenderBufferFlag::VERTEX);
+    auto coordinates = upload(uv, sizeof(uv), RenderBufferFlag::VERTEX);
+    auto indexBuffer = upload(indices, sizeof(indices), RenderBufferFlag::INDEX);
+    auto readback = device->createBuffer(RenderBufferDesc::ReadbackBuffer(8 * 256));
+    const RenderVertexBufferView positionView(vertices.get(), sizeof(positions));
+    const RenderVertexBufferView uvView(coordinates.get(), sizeof(uv));
+    const RenderIndexBufferView indexView(indexBuffer.get(), sizeof(indices), RenderFormat::R32_UINT);
+    bool passed = true;
+    std::array<float, 64> coverage{};
+    for (uint32_t test = 0; test < 14; ++test) {
+        interop::RDPParams params{};
+        params.primColor = {0, 0, 0, float(test & 1)};
+        if (test >= 12) params.primColor.w = .5f;
+        params.blendColor = {0, 0, 0, .5f};
+        auto rdp = upload(&params, sizeof(params), RenderBufferFlag::STORAGE);
+        const uint32_t alpha = (test & 1) ? 0xFF000000u : 0u;
+        const uint32_t colors[] = {alpha, alpha, alpha};
+        auto materialColor = upload(colors, sizeof(colors), RenderBufferFlag::STORAGE);
+        common.setBuffer(common.instanceRDPParams, rdp.get(), sizeof(params), RenderBufferStructuredView(sizeof(params)));
+        common.setBuffer(common.bumbleMaterialColor, materialColor.get(), sizeof(colors));
+        RT64::BumbleShadowRenderer::Constants material{};
+        const bool textured = test >= 8 && test < 12;
+        const uint32_t input = textured ? 1u : ((test & 3) < 2 ? 3u : 4u);
+        material.renderParams.ccL = (7u << 12) | (7u << 9);
+        material.renderParams.ccH = (7u << 12) | (input << 9) |
+            (7u << 21) | (7u << 18) | (7u << 3) | input;
+        material.renderParams.omL = G_AC_THRESHOLD;
+        if (test >= 12) material.renderParams.omL = G_AC_DITHER;
+        shadow.reset();
+        auto light = hlslpp::float4x4::identity();
+        if (test == 13) light[3][0] = .25f;
+        shadow.begin(light, test, test);
+        const bool deferred = test >= 4 && test < 10;
+        interop::RDPTile tile{};
+        tile.shifts = tile.shiftt = 1;
+        tile.cms = tile.cmt = G_TX_CLAMP;
+        tile.nativeSampler = NATIVE_SAMPLER_CLAMP_CLAMP;
+        interop::GPUTile gpuTile{};
+        gpuTile.tcScale = gpuTile.ulScale = {1, 1};
+        gpuTile.textureDimensions = {1, 1, 1};
+        auto tiles = upload(&tile, sizeof(tile), RenderBufferFlag::STORAGE);
+        auto gpuTiles = upload(&gpuTile, sizeof(gpuTile), RenderBufferFlag::STORAGE);
+        auto texture = device->createTexture(RenderTextureDesc::Texture2D(1, 1, 1, RenderFormat::R8G8B8A8_UNORM));
+        uint32_t pixel[64]{};
+        pixel[0] = alpha | 0xFFFFFFu;
+        auto textureUpload = upload(pixel, sizeof(pixel), RenderBufferFlag::NONE);
+        if (textured) {
+            interop::RenderFlags flags{};
+            flags.usesTexture0 = true;
+            flags.dynamicTiles = true;
+            material.renderParams.flags = flags;
+            material.tileCount = 1;
+            common.setBuffer(common.RDPTiles, tiles.get(), sizeof(tile), RenderBufferStructuredView(sizeof(tile)));
+            common.setBuffer(common.GPUTiles, gpuTiles.get(), sizeof(gpuTile), RenderBufferStructuredView(sizeof(gpuTile)));
+            textures.setTexture(0, texture.get(), RenderTextureLayout::SHADER_READ);
+        }
+        shadow.addCasterRange(0, 3, material, true, deferred ? 1u : UINT32_MAX);
+        auto* cmd = worker.commandList.get();
+        cmd->begin();
+        auto produceTexture = [&] {
+            cmd->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture.get(), RenderTextureLayout::COPY_DEST));
+            cmd->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture.get()),
+                RenderTextureCopyLocation::PlacedFootprint(textureUpload.get(), RenderFormat::R8G8B8A8_UNORM, 1, 1, 1, 64));
+            cmd->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(texture.get(), RenderTextureLayout::SHADER_READ));
+        };
+        if (textured && !deferred) produceTexture();
+        shadow.record(&worker, positionView, indexView, uvView, common.get(), textures.get());
+        if (deferred) {
+            passed &= shadow.recordedContentKey == UINT64_MAX && shadow.deferredRangeCount == 1;
+            shadow.record(&worker, positionView, indexView, uvView, common.get(), textures.get(), 0);
+            passed &= shadow.deferredRangeCount == 1;
+            if (textured) produceTexture();
+            shadow.record(&worker, positionView, indexView, uvView, common.get(), textures.get(), 1);
+            passed &= shadow.recordedContentKey == test && shadow.deferredRangeCount == 0;
+        }
+        cmd->barriers(RenderBarrierStage::COPY,
+            RenderTextureBarrier(shadow.texture(), RenderTextureLayout::COPY_SOURCE));
+        cmd->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(readback.get(),
+            RenderFormat::D32_FLOAT, 8, 8, 1, 64), RenderTextureCopyLocation::Subresource(shadow.texture()));
+        cmd->end(); worker.execute(); worker.wait();
+        const RenderRange range(0, 8 * 256);
+        const auto* bytes = static_cast<const uint8_t*>(readback->map(0, &range));
+        if (!bytes) return false;
+        for (uint32_t y = 0; y < 8; ++y) for (uint32_t x = 0; x < 8; ++x) {
+            float depth;
+            std::memcpy(&depth, bytes + y * 256 + x * 4, 4);
+            if (test == 12) coverage[y * 8 + x] = depth;
+            else if (test == 13) {
+                if (x > 0) passed &= depth == coverage[y * 8 + x - 1];
+            }
+            else passed &= test & 1 ? (depth > .49f && depth < .6f) : depth == 1.0f;
+        }
+        if (test == 12)
+            passed &= std::count_if(coverage.begin(), coverage.end(),
+                [](float depth) { return depth > .49f && depth < .6f; }) == 32;
+        readback->unmap();
+    }
+    std::fprintf(stderr, "BUMBLE_SHADOW_MATERIAL_CONTRACT result=%s cases=14\n", passed ? "pass" : "fail");
+    return passed;
+}
+
 bool validate_raster_identity(RenderDevice* device, RenderShaderFormat format) {
     using namespace plume;
     RT64::RenderWorker worker(device, "Bumble Raster Identity", RenderCommandListType::DIRECT);
@@ -133,11 +343,106 @@ bool validate_raster_identity(RenderDevice* device, RenderShaderFormat format) {
     }
     readback->unmap();
     std::fprintf(stderr, "BUMBLE_RASTER_IDENTITY result=%s\n", passed ? "pass" : "fail");
+    desc.vertexShader = vs.get();
+    desc.depthEnabled = true;
+    desc.depthWriteEnabled = true;
+    desc.depthFunction = RenderComparisonFunction::LESS_EQUAL;
+    desc.depthTargetFormat = RenderFormat::D32_FLOAT;
+    auto waterPipeline = device->createGraphicsPipeline(desc);
+    desc.depthWriteEnabled = false;
+    auto readOnlyWaterPipeline = device->createGraphicsPipeline(desc);
+    desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+    auto effectPipeline = device->createGraphicsPipeline(desc);
+    auto depth = device->createTexture(RenderTextureDesc::Texture2D(8, 1, 1,
+        RenderFormat::D32_FLOAT, RenderTextureFlag::DEPTH_TARGET));
+    auto waterFramebuffer = device->createFramebuffer(RenderFramebufferDesc(&attachment, 1, depth.get()));
+    cmd->begin();
+    const RenderTextureBarrier waterBarriers[] = {
+        RenderTextureBarrier(target.get(), RenderTextureLayout::COLOR_WRITE),
+        RenderTextureBarrier(depth.get(), RenderTextureLayout::DEPTH_WRITE)
+    };
+    cmd->barriers(RenderBarrierStage::GRAPHICS, waterBarriers, 2);
+    cmd->setFramebuffer(waterFramebuffer.get());
+    cmd->setGraphicsPipelineLayout(layout.get());
+    cmd->clearDepth(true, 1.0f);
+    cmd->clearColor(0, RenderColor{0, 0, 0, 1});
+    auto draw = [&](const RenderPipeline* selected, float z, uint32_t color) {
+        cmd->setPipeline(selected);
+        interop::RasterParams params{};
+        params.renderIndex = color;
+        params.bumbleWaterPlaneHeight = z;
+        cmd->setGraphicsPushConstants(0, &params);
+        cmd->drawInstanced(3, 1, 0, 0);
+    };
+    for (uint32_t x = 0; x < 5; ++x) {
+        cmd->setViewports(RenderViewport(float(x), 0, 1, 1));
+        cmd->setScissors(RenderRect(x, 0, x + 1, 1));
+        if (x == 2) draw(waterPipeline.get(), .1f, 64);
+        if (x == 3) draw(effectPipeline.get(), .2f, 224 | 256);
+        draw(x == 4 ? readOnlyWaterPipeline.get() : waterPipeline.get(), .5f, 32);
+        if (x != 3) draw(effectPipeline.get(), (x == 1 || x == 4) ? .8f : .2f, 224 | 256);
+    }
+    cmd->barriers(RenderBarrierStage::COPY,
+        RenderBufferBarrier(readback.get(), RenderBufferAccess::WRITE),
+        RenderTextureBarrier(target.get(), RenderTextureLayout::COPY_SOURCE));
+    cmd->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(readback.get(),
+        RenderFormat::R8G8B8A8_UNORM, 8, 1, 1, 64), RenderTextureCopyLocation::Subresource(target.get()));
+    cmd->end(); worker.execute(); worker.wait();
+    pixels = static_cast<const uint8_t*>(readback->map(0, &range));
+    bool waterPassed = pixels != nullptr;
+    constexpr uint8_t expectedWater[] = {128, 32, 64, 32, 128};
+    if (pixels) for (uint32_t x = 0; x < 5; ++x)
+        waterPassed &= std::abs(int(pixels[x * 4]) - int(expectedWater[x])) <= 1;
+    readback->unmap();
+    std::fprintf(stderr, "BUMBLE_WATER_EFFECT_CONTRACT result=%s cases=5\n", waterPassed ? "pass" : "fail");
+    passed &= waterPassed;
     return passed;
 }
 }
 
 void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, RenderShaderFormat format) {
+    {
+        using namespace bumble::textures;
+        Image flat{12, 12, std::vector<uint8_t>(12 * 12 * 4, 127)};
+        if (reconstruct_material(flat).rgba != reconstruct(flat).rgba)
+            throw std::runtime_error("Flat texture reconstruction changed");
+        Image edge = flat;
+        constexpr std::array<uint8_t, 12> profile{32,32,32,32,48,96,160,208,224,224,224,224};
+        for (unsigned y = 0; y < 12; ++y) for (unsigned x = 0; x < 12; ++x) {
+            const size_t p = (y * 12 + x) * 4;
+            for (unsigned c = 0; c < 3; ++c) edge.rgba[p + c] = profile[x];
+            edge.rgba[p + 3] = uint8_t(x * 11 + y * 7);
+        }
+        const auto baseline = filter_surface(reconstruct(restore_detail(clean_grain(edge))));
+        const auto result = reconstruct_material(edge);
+        uint32_t checkpoints = 0;
+        const auto checked = reconstruct_material(edge, [&]() { ++checkpoints; });
+        bool cancelled = false;
+        try {
+            reconstruct_material(edge, []() { throw std::runtime_error("cancelled"); });
+        } catch (const std::runtime_error&) { cancelled = true; }
+        bool valid = result.width == 108 && result.height == 108 && result.rgba != baseline.rgba &&
+            result.rgba == checked.rgba && checkpoints > 0 && cancelled;
+        for (unsigned y = 0; y < 108; ++y) for (unsigned x = 0; x < 108; ++x) {
+            const size_t p = (y * 108 + x) * 4;
+            valid &= result.rgba[p + 3] == baseline.rgba[p + 3];
+            if (x < 18 || y < 18 || x + 18 >= 108 || y + 18 >= 108)
+                for (unsigned c = 0; c < 3; ++c) valid &= result.rgba[p + c] == baseline.rgba[p + c];
+        }
+        const auto odd = make_dds({3, 1, {0,0,0,255, 0,0,0,255, 255,255,255,255}});
+        valid &= odd.size() == 164 && odd[160] == 85;
+        bool rejected = false;
+        try { reconstruct_material({4, 4, {1, 2}}); } catch (const std::exception&) { rejected = true; }
+        if (!valid || !rejected) throw std::runtime_error("Texture reconstruction contract failed");
+        std::fprintf(stderr, "BUMBLE_RECONSTRUCTION_CONTRACT result=pass scale=9 alpha=1 seam=1 odd_mips=1\n");
+    }
+    validate_recording_mutex();
+    if (!bumble::electric_effect::validate_actor_lifetime()) {
+        throw std::runtime_error("Effect actor lifetime contract failed");
+    }
+    std::fprintf(stderr, "BUMBLE_EFFECT_LIFETIME_CONTRACT result=pass\n");
+    validate_tmem_contracts();
+    if (!validate_shadow_material(device, format)) throw std::runtime_error("Shadow material GPU contract failed");
     using namespace plume;
     auto require = [](bool ok) { if (!ok) throw std::runtime_error("Texture GPU contract failed"); };
     const bool rasterIdentityPassed = validate_raster_identity(device, format);
@@ -168,6 +473,40 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         return shadowCache.key(geometry, 0, 3);
     };
     const uint64_t meshKey = geometryKey();
+    {
+        auto materialData = geometry;
+        materialData.tcFloats.resize(6, 0);
+        materialData.tcVelFloats.resize(6, 0);
+        materialData.normColBytes.resize(12, 255);
+        materialData.lookAtIndices.resize(3, 0);
+        materialData.rdpParams.resize(1);
+        RT64::GameCall call{};
+        call.callDesc.triangleCount = 1;
+        bool animated = false;
+        auto key = [&] {
+            shadowCache.reset(materialData);
+            animated = false;
+            return shadowCache.materialKey(materialData, call, animated);
+        };
+        const auto baseline = key();
+        require(!animated);
+        materialData.normColBytes[3] = 0;
+        require(key() != baseline);
+        materialData.normColBytes[3] = 255;
+        materialData.tcFloats[0] = 1;
+        require(key() != baseline);
+        materialData.tcFloats[0] = 0;
+        materialData.rdpParams[0].primColor.w = .5f;
+        require(key() != baseline);
+        materialData.rdpParams[0].primColor.w = 0;
+        require(key() == baseline);
+        materialData.tcVelFloats[0] = .1f;
+        key(); require(animated);
+        materialData.tcVelFloats[0] = 0;
+        materialData.lookAtIndices[0] = 1;
+        key(); require(animated);
+        shadowCache.reset(geometry);
+    }
     require(!RT64::bumbleShadowGeometryMoving(geometry, 0, 3));
     geometry.posFloats[0] = 2;
     require(geometryKey() != meshKey);
@@ -264,7 +603,7 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         require(!RT64::bumbleShadowCasterDynamic(geometry, 0, 0));
     }
     std::fprintf(stderr, "BUMBLE_SHADOW_OWNERSHIP_CONTRACT result=pass hierarchy=1 pause=1 unmatched=1 deformation=1 level_reset=1\n");
-    constexpr uint64_t bytes = 404 * 4 * sizeof(float);
+    constexpr uint64_t bytes = 406 * 4 * sizeof(float);
     RT64::RenderWorker worker(device, "Bumble Texture Contract", RenderCommandListType::DIRECT);
     std::unique_ptr<RenderBuffer> upload;
     for (size_t length = 0; length < 4; ++length) {
@@ -275,7 +614,6 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     for (uint32_t i = 0; i < 16; ++i) pixels.insert(pixels.end(), {128, 64, 32, 255});
     auto dds = first_run::make_faithful_dds(std::move(pixels), 4, 4, 3);
     require(dds.size() == 148 + (16 + 4 + 1) * 4 && dds[128] == 28);
-    // Reject invalid metadata before submitting GPU commands.
     for (const auto [offset, value] : std::array<std::pair<size_t, uint32_t>, 4>{{
             {28, 32}, {16, UINT32_MAX}, {140, 2}, {132, 4}}}) {
         auto invalid = dds;
@@ -294,7 +632,7 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     const RenderDescriptorSetDesc setDesc(ranges, 1);
     auto set = device->createDescriptorSet(setDesc);
     const RenderDescriptorRange textureRange(RenderDescriptorRangeType::TEXTURE, 0, 8192);
-    const RenderDescriptorSetDesc textureDesc(&textureRange, 1, true, 1);
+    const RenderDescriptorSetDesc textureDesc(&textureRange, 1, true, 3);
     auto textureSet = device->createDescriptorSet(textureDesc);
     RenderSamplerDesc samplerDesc;
     samplerDesc.addressU = samplerDesc.addressV = RenderTextureAddressMode::CLAMP;
@@ -357,12 +695,22 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     textureSet->setTexture(0, texture->texture.get(), RenderTextureLayout::SHADER_READ);
     mixedSet->setTexture(0, texture->texture.get(), RenderTextureLayout::SHADER_READ);
     std::vector<uint8_t> otherPixels;
-    for (uint32_t i = 0; i < 16; ++i) otherPixels.insert(otherPixels.end(), {16, 192, 240, 255});
+    for (uint32_t i = 0; i < 16; ++i) otherPixels.insert(otherPixels.end(), {16, 192, 240, 128});
     const auto otherDDS = first_run::make_faithful_dds(std::move(otherPixels), 4, 4, 3);
     std::unique_ptr<RenderBuffer> otherUpload;
     std::unique_ptr<RT64::Texture> otherTexture(RT64::TextureCache::loadTextureFromBytes(
         device, worker.commandList.get(), otherDDS, otherUpload));
     require(otherTexture != nullptr);
+    textureSet->setTexture(1, otherTexture->texture.get(), RenderTextureLayout::SHADER_READ);
+    bumble::textures::Image enhancedImage{4, 4, std::vector<uint8_t>(4 * 4 * 4, 255)};
+    const auto enhancedDDS = bumble::textures::make_dds(bumble::textures::reconstruct_material(enhancedImage));
+    std::unique_ptr<RenderBuffer> enhancedUpload;
+    std::unique_ptr<RT64::Texture> enhancedTexture(RT64::TextureCache::loadTextureFromBytes(
+        device, worker.commandList.get(), enhancedDDS, enhancedUpload));
+    require(enhancedTexture != nullptr);
+    textureSet->setTexture(2, enhancedTexture->texture.get(), RenderTextureLayout::SHADER_READ);
+    worker.commandList->barriers(RenderBarrierStage::COMPUTE,
+        RenderTextureBarrier(enhancedTexture->texture.get(), RenderTextureLayout::SHADER_READ));
     mixedSet->setTexture(3, otherTexture->texture.get(), RenderTextureLayout::SHADER_READ);
     worker.commandList->barriers(RenderBarrierStage::COMPUTE,
         RenderTextureBarrier(otherTexture->texture.get(), RenderTextureLayout::SHADER_READ));
@@ -400,7 +748,11 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         for (uint32_t c = 0; c < 4; ++c)
             matches &= std::isfinite(values[i * 4 + c]) && std::abs(values[i * 4 + c] - expectedColor[c]) < .0001;
     matches &= values[257 * 4] == -16 && values[257 * 4 + 1] == -1 && values[257 * 4 + 2] == 0 && values[257 * 4 + 3] == 1;
-    const std::array<float, 4> otherColor{16.f / 255, 192.f / 255, 240.f / 255, 1};
+    const std::array<float, 4> otherColor{16.f / 255, 192.f / 255, 240.f / 255, 128.f / 255};
+    const bool alphaPassed = std::abs(values[404 * 4 + 3] - 128.f / 255) < .0001f &&
+        values[405 * 4 + 3] == 1 && values[404 * 4] == 1;
+    matches &= alphaPassed;
+    std::fprintf(stderr, "BUMBLE_REPLACEMENT_ALPHA_CONTRACT result=%s cases=2\n", alphaPassed ? "pass" : "fail");
     bool mixedPassed = true;
     for (uint32_t c = 0; c < 4; ++c) {
         mixedPassed &= std::abs(values[322 * 4 + c] - expectedColor[c]) < .0001;
@@ -439,7 +791,7 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         shadowPassed ? "pass" : "fail", oldSelfShadowObserved);
     std::fprintf(stderr, "BUMBLE_MIXED_DESCRIPTOR_GPU_CONTRACT result=%s immutable_samplers=2 sampled_before_and_after=1\n", mixedPassed ? "pass" : "fail");
     if (!matches) {
-        for (uint32_t i = 256; i < 404; ++i)
+        for (uint32_t i = 256; i < 406; ++i)
             std::fprintf(stderr, "BUMBLE_TEXTURE_GPU_CONTRACT sample=%u value=%.9g,%.9g,%.9g,%.9g\n", i,
                 values[i * 4], values[i * 4 + 1], values[i * 4 + 2], values[i * 4 + 3]);
     }
@@ -468,7 +820,6 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         compiler.link(L"VSMain", L"vs_6_3", libraries, names, 2, &linked);
         require(linked != nullptr);
         std::fprintf(stderr, "BUMBLE_RASTER_LIBRARY_CONTRACT result=pass generated_wrapper_linked=1\n");
-        // Driver rejection must return failure.
         const uint32_t invalidCode = 0;
         auto badShader = device->createShader(&invalidCode, sizeof(invalidCode), "CSMain", format);
         pipelineDesc.computeShader = badShader.get();

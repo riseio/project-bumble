@@ -8,6 +8,11 @@ Get the latest build *FuzzyBumble* from [Releases](https://github.com/riseio/pro
 You need your own **Buck Bumble (USA), revision 0** ROM. Select it when prompted
 on first launch. No ROM or game assets are included.
 
+On first launch, choose whether to generate enhanced textures (about 120 MB).
+Select **Not now** to skip them and **Don't ask again** to remember your choice.
+Generation shows progress and can be cancelled. Restore the prompt from
+**Options > Graphics / Effects** if you change your mind.
+
 - **Windows:** Run `FuzzyBumble_<version>.exe`. No installer or separate DLLs needed.
 - **Steam Deck:** Make `FuzzyBumble_<version>.AppImage` executable, add it to Steam
   as a non-Steam game, and use the Gamepad controller layout.
@@ -29,7 +34,7 @@ Saves and settings stay in your user-data folder when you replace the executable
 - Modern menus with keyboard, mouse and controller navigation.
 - Updated weapon labels, boss health display and damage feedback.
 - Optional modern lighting, water effects, terrain textures and grass.
-- Switch between modern and original visuals during play.
+- Cycle original, modern, and enhanced textures during play.
 - Local saves and settings, with no account or online connection needed to play.
 - Mid mission checkpoints.
 - Weapon enhancements
@@ -47,10 +52,14 @@ Saves and settings stay in your user-data folder when you replace the executable
 | Mouse 4 | Loop-de-loop |
 | R | Quick flip |
 | Mouse wheel or Q/E | Change weapon |
-| Tab | Switch modern/original visuals |
+| Tab | Cycle visual modes |
 | Enter or Escape | Pause |
 
 Controls can be changed in the settings menu.
+
+Enhanced textures are generated once from your ROM and cached locally.
+Enhanced mode is unavailable if you skip generation; Original and Modern
+remain available.
 
 ## Steam Deck controls
 
@@ -68,7 +77,7 @@ Use Steam's **Gamepad** layout. These are the default in-game bindings:
 | B | Loop-de-loop |
 | Y | Quick flip |
 | Menu (☰) | Pause |
-| View (▢▢) | Switch modern/original visuals |
+| View (▢▢) | Cycle visual modes |
 | A / B in menus | Confirm / back |
 
 Custom bindings override these defaults. Trackpads and rear buttons can be

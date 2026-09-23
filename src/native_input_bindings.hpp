@@ -112,6 +112,13 @@ struct CaptureState {
 };
 
 Settings default_settings(uint32_t version = 7u);
+inline void apply_menu_dpad(float& x, float& y, bool up, bool down,
+                            bool left, bool right, bool menu_active) {
+    if (!menu_active) return;
+    if (left || right) x = float(right) - float(left);
+    if (up || down) y = float(up) - float(down);
+}
+
 void upgrade_keyboard_defaults(Settings& settings, uint32_t version);
 bool validate_default_contracts();
 void configure(const Settings& settings);

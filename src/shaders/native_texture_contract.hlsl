@@ -16,6 +16,21 @@ static const float gradients[16] = {
 [numthreads(64, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
+    if (i < 2) {
+        OtherMode mode = (OtherMode)0;
+        RDPTile tile = (RDPTile)0;
+        tile.shifts = tile.shiftt = 1;
+        tile.cms = tile.cmt = G_TX_CLAMP;
+        tile.lrs = tile.lrt = 12;
+        GPUTile gpu = (GPUTile)0;
+        gpu.ulScale = gpu.tcScale = 9.0f.xx;
+        gpu.texelMask = uint2(0xFFFFFFFF, 0xFFFFFFFF);
+        gpu.textureIndex = 2;
+        gpu.originalAlphaTextureIndex = 1;
+        gpu.textureDimensions = float3(36, 36, 1);
+        gpu.flags = i == 0 ? 0x42 : 0x2;
+        outputValues[404 + i] = sampleTexture(mode, 0, 1.0f.xx, 0.0f.xx, 0.0f.xx, tile, gpu, false);
+    }
     if (i < 32) {
         const float slope = float(i + 1) * 1024.0f;
         const float3 receiver = float3(.49f, .51f, .5f);

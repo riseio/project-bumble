@@ -82,6 +82,17 @@ struct ActiveEffect {
     Clock::time_point born{};
 };
 
+void release_effect_owner(ActiveEffect& effect, uint32_t actor) {
+    if (effect.actor == actor) effect.actor = 0;
+}
+
+void release_arc_owner(ActiveArc& arc, uint32_t actor) {
+    if (arc.sourceActor == actor ||
+        ((arc.flags & bumble::electric_effect::ArcEnemy) && arc.targetKey == actor)) {
+        arc.sourceActor = 0;
+    }
+}
+
 std::array<ActiveArc, kActiveArcCapacity> g_active_arcs{};
 std::array<ActiveEffect, kActiveEffectCapacity> g_active_effects{};
 std::mutex g_arc_mutex;
@@ -373,6 +384,43 @@ bool append_marker(uint8_t* rdram, uint32_t ticket, uint32_t& new_cursor) {
 }
 
 } // namespace
+
+void bumble::electric_effect::release_actor(uint32_t actor) {
+    const std::scoped_lock lock(g_arc_mutex, g_effect_mutex);
+    for (auto& effect : g_active_effects) release_effect_owner(effect, actor);
+    for (auto& arc : g_active_arcs) release_arc_owner(arc, actor);
+}
+
+void bumble::electric_effect::reset_scene() {
+    const std::scoped_lock lock(g_arc_mutex, g_effect_mutex);
+    g_active_effects = {};
+    g_active_arcs = {};
+}
+
+bool bumble::electric_effect::validate_actor_lifetime() {
+    ActiveEffect effect{};
+    effect.active = effect.renderModern = true;
+    effect.actor = 1;
+    release_effect_owner(effect, 2);
+    if (effect.actor != 1) return false;
+    release_effect_owner(effect, 1);
+    if (effect.actor != 0 || !effect.active || !effect.renderModern) return false;
+    ActiveArc arc{};
+    arc.active = true;
+    arc.sourceActor = 1;
+    arc.targetKey = 2;
+    arc.flags = ArcEnemy;
+    release_arc_owner(arc, 3);
+    if (arc.sourceActor != 1) return false;
+    release_arc_owner(arc, 2);
+    if (arc.sourceActor != 0 || !arc.active) return false;
+    arc.sourceActor = 1;
+    arc.flags = ArcGeometry;
+    release_arc_owner(arc, 2);
+    if (arc.sourceActor != 1) return false;
+    release_arc_owner(arc, 1);
+    return arc.sourceActor == 0 && arc.active;
+}
 
 void bumble::electric_effect::record_arc(
     uint32_t source_actor,

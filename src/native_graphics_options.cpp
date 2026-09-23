@@ -1,4 +1,5 @@
 #include "native_graphics_options.hpp"
+#include "native_first_run_assets.hpp"
 
 #if defined(_WIN32)
 #include <windowsx.h>
@@ -181,6 +182,7 @@ enum class RowKind : uint32_t {
     FramePacing,
     Fog,
     HdTerrain,
+    TexturePreparation,
     ModernLighting,
     Grass,
     CollisionOverlay,
@@ -435,6 +437,7 @@ std::atomic_uint32_t g_fog_mode{
 };
 std::atomic_bool g_high_resolution_textures{true};
 std::atomic_bool g_hd_terrain{true};
+std::atomic_bool g_enhanced_textures{false};
 std::atomic_bool g_modern_lighting{true};
 std::atomic_uint32_t g_lighting_environment{0xC0000000u};
 std::atomic_uint32_t g_last_gameplay_level_index{0u};
@@ -2027,6 +2030,7 @@ void save_settings(const bumble::graphics_options::Settings& settings) {
     write_ini_uint(L"HighResolutionTextures", 1u);
     write_ini_uint(L"HdTerrain", settings.hd_terrain ? 1u : 0u);
     write_ini_uint(L"ModernLighting", settings.modern_lighting ? 1u : 0u);
+    write_ini_uint(L"EnhancedTextures", settings.enhanced_textures ? 1u : 0u);
     write_ini_uint(L"GrassMode", static_cast<uint32_t>(settings.grass_mode));
     write_ini_section_uint(
         L"Debug",
@@ -2155,6 +2159,7 @@ void publish_settings(const bumble::graphics_options::Settings& settings) {
         std::memory_order_release
     );
     g_hd_terrain.store(settings.hd_terrain, std::memory_order_release);
+    g_enhanced_textures.store(settings.enhanced_textures && settings.hd_terrain, std::memory_order_release);
     g_modern_lighting.store(
         settings.modern_lighting,
         std::memory_order_release
@@ -2494,6 +2499,7 @@ const char* row_name(RowKind row) {
     case RowKind::FramePacing: return "frame_pacing";
     case RowKind::Fog: return "fog";
     case RowKind::HdTerrain: return "hd_terrain";
+    case RowKind::TexturePreparation: return "texture_preparation";
     case RowKind::ModernLighting: return "modern_lighting";
     case RowKind::Grass: return "grass";
     case RowKind::CollisionOverlay: return "collision_overlay";
@@ -2834,9 +2840,13 @@ std::string row_text(
         std::snprintf(
             buffer,
             sizeof(buffer),
-            "HD TEXTURES <%s>",
-            settings.hd_terrain ? "ON" : "OFF"
+            "TEXTURES <%s>",
+            !settings.hd_terrain ? "ORIGINAL" : settings.enhanced_textures ? "ENHANCED" : "MODERN"
         );
+        break;
+    case RowKind::TexturePreparation:
+        std::snprintf(buffer, sizeof(buffer), "%s", bumble::first_run::texture_prompt_requested()
+            ? "TEXTURE PROMPT ENABLED" : "ENHANCED TEXTURES: ASK NEXT LAUNCH");
         break;
     case RowKind::ModernLighting:
         std::snprintf(
@@ -3008,6 +3018,12 @@ std::string row_text(
 
 const char* row_description(RowKind row) {
     switch (row) {
+    case RowKind::TexturePreparation:
+        return "Show the enhanced texture choice next time you launch the game.";
+    case RowKind::HdTerrain:
+        return bumble::first_run::enhanced_textures_available()
+            ? "Choose Original, Modern, or Enhanced textures."
+            : "Enhanced textures are unavailable because they have not been generated.";
     case RowKind::FramePacing:
         return "Smoother rendering; gameplay stays at 30 Hz. Limited by display refresh.";
     case RowKind::JoystickSettingsMenu:
@@ -3221,6 +3237,7 @@ bool install_native_menu_locked(
         add_row(RowKind::DisplaySettings);
         add_row(RowKind::Fog);
         add_row(RowKind::HdTerrain);
+        if (!bumble::first_run::enhanced_textures_available()) add_row(RowKind::TexturePreparation);
         add_row(RowKind::ModernLighting);
         add_row(RowKind::Back);
         break;
@@ -3446,6 +3463,9 @@ void cycle_row_locked(RowKind row, int direction) {
     auto settings = bumble::graphics_options::current();
     const int step = direction < 0 ? -1 : 1;
     switch (row) {
+    case RowKind::TexturePreparation:
+        bumble::first_run::request_texture_prompt();
+        break;
     case RowKind::InputDevice:
         bumble::input_bindings::cycle_device_mode(step);
         break;
@@ -3529,7 +3549,13 @@ void cycle_row_locked(RowKind row, int direction) {
         break;
     }
     case RowKind::HdTerrain:
-        settings.hd_terrain = !settings.hd_terrain;
+        {
+            const int mode = !settings.hd_terrain ? 0 : settings.enhanced_textures ? 2 : 1;
+            const int count = bumble::first_run::enhanced_textures_available() ? 3 : 2;
+            const int next = (mode + step + count) % count;
+            settings.hd_terrain = next != 0;
+            settings.enhanced_textures = next == 2;
+        }
         break;
     case RowKind::ModernLighting:
         settings.modern_lighting = !settings.modern_lighting;
@@ -5278,6 +5304,7 @@ bool bumble::graphics_options::initialize(
                 static_cast<uint32_t>(FramePacing::Original30Hz)
             ));
     settings.high_resolution_textures = true;
+    settings.enhanced_textures = read_ini_bool(L"EnhancedTextures", false);
     settings.hd_terrain = read_ini_bool(L"HdTerrain", settings.hd_terrain);
     settings.modern_lighting = persisted_version < 4u
         ? true
@@ -5454,6 +5481,7 @@ bumble::graphics_options::Settings bumble::graphics_options::current() {
     settings.high_resolution_textures =
         g_high_resolution_textures.load(std::memory_order_acquire);
     settings.hd_terrain = g_hd_terrain.load(std::memory_order_acquire);
+    settings.enhanced_textures = enhanced_textures_enabled();
     settings.modern_lighting =
         g_modern_lighting.load(std::memory_order_acquire);
     settings.grass_mode = static_cast<GrassMode>(
@@ -5530,17 +5558,24 @@ bool bumble::graphics_options::modern_lighting_enabled() {
 void bumble::graphics_options::toggle_modern_visuals() {
     std::lock_guard lock(g_state_mutex);
     auto settings = current();
-    const bool enabled = !(settings.hd_terrain && settings.modern_lighting);
-    settings.hd_terrain = enabled;
-    settings.modern_lighting = enabled;
+    const int mode = settings.enhanced_textures ? 2 :
+        (settings.hd_terrain && settings.modern_lighting ? 1 : 0);
+    const int next = (mode + 1) % (bumble::first_run::enhanced_textures_available() ? 3 : 2);
+    settings.hd_terrain = next != 0;
+    settings.modern_lighting = next != 0;
+    settings.enhanced_textures = next == 2;
     apply_settings(settings);
     std::fprintf(
         stderr,
         "BUMBLE_GRAPHICS_OPTIONS stage=modern_visuals_toggled"
-        " source=shared_input_toggle enabled=%d\n",
-        enabled ? 1 : 0
+        " source=shared_input_toggle mode=%d\n",
+        next
     );
     std::fflush(stderr);
+}
+
+bool bumble::graphics_options::enhanced_textures_enabled() {
+    return bumble::first_run::enhanced_textures_available() && g_enhanced_textures.load(std::memory_order_acquire);
 }
 
 bool bumble::graphics_options::all_weapons_enabled() {

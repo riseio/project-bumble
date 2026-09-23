@@ -122,6 +122,17 @@ void bumble_apply_mission_time_limit(uint8_t* rdram, recomp_context* ctx);
 void bumble_gameplay_modifier_tick(uint8_t* rdram);
 void bumble_record_rendered_actor(void);
 void bumble_begin_actor_matrix_group(uint8_t* rdram, recomp_context* ctx);
+void bumble_register_actor_history(uint8_t* rdram, recomp_context* ctx);
+void bumble_unregister_actor_history(uint8_t* rdram, recomp_context* ctx);
+#ifdef __cplusplus
+void bumble_begin_model_part(uint8_t* rdram, recomp_context* ctx) noexcept(false);
+void bumble_end_model_part(uint8_t* rdram) noexcept(false);
+#else
+void bumble_begin_model_part(uint8_t* rdram, recomp_context* ctx);
+void bumble_end_model_part(uint8_t* rdram);
+#endif
+void bumble_set_model_role(uint32_t role);
+void bumble_wait_graphics_input(uint8_t* rdram, uint32_t waiter_index);
 void bumble_end_actor_matrix_group(uint8_t* rdram);
 void bumble_scale_enemy_awareness_planar_distance(
     uint8_t* rdram,
@@ -293,7 +304,15 @@ void bumble_configure_single_player_color_clear(
     uint8_t* rdram,
     recomp_context* ctx
 );
+#ifdef __cplusplus
+void bumble_configure_single_player_world_aperture(uint8_t* rdram, recomp_context* ctx) noexcept(false);
+void bumble_end_world_camera_scope(uint8_t* rdram, recomp_context* ctx) noexcept(false);
+#else
 void bumble_configure_single_player_world_aperture(uint8_t* rdram, recomp_context* ctx);
+void bumble_end_world_camera_scope(uint8_t* rdram, recomp_context* ctx);
+#endif
+void bumble_invalidate_world_camera_history(uint8_t* rdram, recomp_context* ctx);
+void bumble_publish_script_camera_history(uint8_t* rdram, recomp_context* ctx);
 void bumble_restore_split_screen_world_aperture(uint8_t* rdram, recomp_context* ctx);
 
 void bumble_object_cull_pvs_reject_probe(uint8_t* rdram, recomp_context* ctx);

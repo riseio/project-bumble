@@ -145,6 +145,7 @@ std::atomic_bool g_window_focused{false};
 std::atomic_bool g_mouse_captured{false};
 std::atomic_bool g_gameplay_active{false};
 std::atomic_bool g_pause_menu_active{false};
+std::atomic_bool g_menu_navigation_active{true};
 std::atomic_bool g_resync_aim{true};
 std::atomic_bool g_gameplay_arm_deferred_logged{false};
 std::atomic_int64_t g_pending_look_x{0};
@@ -2481,6 +2482,7 @@ void bumble::modern_controls::configure(
     g_mouse_captured.store(false, std::memory_order_release);
     g_gameplay_active.store(false, std::memory_order_release);
     g_pause_menu_active.store(false, std::memory_order_release);
+    g_menu_navigation_active.store(true, std::memory_order_release);
     g_replay_automation.store(false, std::memory_order_release);
     g_window_focused.store(false, std::memory_order_release);
     g_player_aim_update_count.store(0, std::memory_order_release);
@@ -2563,6 +2565,10 @@ bool bumble::modern_controls::replay_automation_enabled() {
 bool bumble::modern_controls::gameplay_input_active() {
     return enabled() && g_gameplay_active.load(std::memory_order_acquire) &&
         !g_pause_menu_active.load(std::memory_order_acquire);
+}
+
+bool bumble::modern_controls::menu_navigation_active() {
+    return g_menu_navigation_active.load(std::memory_order_acquire);
 }
 
 bool bumble::modern_controls::pause_menu_active() {
@@ -3402,6 +3408,8 @@ extern "C" void bumble_complete_modern_player_teleport(
     if (rdram == nullptr || context == nullptr) {
         return;
     }
+    if (player_one_actor_is_owned(rdram, guest_u32(context->r18)))
+        bumble::widescreen::invalidate_world_camera_history();
     bumble::native_checkpoint::capture_portal_mission_checkpoint(
         rdram,
         context
@@ -5089,6 +5097,10 @@ extern "C" void bumble_mark_modern_gameplay_active(
         return;
     }
     bumble::menu_actions::observe_pause_menu(rdram);
+    g_menu_navigation_active.store(
+        rdram == nullptr || read_u32(rdram, kPauseMenuVisible) != 0u ||
+        read_u32(rdram, kFrontendObject + kFrontendPhaseOffset) != kFrontendGameplayPhase,
+        std::memory_order_release);
     if (!bumble::modern_controls::enabled()) {
         return;
     }
@@ -5206,15 +5218,16 @@ extern "C" void bumble_mark_modern_gameplay_inactive(
     uint8_t* rdram,
     recomp_context* context
 ) {
-    if (!bumble::modern_controls::enabled()) {
-        return;
-    }
-
     const uint32_t live_object = guest_u32(context->r19);
     const uint32_t phase = valid_guest_pointer(live_object, 0x88u)
         ? read_u32(rdram, live_object + kFrontendPhaseOffset)
         : 0xFFFFFFFFu;
     if (live_object != kFrontendObject || phase == kFrontendGameplayPhase) {
+        return;
+    }
+
+    g_menu_navigation_active.store(true, std::memory_order_release);
+    if (!bumble::modern_controls::enabled()) {
         return;
     }
 

@@ -57,6 +57,7 @@ struct Settings {
     bool high_resolution_textures = true;
     bool hd_terrain = true;
     bool modern_lighting = true;
+    bool enhanced_textures = false;
     GrassMode grass_mode = GrassMode::Off;
     bool collision_overlay = false;
     bool all_weapons = false;
@@ -94,6 +95,7 @@ FramePacing frame_pacing();
 bool high_resolution_textures_enabled();
 bool hd_terrain_enabled();
 bool modern_lighting_enabled();
+bool enhanced_textures_enabled();
 void toggle_modern_visuals();
 void publish_lighting_environment(uint8_t* rdram);
 GrassMode grass_mode();

@@ -1,0 +1,130 @@
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -3908,14 +3908,6 @@
+                         p.rasterShaderCache->submit(
+                             reflectionWaterDescription
+                         );
+-                        if (reflectionWaterDescription.otherMode.zUpd()) {
+-                            ShaderDescription deferredWaterDescription =
+-                                reflectionWaterDescription;
+-                            deferredWaterDescription.otherMode.L &= ~Z_UPD;
+-                            p.rasterShaderCache->submit(
+-                                deferredWaterDescription
+-                            );
+-                        }
+                     }
+                 }
+             }
+@@ -4143,6 +4135,25 @@
+ 
+         RasterScene rasterScene;
+         RasterScene shorelineAmbientScene;
++        thread_local RasterScene waterEffectScene;
++        waterEffectScene.instanceIndices.clear();
++        thread_local std::vector<bool> waterProjectionPasses;
++        waterProjectionPasses.assign(fbPair.projectionCount, false);
++        for (uint32_t first = 0; first < fbPair.projectionCount;) {
++            if (fbPair.projections[first].type != Projection::Type::Perspective) {
++                ++first;
++                continue;
++            }
++            uint32_t end = first + 1;
++            while (end < fbPair.projectionCount &&
++                fbPair.projections[end].type == Projection::Type::Perspective) ++end;
++            const bool containsWater = std::any_of(waterPlaneReceivers.begin(), waterPlaneReceivers.end(),
++                [&](const BumbleWaterPlaneReceiver& receiver) {
++                    return receiver.projectionIndex >= first && receiver.projectionIndex < end;
++                });
++            std::fill(waterProjectionPasses.begin() + first, waterProjectionPasses.begin() + end, containsWater);
++            first = end;
++        }
+         struct DeferredWaterGroup {
+             float planeHeight = 0.0f;
+             RasterScene scene;
+@@ -5132,6 +5143,12 @@
+             checkRasterScene(shorelineAmbientScene);
+         };
+ 
++        auto emitWaterAndEffects = [&]() {
++            emitDeferredWater();
++            checkRasterScene(rasterScene);
++            checkRasterScene(waterEffectScene);
++        };
++
+         bool pendingElectricValid = false;
+         uint32_t electricProjectionIndex = fbPair.projectionCount;
+         uint32_t electricMarkerCallIndex = 0u;
+@@ -5564,10 +5581,9 @@
+                  proj.type == Projection::Type::Rectangle)) {
+                 emitPendingGrass();
+             }
+-            if (deferredWaterPending() &&
+-                (proj.type == Projection::Type::Orthographic ||
+-                 proj.type == Projection::Type::Rectangle)) {
+-                emitDeferredWater();
++            if ((deferredWaterPending() || !waterEffectScene.instanceIndices.empty()) &&
++                proj.type != Projection::Type::Perspective) {
++                emitWaterAndEffects();
+             }
+             if (pendingElectricValid &&
+                 pr > electricProjectionIndex &&
+@@ -5662,7 +5678,7 @@
+                     // HUD models also use perspective projections.
+                     emitPendingSky();
+                     emitPendingGrass();
+-                    emitDeferredWater();
++                    emitWaterAndEffects();
+                     emitPendingElectric();
+                     emitPendingCollisionDebug();
+                 }
+@@ -6222,10 +6238,6 @@
+                                 modernMaterialClass,
+                                 modernLightingEligible
+                             );
+-                        // Reflection ordering defers the opaque water until the planar capture is shader-readable.
+-                        if (deferThisWaterDraw) {
+-                            rasterShaderDesc.otherMode.L &= ~Z_UPD;
+-                        }
+                         triangles.shaderDesc = rasterShaderDesc;
+                         const bool rasterCopyMode =
+                             rasterShaderDesc.otherMode.cycleType() ==
+@@ -6367,10 +6379,6 @@
+                             vertexTestZFaceIndicesStart += call.callDesc.triangleCount * 3;
+                         }
+ 
+-                        if (deferThisWaterDraw) {
+-                            // The replacement stays in Buck's original clip and depth space.
+-                            triangles.bumbleDepthReadOnly = true;
+-                        }
+                     }
+                 }
+ 
+@@ -6474,6 +6482,18 @@
+                         enqueueWaterReceiver(instanceIndex, waterPlaneHeight, drawBoundsValid,
+                             drawMinimumWorld, drawMaximumWorld, triangles);
+                     }
++                    else if (!mainFrustumCulled && waterSceneReflectionActive && waterProjectionPasses[pr] &&
++                        bumbleWorldPerspectiveGeometry(proj, call) &&
++                        instanceDrawCall.type == InstanceDrawCall::Type::IndexedTriangles &&
++                        !triangles.vertexTestZ && cycleType != G_CYC_COPY && cycleType != G_CYC_FILL &&
++                        !lightingOtherMode.zUpd() && lightingOtherMode.zMode() != ZMODE_DEC &&
++                        !bumbleWaterMaterialClass(modernMaterialClass) &&
++                        modernMaterialClass != BumbleMaterialLegacyWaterOverlay &&
++                        (lightingOtherMode.forceBlend() || lightingOtherMode.zMode() == ZMODE_XLU ||
++                         lightingOtherMode.alphaCompare() != G_AC_NONE || lightingOtherMode.cvgXAlpha() ||
++                         interop::Blender::usesAlphaBlend(lightingOtherMode))) {
++                        waterEffectScene.instanceIndices.push_back(instanceIndex);
++                    }
+                     else if (!mainFrustumCulled) {
+                         rasterScene.instanceIndices.push_back(instanceIndex);
+                     }
+@@ -6626,7 +6646,7 @@
+ 
+         emitPendingSky();
+         emitPendingGrass();
+-        emitDeferredWater();
++        emitWaterAndEffects();
+         emitPendingElectric();
+         emitPendingCollisionDebug();
+ #   if RT_ENABLED

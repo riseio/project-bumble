@@ -293,6 +293,17 @@ void bumble::input_bindings::configure(const Settings& requested) {
 }
 
 bool bumble::input_bindings::validate_default_contracts() {
+    bool menu_pass = true;
+    for (unsigned directions = 0; directions < 16; ++directions) {
+        for (bool menu : {false, true}) {
+            float x = 0.25f, y = -0.75f;
+            const bool up = directions & 1u, down = directions & 2u;
+            const bool left = directions & 4u, right = directions & 8u;
+            apply_menu_dpad(x, y, up, down, left, right, menu);
+            menu_pass &= x == (menu && (left || right) ? float(right) - float(left) : 0.25f);
+            menu_pass &= y == (menu && (up || down) ? float(up) - float(down) : -0.75f);
+        }
+    }
     const auto defaults = default_settings();
     auto legacy = default_settings(6u);
     const auto controller = legacy.controller;
@@ -304,7 +315,7 @@ bool bumble::input_bindings::validate_default_contracts() {
     custom.keyboard_mouse[action_index(InputAction::MoveForward)] = {'T', 0u, 0u};
     const auto custom_keyboard = custom.keyboard_mouse;
     upgrade_keyboard_defaults(custom, 6u);
-    const bool pass = defaults.controller == controller &&
+    const bool pass = menu_pass && defaults.controller == controller &&
         legacy.controller == custom_controller &&
         legacy.keyboard_mouse == defaults.keyboard_mouse &&
         custom.keyboard_mouse == custom_keyboard &&
@@ -626,7 +637,7 @@ const char* bumble::input_bindings::action_label(InputAction action) {
     case InputAction::Pause: return "PAUSE";
     case InputAction::MenuConfirm: return "MENU CONFIRM";
     case InputAction::MenuBack: return "MENU BACK";
-    case InputAction::ToggleModernVisuals: return "MODERN / ORIGINAL VISUALS";
+    case InputAction::ToggleModernVisuals: return "CYCLE VISUAL MODES";
     case InputAction::Count: break;
     }
     return "UNKNOWN";

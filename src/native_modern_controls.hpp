@@ -32,6 +32,7 @@ bool replay_automation_enabled();
 
 bool gameplay_input_active();
 bool pause_menu_active();
+bool menu_navigation_active();
 
 void set_window_focused(bool focused);
 bool window_focused();

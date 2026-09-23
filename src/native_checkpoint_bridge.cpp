@@ -1,4 +1,5 @@
 #include "native_checkpoint_bridge.hpp"
+#include "native_widescreen.hpp"
 
 #include <algorithm>
 #include <array>
@@ -5219,6 +5220,7 @@ bool restore_mission_checkpoint(
         camera_context.r5 = player_index;
         func_8009C9E4(rdram, &camera_context);
     }
+    bumble::widescreen::invalidate_scene_history();
 
     if (trigger == MissionCheckpointRestoreTrigger::PauseMenu) {
         const gpr current_pad = guest_address(kCurrentPadBase);

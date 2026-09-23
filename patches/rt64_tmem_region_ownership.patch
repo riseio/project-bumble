@@ -1,0 +1,363 @@
+diff --git a/src/common/rt64_tmem_hasher.h b/src/common/rt64_tmem_hasher.h
+index d646f41..2918ff1 100644
+--- a/src/common/rt64_tmem_hasher.h
++++ b/src/common/rt64_tmem_hasher.h
+@@ -197,12 +197,12 @@ namespace RT64 {
+             return XXH3_64bits_digest(&xxh3);
+         }
+ 
+-        static bool requiresRawTMEM(const LoadTile &loadTile, uint16_t width, uint16_t height) {
++        static bool requiresRawTMEM(const LoadTile &loadTile, uint16_t width, uint16_t height, uint32_t tlutFormat) {
+             // With no row advance, odd-row word swapping can read outside a decoded rectangle's hash span.
+             if (loadTile.line == 0) return true;
+             const uint32_t TMEMBytes = 4096;
+             const bool RGBA32 = (loadTile.siz == G_IM_SIZ_32b) && (loadTile.fmt == G_IM_FMT_RGBA);
+-            const uint32_t tmemSize = RGBA32 ? (TMEMBytes >> 1) : TMEMBytes;
++            const uint32_t tmemSize = RGBA32 || (tlutFormat > 0) ? (TMEMBytes >> 1) : TMEMBytes;
+             const uint32_t lastRowBytes = width << std::min(loadTile.siz, uint8_t(G_IM_SIZ_16b)) >> 1;
+             const uint32_t bytesToHash = (loadTile.line << 3) * (height - 1) + lastRowBytes;
+             return (bytesToHash > tmemSize);
+diff --git a/src/hle/rt64_framebuffer_manager.cpp b/src/hle/rt64_framebuffer_manager.cpp
+index c345166..246c46a 100644
+--- a/src/hle/rt64_framebuffer_manager.cpp
++++ b/src/hle/rt64_framebuffer_manager.cpp
+@@ -625,114 +625,142 @@ namespace RT64 {
+         }
+     }
+ 
+-    FramebufferManager::CheckCopyResult FramebufferManager::checkTileCopyTMEM(uint32_t tmem, uint32_t lineWidth, uint8_t siz, uint8_t fmt, uint16_t uls) {
+-        const bool RGBA32 = (siz == G_IM_SIZ_32b) && (fmt == G_IM_FMT_RGBA);
+-        if (RGBA32) {
+-            tmem = tmem & RDP_TMEM_MASK128;
++    void FramebufferManager::synchronizeRegionsTMEM() {
++        auto it = activeRegionsTMEM.begin();
++        while (it != activeRegionsTMEM.end()) {
++            it->syncRequired = false;
++            it++;
+         }
++    }
+ 
++    FramebufferManager::CheckCopyResult FramebufferManager::checkRegionsTMEM(uint32_t tmemStart, uint32_t tmemEnd, uint32_t lineWidth, uint8_t siz, uint8_t fmt, uint16_t uls, bool usesTLUT, uint8_t palette) {
++        const bool RGBA32 = (siz == G_IM_SIZ_32b) && (fmt == G_IM_FMT_RGBA);
+         CheckCopyResult result;
+         auto it = activeRegionsTMEM.begin();
+         while (it != activeRegionsTMEM.end()) {
+-            if ((tmem >= it->tmemStart) && (tmem < it->tmemEnd)) {
+-                if (it->syncRequired) {
+-                    result.syncRequired = true;
+-                }
++            if (!result.syncRequired && it->syncRequired && (tmemStart < it->tmemEnd) && (it->tmemStart < tmemEnd)) {
++                result.syncRequired = true;
++            }
+ 
+-                if (it->fbTile.valid()) {
+-                    bool validCopy = false;
+-                    bool reinterpret = false;
+-                    uint32_t tileWidth = (it->fbTile.right - it->fbTile.left);
+-                    uint32_t tileLineWidth = it->fbTile.lineWidth;
+-
+-                    // Tile reinterpreation is not required when using RGBA16 and Depth tile copies. Allow
+-                    // the framebuffer manager to perform the conversion instead that preserves the precision.
+-                    if ((it->fbTile.siz == G_IM_SIZ_16b) && (siz == G_IM_SIZ_16b) &&
+-                        (
+-                            ((it->fbTile.fmt == G_IM_FMT_RGBA) && (fmt == G_IM_FMT_DEPTH)) ||
+-                            ((it->fbTile.fmt == G_IM_FMT_DEPTH) && (fmt == G_IM_FMT_RGBA))
+-                            )
++            if (!result.valid() && it->fbTile.valid() && (tmemStart >= it->tmemStart) && (tmemEnd <= it->tmemEnd)) {
++                bool validCopy = false;
++                bool reinterpret = false;
++                uint32_t tileWidth = (it->fbTile.right - it->fbTile.left);
++                uint32_t tileLineWidth = it->fbTile.lineWidth;
++
++                // Tile reinterpreation is not required when using RGBA16 and Depth tile copies. Allow
++                // the framebuffer manager to perform the conversion instead that preserves the precision.
++                if ((it->fbTile.siz == G_IM_SIZ_16b) && (siz == G_IM_SIZ_16b) &&
++                    (
++                        ((it->fbTile.fmt == G_IM_FMT_RGBA) && (fmt == G_IM_FMT_DEPTH)) ||
++                        ((it->fbTile.fmt == G_IM_FMT_DEPTH) && (fmt == G_IM_FMT_RGBA))
+                         )
+-                    {
+-                        // Do nothing.
+-                    }
+-                    // Tile reinterpretation is always enabled if the source is an 8-bit FB, since special 
+-                    // sampling and decoding are required.
+-                    else if (it->fbTile.siz == G_IM_SIZ_8b) {
+-                        reinterpret = true;
+-                    }
+-                    // Tile reinterpretation is also required if the formats are different. A strict format
+-                    // difference here is not necessarily true in the case of certain formats that are actually
+-                    // compatible and behave the same way. This logic can be improved in that regard to detect
+-                    // less false positives.
+-                    else if (it->fbTile.fmt != fmt) {
+-                        reinterpret = true;
+-                    }
++                    )
++                {
++                    // Do nothing.
++                }
++                // Tile reinterpretation is always enabled if the source is an 8-bit FB, since special
++                // sampling and decoding are required.
++                else if (it->fbTile.siz == G_IM_SIZ_8b) {
++                    reinterpret = true;
++                }
++                // Tile reinterpretation is also required if the formats are different. A strict format
++                // difference here is not necessarily true in the case of certain formats that are actually
++                // compatible and behave the same way. This logic can be improved in that regard to detect
++                // less false positives.
++                else if (it->fbTile.fmt != fmt) {
++                    reinterpret = true;
++                }
+ 
+-                    // Detect whether the actual width and pixel size matches, and if it doesn't, if the sizes
+-                    // are compatible.
+-                    if ((tileLineWidth == lineWidth) && (it->fbTile.siz == siz)) {
++                // Detect whether the actual width and pixel size matches, and if it doesn't, if the sizes
++                // are compatible.
++                if ((tileLineWidth == lineWidth) && (it->fbTile.siz == siz)) {
++                    validCopy = true;
++                }
++                else if ((tileLineWidth < lineWidth) && (it->fbTile.siz > siz)) {
++                    uint8_t sizDifference = (it->fbTile.siz - siz);
++                    uint32_t sizMultiplier = (1 << sizDifference);
++                    if ((tileLineWidth * sizMultiplier) == lineWidth) {
++                        tileWidth *= sizMultiplier;
++                        tileLineWidth *= sizMultiplier;
+                         validCopy = true;
++                        reinterpret = true;
+                     }
+-                    else if ((tileLineWidth < lineWidth) && (it->fbTile.siz > siz)) {
+-                        uint8_t sizDifference = (it->fbTile.siz - siz);
+-                        uint32_t sizMultiplier = (1 << sizDifference);
+-                        if ((tileLineWidth * sizMultiplier) == lineWidth) {
+-                            tileWidth *= sizMultiplier;
+-                            tileLineWidth *= sizMultiplier;
+-                            validCopy = true;
+-                            reinterpret = true;
+-                        }
+-                    }
+-                    else if ((tileLineWidth > lineWidth) && (it->fbTile.siz < siz)) {
+-                        uint8_t sizDifference = (siz - it->fbTile.siz);
+-                        uint32_t sizMultiplier = (1 << sizDifference);
+-                        if ((lineWidth * sizMultiplier) == tileLineWidth) {
+-                            tileWidth /= sizMultiplier;
+-                            tileLineWidth /= sizMultiplier;
+-                            validCopy = true;
+-                            reinterpret = true;
+-                        }
++                }
++                else if ((tileLineWidth > lineWidth) && (it->fbTile.siz < siz)) {
++                    uint8_t sizDifference = (siz - it->fbTile.siz);
++                    uint32_t sizMultiplier = (1 << sizDifference);
++                    if ((lineWidth * sizMultiplier) == tileLineWidth) {
++                        tileWidth /= sizMultiplier;
++                        tileLineWidth /= sizMultiplier;
++                        validCopy = true;
++                        reinterpret = true;
+                     }
++                }
+ 
+-                    // Special condition for RGBA32. Verify if an equivalent region exists in the upper half of TMEM.
+-                    if (validCopy && RGBA32) {
+-                        const uint32_t TMEMUpper = RDP_TMEM_WORDS >> 1;
+-                        auto searchIt = activeRegionsTMEM.begin();
+-                        while (searchIt != activeRegionsTMEM.end()) {
+-                            if ((searchIt != it) &&
+-                                (searchIt->tileCopyId == it->tileCopyId) &&
+-                                (searchIt->tmemStart == (it->tmemStart + TMEMUpper)) &&
+-                                (searchIt->tmemEnd == (it->tmemEnd + TMEMUpper)))
+-                            {
+-                                break;
+-                            }
+-
+-                            searchIt++;
++                // Special condition for RGBA32. Verify if an equivalent region exists in the upper half of TMEM.
++                if (validCopy && RGBA32) {
++                    const uint32_t TMEMUpper = RDP_TMEM_WORDS >> 1;
++                    auto searchIt = activeRegionsTMEM.begin();
++                    while (searchIt != activeRegionsTMEM.end()) {
++                        if ((searchIt != it) &&
++                            (searchIt->tileCopyId == it->tileCopyId) &&
++                            (searchIt->tmemStart == (it->tmemStart + TMEMUpper)) &&
++                            (searchIt->tmemEnd == (it->tmemEnd + TMEMUpper)))
++                        {
++                            break;
+                         }
+ 
+-                        if (searchIt == activeRegionsTMEM.end()) {
+-                            validCopy = false;
+-                        }
++                        searchIt++;
+                     }
+ 
+-                    if (validCopy) {
+-                        result.tileId = it->tileCopyId;
+-                        result.tileWidth = tileWidth;
+-                        result.lineWidth = tileLineWidth;
+-                        result.tileHeight = it->fbTile.bottom - it->fbTile.top;
+-                        result.fmt = it->fbTile.fmt;
+-                        result.siz = it->fbTile.siz;
+-                        result.reinterpret = reinterpret;
++                    if (searchIt == activeRegionsTMEM.end()) {
++                        validCopy = false;
+                     }
++                }
+ 
+-                    return result;
++                if (validCopy) {
++                    result.tileId = it->tileCopyId;
++                    result.tileWidth = tileWidth;
++                    result.lineWidth = tileLineWidth;
++                    result.tileHeight = it->fbTile.bottom - it->fbTile.top;
++                    result.fmt = it->fbTile.fmt;
++                    result.siz = it->fbTile.siz;
++                    result.reinterpret = reinterpret;
+                 }
++
+             }
+ 
+             it++;
+         }
+ 
++        // Upper TMEM holds RGBA32's second bank or the TLUT.
++        // Check the CI4 palette span; CI8 can reference the whole TLUT.
++        if ((usesTLUT || RGBA32) && !result.syncRequired) {
++            if (RGBA32) {
++                tmemStart += 256;
++                tmemEnd += 256;
++            }
++            else if (siz == G_IM_SIZ_4b) {
++                tmemStart = 256 + palette * 16;
++                tmemEnd = tmemStart + 16;
++            }
++            else {
++                tmemStart = 256;
++                tmemEnd = 512;
++            }
++
++            auto it = activeRegionsTMEM.begin();
++            while (it != activeRegionsTMEM.end()) {
++                if (it->syncRequired && (tmemStart < it->tmemEnd) && (it->tmemStart < tmemEnd)) {
++                    result.syncRequired = true;
++                    break;
++                }
++
++                it++;
++            }
++        }
++
+         return result;
+     }
+ 
+diff --git a/src/hle/rt64_framebuffer_manager.h b/src/hle/rt64_framebuffer_manager.h
+index 04ffab7..c23ae2d 100644
+--- a/src/hle/rt64_framebuffer_manager.h
++++ b/src/hle/rt64_framebuffer_manager.h
+@@ -196,9 +196,10 @@ namespace RT64 {
+         FramebufferOperation makeTileReintepretation(uint64_t srcTileId, uint8_t srcSiz, uint8_t srcFmt, uint64_t dstTileId, uint8_t dstSiz, uint8_t dstFmt, bool ulScaleS, bool ulScaleT,
+             interop::uint2 texelShift, interop::uint2 texelMask, uint64_t tlutHash, uint32_t tlutFormat);
+ 
+-        CheckCopyResult checkTileCopyTMEM(uint32_t tmem, uint32_t lineWidth, uint8_t siz, uint8_t fmt, uint16_t uls);
++        CheckCopyResult checkRegionsTMEM(uint32_t tmemStart, uint32_t tmemEnd, uint32_t lineWidth, uint8_t siz, uint8_t fmt, uint16_t uls, bool usesTLUT, uint8_t palette);
+         void insertRegionsTMEM(uint32_t addressStart, uint32_t tmemStart, uint32_t tmemWords, uint32_t tmemMask, bool RGBA32, bool syncRequired, std::vector<RegionIterator> *resultRegions);
+         void discardRegionsTMEM(uint32_t tmemStart, uint32_t tmemWords, uint32_t tmemMask);
++        void synchronizeRegionsTMEM();
+         void storeRAM(FramebufferStorage &fbStorage, const uint8_t *RDRAM, uint32_t fbPairIndex);
+         void checkRAM(const uint8_t *RDRAM, std::vector<Framebuffer *> &differentFbs, bool updateHashes);
+         void uploadRAM(RenderWorker *renderWorker, Framebuffer **differentFbs, size_t differentFbsCount, FramebufferChangePool &fbChangePool, const uint8_t *RDRAM, bool canDiscard, std::vector<FramebufferOperation> &fbOps,
+@@ -226,4 +227,4 @@ namespace RT64 {
+         void destroyAllTileCopies();
+         uint64_t nextWriteTimestamp();
+     };
+-};
+\ No newline at end of file
++};
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index ac389ba..ca409c0 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -287,7 +287,7 @@ namespace RT64 {
+ 
+                     // Check if we need to use raw TMEM decoding because the tile can sample more bytes than TMEM actually allows.
+                     assert((dstCallTile.sampleWidth > 0) && (dstCallTile.sampleHeight > 0) && "Sample size calculation can only result in non-zero values.");
+-                    dstCallTile.rawTMEM = TMEMHasher::requiresRawTMEM(tile, dstCallTile.sampleWidth, dstCallTile.sampleHeight);
++                    dstCallTile.rawTMEM = TMEMHasher::requiresRawTMEM(tile, dstCallTile.sampleWidth, dstCallTile.sampleHeight, dstCallTile.tlut);
+                     
+                     auto &dstRDPTile = drawData.rdpTiles[drawCall.tileIndex + t];
+                     dstRDPTile.fmt = tile.fmt;
+@@ -332,12 +332,30 @@ namespace RT64 {
+                     if ((tile.maskt > 0) && (tile.cmt & G_TX_CLAMP)) {
+                         nativeSamplerSupported = nativeSamplerSupported && clampAlignedToMask(tile.maskt, tile.ult, tile.lrt);
+                     }
++
++                    // Determine the range of TMEM that this tile can sample from.
++                    const bool usesTLUT = rdp->otherMode.textLUT() > 0;
++                    uint32_t checkTMEMStart = tile.tmem;
++                    if (RGBA32 || usesTLUT) {
++                        checkTMEMStart = tile.tmem & RDP_TMEM_MASK128;
++                    }
++
++                    // Compute the area of TMEM to check. If it loads so many rows to the point it wraps around TMEM, just check
++                    // the entire relevant region of TMEM.
++                    const uint32_t tmemSize = (RGBA32 || usesTLUT) ? (RDP_TMEM_WORDS >> 1) : RDP_TMEM_WORDS;
++                    const uint32_t lastRowBytes = ((dstCallTile.sampleWidth << std::min(tile.siz, uint8_t(G_IM_SIZ_16b))) + 1) >> 1;
++                    const uint32_t bytesToHash = (tile.line << 3) * (dstCallTile.sampleHeight - 1) + lastRowBytes;
++                    uint32_t checkTMEMEnd = checkTMEMStart + ((bytesToHash + 7) >> 3);
++                    if (checkTMEMEnd > tmemSize) {
++                        checkTMEMStart = 0;
++                        checkTMEMEnd = tmemSize;
++                    }
+                     
+                     // Check if there's any valid tile copies that could be used. The line width requirement has to match for 
+                     // the tile copy to make sense, but whether enough pixels are available in the copy according to the sampling
+                     // done by the calls is determined in a later step.
+                     FramebufferManager::CheckCopyResult checkResult;
+-                    checkResult = framebufferManager.checkTileCopyTMEM(tile.tmem, dstCallTile.lineWidth, tile.siz, tile.fmt, tile.uls);
++                    checkResult = framebufferManager.checkRegionsTMEM(checkTMEMStart, checkTMEMEnd, dstCallTile.lineWidth, tile.siz, tile.fmt, tile.uls, usesTLUT, tile.palette);
+                     dstCallTile.syncRequired = checkResult.syncRequired;
+ 
+                     if (gpuCopiesEnabled && checkResult.valid()) {
+@@ -359,6 +377,11 @@ namespace RT64 {
+                     else {
+                         dstCallTile.tileCopyUsed = false;
+                         dstCallTile.tmemHashOrID = rdp->tileReplacementHashes[tileIndex];
++
++                        if (checkResult.syncRequired) {
++                            FramebufferPair &fbPair = workload.fbPairs[workload.currentFramebufferPairIndex()];
++                            fbPair.syncRequired = true;
++                        }
+                     }
+ 
+                     if (nativeSamplerSupported) {
+@@ -627,6 +650,10 @@ namespace RT64 {
+                 depthFb->lastWriteTimestamp = writeTimestamp;
+                 framebufferManager.changeRAM(depthFb, depthFb->addressStart, depthFb->addressStart + depthFbBytes);
+             }
++
++            if (fbPair.syncRequired) {
++                framebufferManager.synchronizeRegionsTMEM();
++            }
+         }
+ 
+         // Store the process Id this framebuffer pair was submitted under.
+@@ -975,7 +1002,7 @@ namespace RT64 {
+                 if (bigTextureCheck) {
+                     callTile.sampleWidth = maxTexcoord.x;
+                     callTile.sampleHeight = maxTexcoord.y;
+-                    callTile.rawTMEM = TMEMHasher::requiresRawTMEM(callTile.loadTile, maxTexcoord.x, maxTexcoord.y);
++                    callTile.rawTMEM = TMEMHasher::requiresRawTMEM(callTile.loadTile, maxTexcoord.x, maxTexcoord.y, callTile.tlut);
+                 }
+             }
+ 
+diff --git a/src/tools/texture_hasher/texture_hasher.cpp b/src/tools/texture_hasher/texture_hasher.cpp
+index d8e4c45..f758818 100644
+--- a/src/tools/texture_hasher/texture_hasher.cpp
++++ b/src/tools/texture_hasher/texture_hasher.cpp
+@@ -371,7 +371,7 @@ void addRiceHash(const std::filesystem::path &directory, const std::string &hash
+ 
+     // Redo the hash if necessary by loading from TMEM. If it requires raw TMEM, the hash is already correct.
+     std::string currentHashName;
+-    if (redoHash && !RT64::TMEMHasher::requiresRawTMEM(drawTile, drawWidth, drawHeight)) {
++    if (redoHash && !RT64::TMEMHasher::requiresRawTMEM(drawTile, drawWidth, drawHeight, toHashTLUT(drawTLUT))) {
+         std::vector<uint8_t> tmemBytes;
+         if (!loadBytesFromFile(directory / (hashNameWithSuffix + TMEMExtension), tmemBytes)) {
+             return;

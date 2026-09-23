@@ -1,0 +1,140 @@
+diff --git a/src/common/rt64_bumble_ui.h b/src/common/rt64_bumble_ui.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/rt64_bumble_ui.h
+@@ -0,0 +1,6 @@
++#pragma once
++
++namespace RT64::BumbleUI {
++constexpr unsigned LeftStackX = 32;
++constexpr unsigned RasterPadding = 4;
++}
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index 6414537..6ee2c87 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "rt64_framebuffer_renderer.h"
+ #include "common/rt64_performance_profiler.h"
++#include "common/rt64_bumble_ui.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -105,9 +106,9 @@ namespace RT64 {
+             : 0.0f;
+     }
+ 
+-    float bumblePlacementOffsetX(uint16_t originFlags) {
++    float bumblePlacementOffsetX(uint16_t originFlags, float aspectRatioScale) {
+         if ((originFlags & G_EX_ORIGIN_BUMBLE_STATUS_TOP_LEFT) != 0) {
+-            return -64.0f;
++            return (float(BumbleUI::LeftStackX) - 212.0f) * 0.5f * aspectRatioScale;
+         }
+         if ((originFlags & G_EX_ORIGIN_BUMBLE_RADAR_BOTTOM_LEFT) != 0) {
+             return -32.0f;
+@@ -184,7 +185,7 @@ namespace RT64 {
+             int32_t left = static_cast<int32_t>(std::floor((leftAnchor + (rect.left(true) - leftAnchor) * aspectRatioScale * uiScale) * resScale.x));
+             int32_t right = static_cast<int32_t>(std::ceil((rightAnchor + (rect.right(true) - rightAnchor) * aspectRatioScale * uiScale) * resScale.x));
+             const int32_t placementOffsetX = lround(
+-                bumblePlacementOffsetX(originFlags) * resScale.x
++                bumblePlacementOffsetX(originFlags, aspectRatioScale) * resScale.x
+             );
+             left += placementOffsetX;
+             right += placementOffsetX;
+@@ -207,6 +208,12 @@ namespace RT64 {
+             int32_t bottom = lround(bottomSource * resScale.y);
+             left = correctMisalignment(left, leftOrigin);
+             right = correctMisalignment(right, rightOrigin);
++            if ((originFlags & G_EX_ORIGIN_BUMBLE_STATUS_TOP_LEFT) != 0) {
++                const int32_t anchor = lround(BumbleUI::LeftStackX * 0.5f * aspectRatioScale * resScale.x);
++                const int32_t shift = anchor + BumbleUI::RasterPadding - correctMisalignment(anchor, leftOrigin);
++                left += shift;
++                right += shift;
++            }
+             return RenderRect(left, top, right, bottom);
+         }
+         else {
+@@ -244,7 +251,7 @@ namespace RT64 {
+         float left = std::round((leftAnchor + (rect.left(true) - leftAnchor) * aspectRatioScale * uiScale) * resScale.x);
+         float right = std::round((rightAnchor + (rect.right(true) - rightAnchor) * aspectRatioScale * uiScale) * resScale.x);
+         const float placementOffsetX =
+-            bumblePlacementOffsetX(originFlags) * resScale.x;
++            bumblePlacementOffsetX(originFlags, aspectRatioScale) * resScale.x;
+         left += placementOffsetX;
+         right += placementOffsetX;
+         float topSource = rect.top(true);
+@@ -266,6 +273,12 @@ namespace RT64 {
+         float bottom = std::round(bottomSource * resScale.y);
+         left = correctMisalignment(left, leftOrigin);
+         right = correctMisalignment(right, rightOrigin);
++        if ((originFlags & G_EX_ORIGIN_BUMBLE_STATUS_TOP_LEFT) != 0) {
++            const float anchor = std::round(BumbleUI::LeftStackX * 0.5f * aspectRatioScale * resScale.x);
++            const float shift = anchor + BumbleUI::RasterPadding - correctMisalignment(anchor, leftOrigin);
++            left += shift;
++            right += shift;
++        }
+         return RenderViewport(left, top, right - left, bottom - top);
+     }
+ 
+diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+index 99beb65..f46a2af 100644
+--- a/src/shaders/TextureSampler.hlsli
++++ b/src/shaders/TextureSampler.hlsli
+@@ -358,8 +358,7 @@ float4 sampleTextureRGBA(OtherMode otherMode, RenderFlags renderFlags, float2 in
+     return textureColor;
+ }
+ 
+-float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
+-    float4 result = sampleTextureRGBA(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, gpuTile, nextPixelBug);
++float sampleTextureAlpha(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
+     if (gpuTileFlagPreserveOriginalAlpha(gpuTile.flags)) {
+         GPUTile alphaTile = gpuTile;
+         alphaTile.textureIndex = gpuTile.originalAlphaTextureIndex;
+@@ -367,7 +366,14 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputU
+         alphaTile.tcScale = float2(1.0f, 1.0f);
+         alphaTile.ulScale = float2(1.0f, 1.0f);
+         alphaTile.flags = gpuTileFlagOriginalAlphaRawTMEM(gpuTile.flags) ? 0x8 : 0;
+-        result.a = sampleTextureRGBA(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, alphaTile, nextPixelBug).a;
++        return sampleTextureRGBA(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, alphaTile, nextPixelBug).a;
+     }
++    return sampleTextureRGBA(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, gpuTile, nextPixelBug).a;
++}
++
++float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
++    float4 result = sampleTextureRGBA(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, gpuTile, nextPixelBug);
++    if (gpuTileFlagPreserveOriginalAlpha(gpuTile.flags))
++        result.a = sampleTextureAlpha(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, gpuTile, nextPixelBug);
+     return result;
+ }
+diff --git a/src/shaders/BumbleShadowMaterialPS.hlsl b/src/shaders/BumbleShadowMaterialPS.hlsl
+index 593d6e3..dcfc7ae 100644
+--- a/src/shaders/BumbleShadowMaterialPS.hlsl
++++ b/src/shaders/BumbleShadowMaterialPS.hlsl
+@@ -26,7 +26,7 @@ void PSMain(float4 position : SV_POSITION, float2 uv : TEXCOORD0,
+                 tile.cmt = useFirst ? renderCMT0(rp.flags) : renderCMT1(rp.flags);
+                 tile.nativeSampler = useFirst ? renderFlagNativeSampler0(rp.flags) : renderFlagNativeSampler1(rp.flags);
+             }
+-            texels[slot] = sampleTexture(mode, rp.flags, uv, dx, dy,
++            texels[slot].a = sampleTextureAlpha(mode, rp.flags, uv, dx, dy,
+                 tile, GPUTiles[index], slot == 1 && oneCycle);
+         }
+     }
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+index 4dbd0cd..bbad028 100644
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -1876,6 +1876,13 @@ namespace RT64 {
+ 
+                         if (db.config.hashVersion <= TMEMHasher::CurrentHashVersion) {
+                             db.resolvePaths(fileSystems[i].get(), uint32_t(i), fileSystemResolvedPaths[i], false, nullptr, &fileSystemStreamSets[i]);
++                            if (!replacementDirectories[i].enabled) {
++                                fileSystemStreamSets[i].clear();
++                                for (auto &entry : fileSystemResolvedPaths[i]) {
++                                    if (entry.second.resolvedOperation == ReplacementOperation::Preload)
++                                        entry.second.resolvedOperation = ReplacementOperation::Stream;
++                                }
++                            }
+                             fileSystemHashVersions[i] = db.config.hashVersion;
+                             knownHashVersions.insert(db.config.hashVersion);
+ 

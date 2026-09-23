@@ -1,0 +1,763 @@
+diff --git a/src/render/rt64_bumble_shadow_renderer.h b/src/render/rt64_bumble_shadow_renderer.h
+index cf95891..7b9199e 100644
+--- a/src/render/rt64_bumble_shadow_renderer.h
++++ b/src/render/rt64_bumble_shadow_renderer.h
+@@ -10,6 +10,8 @@
+ 
+ #include "common/rt64_plume.h"
+ #include "shared/rt64_hlsl.h"
++#include "rt64_descriptor_sets.h"
++#include "shared/rt64_render_params.h"
+ 
+ namespace RT64 {
+     struct RenderWorker;
+@@ -27,18 +29,30 @@ namespace RT64 {
+ 
+         struct Constants {
+             interop::float4x4 lightViewProjection;
++            interop::RenderParams renderParams{};
++            uint32_t instanceIndex = 0;
++            uint32_t tileIndex = 0;
++            uint32_t tileCount = 0;
++            float resolution = 0;
++            uint32_t padding[3]{};
+         };
+ 
+         struct Range {
+             uint32_t indexStart = 0;
+             uint32_t indexCount = 0;
++            Constants material{};
++            bool masked = false;
++            uint32_t readyFramebuffer = UINT32_MAX;
+         };
++        static_assert(sizeof(Constants) == 112);
++        static_assert(offsetof(Constants, instanceIndex) == 84);
+ 
+         std::vector<Range> ranges;
+         uint32_t casterDrawCount = 0;
+         Constants constants{};
+         bool framePrepared = false;
+         bool reusePrepared = false;
++        uint32_t deferredRangeCount = 0;
+ 
+         std::unique_ptr<RenderTexture> depthTexture;
+         std::unique_ptr<RenderTextureView> depthTextureView;
+@@ -46,6 +60,9 @@ namespace RT64 {
+         std::unique_ptr<RenderPipelineLayout> pipelineLayout;
+         std::unique_ptr<RenderShader> vertexShader;
+         std::unique_ptr<RenderPipeline> pipeline;
++        std::unique_ptr<RenderPipeline> materialPipeline;
++        std::unique_ptr<RenderShader> materialVertexShader;
++        std::unique_ptr<RenderShader> materialPixelShader;
+         RenderShaderFormat shaderFormat = RenderShaderFormat::UNKNOWN;
+         uint64_t recordedFrames = 0;
+         uint64_t reusedFrames = 0;
+@@ -65,17 +82,22 @@ namespace RT64 {
+             uint32_t resolution
+         );
+         void reset();
+-        bool ensureResources(RenderWorker *worker, RenderShaderFormat format);
++        bool ensureResources(RenderWorker *worker, RenderShaderFormat format,
++            const SamplerLibrary &samplers);
+         bool begin(
+             const interop::float4x4 &lightViewProjection,
+             uint64_t cacheFrame,
+             uint64_t contentKey
+         );
+-        void addCasterRange(uint32_t indexStart, uint32_t indexCount);
++        void addCasterRange(uint32_t indexStart, uint32_t indexCount,
++            const Constants &material, bool masked, uint32_t readyFramebuffer = UINT32_MAX);
+         void record(
+             RenderWorker *worker,
+             const RenderVertexBufferView &worldPositionView,
+-            const RenderIndexBufferView &indexView
++            const RenderIndexBufferView &indexView,
++            const RenderVertexBufferView &uvView,
++            RenderDescriptorSet *commonSet, RenderDescriptorSet *textureSet,
++            uint32_t readyFramebuffer = UINT32_MAX
+         );
+ 
+         bool active() const;
+diff --git a/src/render/rt64_bumble_shadow_renderer.cpp b/src/render/rt64_bumble_shadow_renderer.cpp
+index 78c28fa..2213434 100644
+--- a/src/render/rt64_bumble_shadow_renderer.cpp
++++ b/src/render/rt64_bumble_shadow_renderer.cpp
+@@ -5,13 +5,18 @@
+ #include "rt64_bumble_shadow_renderer.h"
+ 
+ #include <cassert>
++#include <algorithm>
+ #include <cinttypes>
+ #include <cstring>
+ #include <cstdio>
+ 
+ #include "shaders/BumbleShadowVS.hlsl.spirv.h"
++#include "shaders/BumbleShadowMaterialVS.hlsl.spirv.h"
++#include "shaders/BumbleShadowMaterialPS.hlsl.spirv.h"
+ #ifdef _WIN32
+ #   include "shaders/BumbleShadowVS.hlsl.dxil.h"
++#   include "shaders/BumbleShadowMaterialVS.hlsl.dxil.h"
++#   include "shaders/BumbleShadowMaterialPS.hlsl.dxil.h"
+ #elif defined(__APPLE__)
+ #   include "shaders/BumbleShadowVS.hlsl.metal.h"
+ #endif
+@@ -63,13 +68,15 @@ namespace RT64 {
+         casterDrawCount = 0;
+         framePrepared = false;
+         reusePrepared = false;
++        deferredRangeCount = 0;
+         pendingSubmissionFrame = UINT64_MAX;
+         pendingContentKey = UINT64_MAX;
+     }
+ 
+     bool BumbleShadowRenderer::ensureResources(
+         RenderWorker *worker,
+-        RenderShaderFormat format
++        RenderShaderFormat format,
++        const SamplerLibrary &samplers
+     ) {
+         assert(worker != nullptr);
+         if (depthTexture == nullptr) {
+@@ -102,11 +109,12 @@ namespace RT64 {
+             }
+         }
+ 
+-        if (pipeline != nullptr && shaderFormat == format) {
++        if (pipeline != nullptr && materialPipeline != nullptr && shaderFormat == format) {
+             return true;
+         }
+ 
+         pipeline.reset();
++        materialPipeline.reset();
+         pipelineLayout.reset();
+         vertexShader.reset();
+         size_t blobSize = 0;
+@@ -130,8 +138,13 @@ namespace RT64 {
+             0,
+             0,
+             sizeof(Constants),
+-            RenderShaderStageFlag::VERTEX
++            RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::PIXEL
+         );
++        FramebufferRendererDescriptorCommonSet commonLayout(samplers, false);
++        FramebufferRendererDescriptorTextureSet textureLayout;
++        layoutBuilder.addDescriptorSet(commonLayout);
++        layoutBuilder.addDescriptorSet(textureLayout);
++        layoutBuilder.addDescriptorSet(textureLayout);
+         layoutBuilder.end();
+         pipelineLayout = layoutBuilder.create(worker->device);
+ 
+@@ -168,6 +181,35 @@ namespace RT64 {
+         desc.inputElements = &InputElement;
+         desc.inputElementsCount = 1;
+         pipeline = worker->device->createGraphicsPipeline(desc);
++        if (format == RenderShaderFormat::SPIRV) {
++            materialVertexShader = worker->device->createShader(BumbleShadowMaterialVSBlobSPIRV,
++                sizeof(BumbleShadowMaterialVSBlobSPIRV), "VSMain", format);
++            materialPixelShader = worker->device->createShader(BumbleShadowMaterialPSBlobSPIRV,
++                sizeof(BumbleShadowMaterialPSBlobSPIRV), "PSMain", format);
++        }
++#ifdef _WIN32
++        else if (format == RenderShaderFormat::DXIL) {
++            materialVertexShader = worker->device->createShader(BumbleShadowMaterialVSBlobDXIL,
++                sizeof(BumbleShadowMaterialVSBlobDXIL), "VSMain", format);
++            materialPixelShader = worker->device->createShader(BumbleShadowMaterialPSBlobDXIL,
++                sizeof(BumbleShadowMaterialPSBlobDXIL), "PSMain", format);
++        }
++#endif
++        if (!materialVertexShader || !materialPixelShader) return false;
++        const RenderInputSlot materialSlots[] = {
++            InputSlot, RenderInputSlot(1, sizeof(float) * 2)
++        };
++        const RenderInputElement materialElements[] = {
++            InputElement,
++            RenderInputElement("TEXCOORD", 0, 1, RenderFormat::R32G32_FLOAT, 1, 0)
++        };
++        desc.vertexShader = materialVertexShader.get();
++        desc.pixelShader = materialPixelShader.get();
++        desc.inputSlots = materialSlots;
++        desc.inputSlotsCount = 2;
++        desc.inputElements = materialElements;
++        desc.inputElementsCount = 2;
++        materialPipeline = worker->device->createGraphicsPipeline(desc);
+         shaderFormat = format;
+         if (pipeline != nullptr && bumbleRendererProofLogEnabled()) {
+             std::fprintf(
+@@ -184,7 +226,7 @@ namespace RT64 {
+             );
+             std::fflush(stderr);
+         }
+-        return pipeline != nullptr;
++        return pipeline != nullptr && materialPipeline != nullptr;
+     }
+ 
+     bool BumbleShadowRenderer::begin(
+@@ -223,7 +265,8 @@ namespace RT64 {
+ 
+     void BumbleShadowRenderer::addCasterRange(
+         uint32_t indexStart,
+-        uint32_t indexCount
++        uint32_t indexCount,
++        const Constants &material, bool masked, uint32_t readyFramebuffer
+     ) {
+         if (!framePrepared || reusePrepared || indexCount == 0) {
+             return;
+@@ -231,22 +274,32 @@ namespace RT64 {
+         ++casterDrawCount;
+         if (!ranges.empty()) {
+             Range &last = ranges.back();
+-            if (last.indexStart + last.indexCount == indexStart) {
++            if (!masked && !last.masked && last.readyFramebuffer == readyFramebuffer &&
++                last.indexStart + last.indexCount == indexStart) {
+                 last.indexCount += indexCount;
+                 return;
+             }
+         }
+-        ranges.push_back({ indexStart, indexCount });
++        ranges.push_back({ indexStart, indexCount, material, masked, readyFramebuffer });
++        deferredRangeCount += readyFramebuffer != UINT32_MAX;
+     }
+ 
+     void BumbleShadowRenderer::record(
+         RenderWorker *worker,
+         const RenderVertexBufferView &worldPositionView,
+-        const RenderIndexBufferView &indexView
++        const RenderIndexBufferView &indexView,
++        const RenderVertexBufferView &uvView,
++        RenderDescriptorSet *commonSet, RenderDescriptorSet *textureSet,
++        uint32_t readyFramebuffer
+     ) {
+         if (worker == nullptr || pipeline == nullptr || !active()) {
+             return;
+         }
++        const bool initial = readyFramebuffer == UINT32_MAX;
++        if (!initial && (reusePrepared || deferredRangeCount == 0 ||
++            std::none_of(ranges.begin(), ranges.end(), [&](const Range &range) {
++                return range.readyFramebuffer == readyFramebuffer;
++            }))) return;
+ 
+         if (reusePrepared) {
+             ++reusedFrames;
+@@ -284,7 +337,7 @@ namespace RT64 {
+             )
+         );
+         worker->commandList->setFramebuffer(framebuffer.get());
+-        worker->commandList->clearDepth();
++        if (initial) worker->commandList->clearDepth();
+         worker->commandList->setViewports(RenderViewport(
+             0.0f,
+             0.0f,
+@@ -307,8 +360,28 @@ namespace RT64 {
+             &inputSlot
+         );
+         worker->commandList->setIndexBuffer(&indexView);
++        worker->commandList->setGraphicsDescriptorSet(commonSet, 0);
++        worker->commandList->setGraphicsDescriptorSet(textureSet, 1);
++        worker->commandList->setGraphicsDescriptorSet(textureSet, 2);
+         worker->commandList->setGraphicsPushConstants(0, &constants);
++        bool previousMasked = false;
+         for (const Range &range : ranges) {
++            if (range.readyFramebuffer != readyFramebuffer) continue;
++            if (!initial) --deferredRangeCount;
++            if (range.masked != previousMasked) {
++                worker->commandList->setPipeline(range.masked ? materialPipeline.get() : pipeline.get());
++                previousMasked = range.masked;
++            }
++            if (range.masked) {
++                const RenderVertexBufferView views[] = { worldPositionView, uvView };
++                const RenderInputSlot slots[] = { inputSlot,
++                    RenderInputSlot(1, sizeof(float) * 2) };
++                worker->commandList->setVertexBuffers(0, views, 2, slots);
++                Constants drawConstants = range.material;
++                drawConstants.lightViewProjection = constants.lightViewProjection;
++                drawConstants.resolution = static_cast<float>(resolution);
++                worker->commandList->setGraphicsPushConstants(0, &drawConstants);
++            }
+             worker->commandList->drawIndexedInstanced(
+                 range.indexCount,
+                 1,
+@@ -325,6 +398,10 @@ namespace RT64 {
+             )
+         );
+ 
++        if (deferredRangeCount != 0) {
++            recordedContentKey = UINT64_MAX;
++            return;
++        }
+         ++recordedFrames;
+         recordedSubmissionFrame = pendingSubmissionFrame;
+         recordedContentKey = pendingContentKey;
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index c6b4aef..69d51b8 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -535,6 +535,33 @@ namespace RT64 {
+         return desc;
+     }
+ 
++    static bool bumbleShadowMaterialRequired(const GameCall &call) {
++        const auto &mode = call.callDesc.otherMode;
++        return mode.alphaCompare() != G_AC_NONE || mode.cvgXAlpha() ||
++            interop::Blender::usesAlphaBlend(mode);
++    }
++
++    static BumbleShadowRenderer::Constants bumbleShadowMaterial(const GameCall &call) {
++        BumbleShadowRenderer::Constants material{};
++        material.renderParams = { call.shaderDesc.colorCombiner.L,
++            call.shaderDesc.colorCombiner.H, call.shaderDesc.otherMode.L,
++            call.shaderDesc.otherMode.H, call.shaderDesc.flags };
++        material.instanceIndex = call.callDesc.callIndex;
++        material.tileIndex = call.callDesc.tileIndex;
++        material.tileCount = call.callDesc.tileCount;
++        return material;
++    }
++
++    static uint32_t bumbleShadowReadyFramebuffer(const DrawData &data,
++        const GameCall &call, uint32_t framebufferIndex) {
++        if (bumbleShadowMaterialRequired(call)) {
++            for (uint32_t i = 0; i < call.callDesc.tileCount; ++i)
++                if (data.callTiles.at(call.callDesc.tileIndex + i).tileCopyUsed)
++                    return framebufferIndex;
++        }
++        return UINT32_MAX;
++    }
++
+     static bool bumbleDynamicShadowCaster(
+         const Workload &workload,
+         const GameCall &call
+@@ -983,7 +1010,8 @@ namespace RT64 {
+         uint32_t submittedCallCount,
+         uint32_t levelIndex,
+         std::unordered_map<const GameCall *, uint32_t> &materialClassCache,
+-        BumbleShadowGeometryCache &geometryCache
++        BumbleShadowGeometryCache &geometryCache,
++        bool &animatedMaterial
+     ) {
+         uint64_t hash = bumbleShadowHashMix(
+             1469598103934665603ull,
+@@ -1030,6 +1058,10 @@ namespace RT64 {
+                     hash = bumbleShadowHashMix(hash, geometryCache.key(
+                         workload.drawData, call.meshDesc.faceIndicesStart,
+                         uint64_t(call.callDesc.triangleCount) * 3));
++                    if (bumbleShadowMaterialRequired(call)) {
++                        hash = bumbleShadowHashMix(hash, geometryCache.materialKey(
++                            workload.drawData, call, animatedMaterial));
++                    }
+                 }
+             }
+         }
+@@ -1042,11 +1074,14 @@ namespace RT64 {
+         uint32_t submittedCallCount,
+         uint32_t levelIndex,
+         uint64_t submissionFrame,
++        uint64_t presentationFrame,
+         std::unordered_map<const GameCall *, uint32_t> &materialClassCache
+     ) {
+         struct CachedKey {
+             uint32_t submittedCallCount = 0u;
+             uint64_t value = 0u;
++            bool animatedMaterial = false;
++            std::vector<uint32_t> materialTiles;
+         };
+         thread_local const Workload *cachedWorkload = nullptr;
+         thread_local uint64_t cachedSubmissionFrame = UINT64_MAX;
+@@ -1074,18 +1109,32 @@ namespace RT64 {
+             }
+         );
+         if (existing != cachedKeys.end()) {
+-            return existing->value;
++            if (!existing->animatedMaterial) {
++                for (uint32_t tile : existing->materialTiles) {
++                    if (tile < workload.drawData.lerpRdpTiles.size() &&
++                        std::memcmp(&workload.drawData.rdpTiles[tile],
++                            &workload.drawData.lerpRdpTiles[tile], sizeof(interop::RDPTile)) != 0) {
++                        existing->animatedMaterial = true;
++                        break;
++                    }
++                }
++            }
++            return existing->animatedMaterial
++                ? bumbleShadowHashMix(existing->value, presentationFrame) : existing->value;
+         }
+ 
++        bool animatedMaterial = false;
++        geometryCache.materialTiles.clear();
+         const uint64_t value = bumbleStaticShadowContentKey(
+             workload,
+             submittedCallCount,
+             levelIndex,
+             materialClassCache,
+-            geometryCache
++            geometryCache,
++            animatedMaterial
+         );
+-        cachedKeys.push_back({ submittedCallCount, value });
+-        return value;
++        cachedKeys.push_back({ submittedCallCount, value, animatedMaterial, geometryCache.materialTiles });
++        return animatedMaterial ? bumbleShadowHashMix(value, presentationFrame) : value;
+     }
+ 
+     static bool bumbleWorldVertex(
+@@ -2135,6 +2184,8 @@ namespace RT64 {
+         }
+         descCommonSet->setBuffer(descCommonSet->GPUTiles, gpuTilesBuffer, RenderBufferStructuredView(sizeof(interop::GPUTile)));
+         descCommonSet->setBuffer(descCommonSet->DynamicRenderParams, drawBuffers->renderParamsBuffer.get(), RenderBufferStructuredView(sizeof(interop::RenderParams)));
++        descCommonSet->setBuffer(descCommonSet->bumbleMaterialColor,
++            drawBuffers->normalColorBuffer.get(), drawBuffers->normalColorBuffer.allocatedSize);
+ 
+         // Make sure the versions vector matches the texture cache size.
+         activeTextureVersions.resize(textureIndices.count, 0);
+@@ -3357,18 +3408,27 @@ namespace RT64 {
+             vertexProcessor->recordCommandList(worker, shaderLibrary, outputBuffers);
+         }
+ 
++        shaderUploader->commandListAfterBarriers(worker);
++        if (!dynamicTextureBarrierVector.empty()) {
++            worker->commandList->barriers(RenderBarrierStage::GRAPHICS_AND_COMPUTE, dynamicTextureBarrierVector);
++        }
++
+         if (bumbleShadowRenderer->active()) {
+             bumbleShadowRenderer->record(
+                 worker,
+                 indexedVertexViews[3],
+-                indexBufferView
++                indexBufferView,
++                indexedVertexViews[1],
++                descCommonSet->get(), descTextureSet->get()
+             );
+         }
+         if (bumbleDynamicShadowRenderer->active()) {
+             bumbleDynamicShadowRenderer->record(
+                 worker,
+                 indexedVertexViews[3],
+-                indexBufferView
++                indexBufferView,
++                indexedVertexViews[1],
++                descCommonSet->get(), descTextureSet->get()
+             );
+         }
+ 
+@@ -3390,15 +3450,15 @@ namespace RT64 {
+         }
+ #   endif
+ 
+-        shaderUploader->commandListAfterBarriers(worker);
+         pendingUploaders = bufferUploaders;
+-
+-        if (!dynamicTextureBarrierVector.empty()) {
+-            worker->commandList->barriers(RenderBarrierStage::GRAPHICS_AND_COMPUTE, dynamicTextureBarrierVector);
+-        }
+     }
+ 
+     void FramebufferRenderer::recordFramebuffer(RenderWorker *worker, uint32_t framebufferIndex, PerformanceDrawQueryContext *drawQueryContext, RenderTextureLayout *finalDepthLayout) {
++        for (BumbleShadowRenderer *shadow : { bumbleShadowRenderer.get(), bumbleDynamicShadowRenderer.get() }) {
++            if (shadow->deferredRangeCount != 0)
++                shadow->record(worker, indexedVertexViews[3], indexBufferView,
++                    indexedVertexViews[1], descCommonSet->get(), descTextureSet->get(), framebufferIndex);
++        }
+         // Submit all transition barriers first.
+         thread_local std::vector<RenderTextureBarrier> startBarriers;
+         startBarriers.clear();
+@@ -3668,13 +3728,15 @@ namespace RT64 {
+             modernLightingActive && shadowProjectionFound &&
+             bumbleShadowRenderer->ensureResources(
+                 p.worker,
+-                p.rasterShaderCache->shaderFormat
++                p.rasterShaderCache->shaderFormat,
++                shaderLibrary->samplerLibrary
+             );
+         const bool dynamicShadowResourcesReady =
+             staticShadowResourcesReady && dynamicShadowCasterPresent &&
+             bumbleDynamicShadowRenderer->ensureResources(
+                 p.worker,
+-                p.rasterShaderCache->shaderFormat
++                p.rasterShaderCache->shaderFormat,
++                shaderLibrary->samplerLibrary
+             );
+         if (staticShadowResourcesReady) {
+             const uint64_t staticContentKey =
+@@ -3683,12 +3745,13 @@ namespace RT64 {
+                     p.maxGameCallTotal,
+                     environment.levelIndex,
+                     p.submissionFrame,
++                    p.presentationFrame,
+                     bumbleMaterialClassCache
+                 );
+             bumbleShadowRenderer->begin(
+                 shadowViewProjection,
+                 p.submissionFrame,
+-                staticContentKey
++                bumbleShadowHashMix(staticContentKey, textureCacheGlobalVersion)
+             );
+         }
+         if (dynamicShadowResourcesReady) {
+@@ -5733,7 +5796,9 @@ namespace RT64 {
+                                     : bumbleShadowRenderer.get();
+                             casterRenderer->addCasterRange(
+                                 call.meshDesc.faceIndicesStart,
+-                                call.callDesc.triangleCount * 3u
++                                call.callDesc.triangleCount * 3u,
++                                bumbleShadowMaterial(call), bumbleShadowMaterialRequired(call),
++                                bumbleShadowReadyFramebuffer(drawData, call, framebufferCount - 1)
+                             );
+                         }
+                     }
+@@ -5999,7 +6064,9 @@ namespace RT64 {
+                             : bumbleShadowRenderer.get();
+                     casterRenderer->addCasterRange(
+                         call.meshDesc.faceIndicesStart,
+-                        call.callDesc.triangleCount * 3u
++                        call.callDesc.triangleCount * 3u,
++                        bumbleShadowMaterial(call), bumbleShadowMaterialRequired(call),
++                        bumbleShadowReadyFramebuffer(drawData, call, framebufferCount - 1)
+                     );
+                 }
+ 
+diff --git a/src/shaders/BumbleShadowVS.hlsl b/src/shaders/BumbleShadowVS.hlsl
+index f6538aa..9e2e066 100644
+--- a/src/shaders/BumbleShadowVS.hlsl
++++ b/src/shaders/BumbleShadowVS.hlsl
+@@ -2,12 +2,7 @@
+ // Project-owned depth-only directional shadow caster pass.
+ //
+ 
+-struct BumbleShadowConstants {
+-    float4x4 lightViewProjection;
+-};
+-
+-[[vk::push_constant]] ConstantBuffer<BumbleShadowConstants> gShadow
+-    : register(b0);
++#include "BumbleShadowMaterial.hlsli"
+ 
+ float4 VSMain(float4 worldPosition : POSITION0) : SV_POSITION {
+     return mul(gShadow.lightViewProjection, worldPosition);
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b10382a..6e9448e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -526,6 +526,8 @@ build_pixel_shader(  rt64 "src/shaders/BumbleCollisionDebugPS.hlsl")
+ build_vertex_shader( rt64 "src/shaders/BumbleSkyVS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/BumbleSkyPS.hlsl")
+ build_vertex_shader( rt64 "src/shaders/BumbleShadowVS.hlsl")
++build_vertex_shader( rt64 "src/shaders/BumbleShadowMaterialVS.hlsl")
++build_pixel_shader( rt64 "src/shaders/BumbleShadowMaterialPS.hlsl")
+ # The temporary pipeline used while a newly discovered N64 state compiles
+ # must not execute every Bumble material path. Build one dynamic-render-state
+ # fallback for each stable material family on every backend so cold gameplay
+diff --git a/src/render/rt64_descriptor_sets.h b/src/render/rt64_descriptor_sets.h
+index e5e7737..2811b1e 100644
+--- a/src/render/rt64_descriptor_sets.h
++++ b/src/render/rt64_descriptor_sets.h
+@@ -213,6 +213,7 @@ namespace RT64 {
+         uint32_t gFilteredIndirectLight;
+         uint32_t gBlueNoise;
+         uint32_t gBumbleShadowComparisonSampler;
++        uint32_t bumbleMaterialColor;
+ 
+         FramebufferRendererDescriptorCommonSet(const SamplerLibrary &samplerLibrary, bool raytracing, RenderDevice *device = nullptr) {
+             builder.begin();
+@@ -287,6 +288,7 @@ namespace RT64 {
+                 68,
+                 samplerLibrary.shadowComparison.get()
+             );
++            bumbleMaterialColor = builder.addByteAddressBuffer(69);
+             builder.end();
+ 
+             if (device != nullptr) {
+diff --git a/src/shaders/FbRendererCommon.hlsli b/src/shaders/FbRendererCommon.hlsli
+index 18eb363..ea3e47f 100644
+--- a/src/shaders/FbRendererCommon.hlsli
++++ b/src/shaders/FbRendererCommon.hlsli
+@@ -39,6 +39,7 @@ SamplerState gNearestClampWrapSampler : register(s22, space0);
+ SamplerState gNearestClampMirrorSampler : register(s23, space0);
+ SamplerState gNearestClampClampSampler : register(s24, space0);
+ SamplerComparisonState gBumbleShadowComparisonSampler : register(s68, space0);
++ByteAddressBuffer bumbleMaterialColor : register(t69, space0);
+ 
+ // Set 1 - RGBA32 texture cache.
+ Texture2D<float4> gTextures[8192] : register(t0, space1);
+diff --git a/src/gbi/rt64_gbi_extended.cpp b/src/gbi/rt64_gbi_extended.cpp
+index f569faa..62ed1db 100644
+--- a/src/gbi/rt64_gbi_extended.cpp
++++ b/src/gbi/rt64_gbi_extended.cpp
+@@ -156,7 +156,7 @@ namespace RT64 {
+ 
+         void popMatrixGroupV1(State *state, DisplayList **dl) {
+             const uint8_t popCount = (*dl)->p1(0, 8);
+-            const uint8_t proj = (*dl)->p0(8, 1);
++            const uint8_t proj = (*dl)->p1(8, 1);
+             state->rsp->popMatrixId(popCount, proj);
+         }
+ 
+diff --git a/src/render/rt64_bumble_shadow_geometry.h b/src/render/rt64_bumble_shadow_geometry.h
+index 4afc2ff..21eb21a 100644
+--- a/src/render/rt64_bumble_shadow_geometry.h
++++ b/src/render/rt64_bumble_shadow_geometry.h
+@@ -92,11 +92,51 @@ namespace RT64 {
+     }
+ 
+     struct BumbleShadowGeometryCache {
+-        std::vector<uint64_t> vertices, transforms, corners;
++        std::vector<uint64_t> vertices, transforms, corners, materialVertices;
++        std::vector<uint8_t> animatedMaterialVertices;
++        std::vector<uint32_t> materialTiles;
+ 
+         void reset(const DrawData &data) {
+             vertices.assign(data.worldIndices.size(), 0);
+             transforms.assign(data.worldTransforms.size(), 0);
++            materialVertices.assign(data.worldIndices.size(), 0);
++            animatedMaterialVertices.assign(data.worldIndices.size(), 0);
++            materialTiles.clear();
++        }
++
++        uint64_t materialKey(const DrawData &data, const GameCall &call, bool &animated) {
++            const auto &desc = call.callDesc;
++            uint64_t hash = XXH3_64bits(&data.rdpParams.at(desc.callIndex), sizeof(interop::RDPParams));
++            auto mix = [&](uint64_t value) { hash ^= value; hash *= 1099511628211ull; };
++            mix(XXH3_64bits(&call.shaderDesc, sizeof(call.shaderDesc)));
++            const uint64_t first = call.meshDesc.faceIndicesStart;
++            const uint64_t count = uint64_t(desc.triangleCount) * 3;
++            for (uint64_t i = first; i < first + count; ++i) {
++                const uint32_t vertex = data.faceIndices.at(i);
++                auto &key = materialVertices.at(vertex);
++                if (!key) {
++                    const float content[] = { data.tcFloats.at(vertex * 2),
++                        data.tcFloats.at(vertex * 2 + 1),
++                        float(data.normColBytes.at(vertex * 4 + 3)) };
++                    key = XXH3_64bits(content, sizeof(content));
++                    animatedMaterialVertices[vertex] = data.lookAtIndices.at(vertex) != 0 ||
++                        data.tcVelFloats.at(vertex * 2) != 0 || data.tcVelFloats.at(vertex * 2 + 1) != 0;
++                }
++                animated |= animatedMaterialVertices[vertex] != 0;
++                mix(key);
++            }
++            for (uint32_t i = 0; i < desc.tileCount; ++i) {
++                const uint32_t index = desc.tileIndex + i;
++                materialTiles.push_back(index);
++                const auto &tile = data.callTiles.at(index);
++                mix(tile.tmemHashOrID);
++                mix(XXH3_64bits(&data.rdpTiles.at(index), sizeof(interop::RDPTile)));
++                animated |= tile.tileCopyUsed;
++                if (index < data.lerpRdpTiles.size()) {
++                    animated |= std::memcmp(&data.rdpTiles[index], &data.lerpRdpTiles[index], sizeof(interop::RDPTile)) != 0;
++                }
++            }
++            return hash;
+         }
+ 
+         uint64_t key(const DrawData &data, uint64_t first, uint64_t count) {
+diff --git a/src/shaders/BumbleShadowMaterial.hlsli b/src/shaders/BumbleShadowMaterial.hlsli
+new file mode 100644
+index 0000000..1f8cb90
+--- /dev/null
++++ b/src/shaders/BumbleShadowMaterial.hlsli
+@@ -0,0 +1,18 @@
++#pragma once
++#include "shared/rt64_render_params.h"
++
++struct BumbleShadowConstants {
++    float4x4 lightViewProjection;
++    uint ccL;
++    uint ccH;
++    uint omL;
++    uint omH;
++    uint flags;
++    uint instanceIndex;
++    uint tileIndex;
++    uint tileCount;
++    float resolution;
++    uint3 padding;
++};
++
++[[vk::push_constant]] ConstantBuffer<BumbleShadowConstants> gShadow : register(b0);
+diff --git a/src/shaders/BumbleShadowMaterialVS.hlsl b/src/shaders/BumbleShadowMaterialVS.hlsl
+new file mode 100644
+index 0000000..7d9d2d1
+--- /dev/null
++++ b/src/shaders/BumbleShadowMaterialVS.hlsl
+@@ -0,0 +1,13 @@
++#include "BumbleShadowMaterial.hlsli"
++#include "FbRendererCommon.hlsli"
++
++void VSMain(float4 worldPosition : POSITION0, float2 uv : TEXCOORD0,
++    uint vertex : SV_VertexID, out float4 position : SV_POSITION,
++    out float2 materialUv : TEXCOORD0, out float4 materialColor : COLOR0,
++    out float2 coverageCoordinate : TEXCOORD1) {
++    position = mul(gShadow.lightViewProjection, worldPosition);
++    materialUv = uv;
++    coverageCoordinate = mul((float3x3)gShadow.lightViewProjection, worldPosition.xyz).xy *
++        float2(0.5f, -0.5f) * gShadow.resolution;
++    materialColor = float4(0, 0, 0, float(bumbleMaterialColor.Load(vertex * 4) >> 24) / 255.0f);
++}
+diff --git a/src/shaders/BumbleShadowMaterialPS.hlsl b/src/shaders/BumbleShadowMaterialPS.hlsl
+new file mode 100644
+index 0000000..593d6e3
+--- /dev/null
++++ b/src/shaders/BumbleShadowMaterialPS.hlsl
+@@ -0,0 +1,66 @@
++#define DYNAMIC_RENDER_PARAMS
++#include "BumbleShadowMaterial.hlsli"
++#include "TextureSampler.hlsli"
++#include "shared/rt64_color_combiner.h"
++#include "shared/rt64_blender.h"
++
++void PSMain(float4 position : SV_POSITION, float2 uv : TEXCOORD0,
++    float4 color : COLOR0, float2 coverageCoordinate : TEXCOORD1) {
++    const RenderParams rp = { gShadow.ccL, gShadow.ccH, gShadow.omL, gShadow.omH, gShadow.flags };
++    const OtherMode mode = { rp.omL, rp.omH };
++    const RDPParams rdp = instanceRDPParams[gShadow.instanceIndex];
++    float2 dx = ddx(uv), dy = ddy(uv);
++    int first = 0, second = 1;
++    float lod;
++    computeLOD(mode, gShadow.tileCount, rdp.primLOD, 1.0f,
++        dx, dy, first, second, lod);
++    float4 texels[2] = { float4(0, 0, 0, 1), float4(0, 0, 0, 1) };
++    const bool oneCycle = mode.cycleType() == G_CYC_1CYCLE;
++    [unroll] for (uint slot = 0; slot < 2; ++slot) {
++        if (slot == 0 ? renderFlagUsesTexture0(rp.flags) : renderFlagUsesTexture1(rp.flags)) {
++            uint index = gShadow.tileIndex + ((slot == 0 || oneCycle) ? first : second);
++            RDPTile tile = RDPTiles[index];
++            if (!renderFlagDynamicTiles(rp.flags)) {
++                bool useFirst = slot == 0 || oneCycle;
++                tile.cms = useFirst ? renderCMS0(rp.flags) : renderCMS1(rp.flags);
++                tile.cmt = useFirst ? renderCMT0(rp.flags) : renderCMT1(rp.flags);
++                tile.nativeSampler = useFirst ? renderFlagNativeSampler0(rp.flags) : renderFlagNativeSampler1(rp.flags);
++            }
++            texels[slot] = sampleTexture(mode, rp.flags, uv, dx, dy,
++                tile, GPUTiles[index], slot == 1 && oneCycle);
++        }
++    }
++    ColorCombiner::Inputs inputs;
++    inputs.otherMode = mode;
++    inputs.alphaOnly = true;
++    inputs.texVal0 = texels[0];
++    inputs.texVal1 = texels[1];
++    inputs.primColor = rdp.primColor;
++    inputs.shadeColor = color;
++    inputs.envColor = rdp.envColor;
++    inputs.keyCenter = rdp.keyCenter;
++    inputs.keyScale = rdp.keyScale;
++    inputs.lodFraction = lod;
++    inputs.primLodFrac = rdp.primLOD.x;
++    inputs.noise = 0.0f;
++    inputs.K4 = rdp.convertK[4] / 255.0f;
++    inputs.K5 = rdp.convertK[5] / 255.0f;
++    const ColorCombiner combiner = { rp.ccL, rp.ccH };
++    float4 combined;
++    float alpha;
++    combiner.run(inputs, combined, alpha);
++    // Stable light-space coverage; never seed translucency from the camera or frame.
++    const int2 pixel = int2(floor(coverageCoordinate));
++    const uint bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
++    const float threshold = (bayer[(pixel.y & 3u) * 4u + (pixel.x & 3u)] + 0.5f) / 16.0f;
++    if (mode.alphaCompare() == G_AC_THRESHOLD && alpha < rdp.blendColor.a) discard;
++    if (mode.alphaCompare() == G_AC_DITHER && alpha < threshold) discard;
++    if (mode.cvgXAlpha() && combined.a < threshold) discard;
++    if (Blender::usesAlphaBlend(mode)) {
++        Blender::Inputs blend;
++        blend.blendColor = rdp.blendColor;
++        blend.fogColor = rdp.fogColor;
++        blend.shadeAlpha = color.a;
++        if (Blender::run(mode, rp.flags, blend, combined, false).a < threshold) discard;
++    }
++}

@@ -109,10 +109,10 @@ void validate_descriptor_contracts(RenderDevice* device) {
             RT64::LoadTile tile{};
             tile.siz = size;
             tile.fmt = format;
-            require(RT64::TMEMHasher::requiresRawTMEM(tile, 1, 1));
-            require(RT64::TMEMHasher::requiresRawTMEM(tile, 1024, 1024));
+            require(RT64::TMEMHasher::requiresRawTMEM(tile, 1, 1, 0));
+            require(RT64::TMEMHasher::requiresRawTMEM(tile, 1024, 1024, 0));
             tile.line = 1;
-            require(!RT64::TMEMHasher::requiresRawTMEM(tile, 1, 1));
+            require(!RT64::TMEMHasher::requiresRawTMEM(tile, 1, 1, 0));
         }
     }
     RenderDescriptorRange range(RenderDescriptorRangeType::TEXTURE, 0, 1);
@@ -569,7 +569,8 @@ struct FaithfulTexturePackContract {
 };
 
 FaithfulTexturePackContract load_faithful_texture_pack_contract(
-    const std::filesystem::path& root
+    const std::filesystem::path& root,
+    bool enhanced = false
 ) {
     FaithfulTexturePackContract contract{};
     const std::filesystem::path manifest_path = root / "manifest.json";
@@ -593,13 +594,13 @@ FaithfulTexturePackContract load_faithful_texture_pack_contract(
             manifest.at("source_rom_sha256").get<std::string>() !=
                 "d21e3d1c2ec4d7f025cfaa119553be9a5fa87a9fd6625ef1ef44dc1d4b0aa54b" ||
             manifest.at("algorithm").get<std::string>() !=
-                "nearest_texel_exact" ||
+                (enhanced ? "coordinate-v7" : "nearest_texel_exact") ||
             manifest.at("output_format").get<std::string>() !=
-                bumble::first_run::kFaithfulTextureFormat ||
+                (enhanced ? "R8G8B8A8_UNORM_area_mips" : bumble::first_run::kFaithfulTextureFormat) ||
             pack_name != "textures.rtz" || !textures.is_array() ||
             manifest.at("texture_count").get<size_t>() !=
-                kFaithfulTextureCount ||
-            textures.size() != kFaithfulTextureCount) {
+                textures.size() ||
+            (enhanced ? textures.size() < kFaithfulTextureCount : textures.size() != kFaithfulTextureCount)) {
             throw std::runtime_error("manifest contract changed");
         }
 
@@ -1215,6 +1216,7 @@ public:
             task->t.ucode_data & 0x03FFFFFFu,
             true
         );
+        app_->state->setTexcoordWrapPoint(1024, 1024);
         const bool widescreen_extended_gbi =
             bumble::widescreen::extended_ui_enabled();
         const bool frame_arena_extended_gbi =
@@ -2157,8 +2159,17 @@ private:
                 : bumble::menu_background::Variant::Standard4x3;
         const bool faithful_textures_requested =
             bumble::graphics_options::hd_terrain_enabled();
-        if (menu_background_pack_loaded_ && variant == menu_background_variant_ &&
-            faithful_texture_pack_loaded_ == faithful_textures_requested) {
+        const bool enhanced = bumble::graphics_options::enhanced_textures_enabled();
+        if (menu_background_pack_loaded_ && variant == menu_background_variant_) {
+            if (faithful_texture_pack_loaded_ != faithful_textures_requested ||
+                enhanced_texture_pack_selected_ != enhanced) {
+                std::vector<bool> selection{faithful_textures_requested && !enhanced, true};
+                if (bumble::first_run::enhanced_textures_available()) selection.push_back(faithful_textures_requested && enhanced);
+                if (!app_->textureCache->queueReplacementDirectorySelection(selection))
+                    return false;
+                faithful_texture_pack_loaded_ = faithful_textures_requested;
+                enhanced_texture_pack_selected_ = enhanced;
+            }
             return true;
         }
 
@@ -2166,20 +2177,19 @@ private:
             bumble::menu_background::replacement_directory(variant);
         const std::filesystem::path faithful_texture_root =
             directory.parent_path().parent_path() / "textures";
-        FaithfulTexturePackContract faithful_contract{};
-        if (faithful_textures_requested) {
-            faithful_contract = load_faithful_texture_pack_contract(
-                faithful_texture_root
-            );
-            if (!faithful_contract.valid) {
-                return false;
-            }
-        }
+        const auto faithful_contract = load_faithful_texture_pack_contract(faithful_texture_root);
+        const bool has_enhanced = bumble::first_run::enhanced_textures_available();
+        const auto enhanced_contract = has_enhanced ? load_faithful_texture_pack_contract(
+            faithful_texture_root.parent_path() / "textures-enhanced", true) : FaithfulTexturePackContract{};
+        if (!faithful_contract.valid || (has_enhanced && !enhanced_contract.valid)) return false;
         std::vector<RT64::ReplacementDirectory> replacement_directories{};
-        if (faithful_textures_requested) {
-            replacement_directories.emplace_back(faithful_contract.pack_path);
-        }
+        replacement_directories.emplace_back(faithful_contract.pack_path);
+        replacement_directories.back().enabled = faithful_textures_requested && !enhanced;
         replacement_directories.emplace_back(directory);
+        if (has_enhanced) {
+            replacement_directories.emplace_back(enhanced_contract.pack_path);
+            replacement_directories.back().enabled = faithful_textures_requested && enhanced;
+        }
         if (!app_->textureCache->loadReplacementDirectories(
                 replacement_directories)) {
             std::fprintf(
@@ -2203,17 +2213,15 @@ private:
         uint32_t resolved_suppressed_logo_count = 0;
         uint32_t resolved_gameplay_ui_count = 0;
         uint32_t resolved_faithful_count = 0;
+        uint32_t resolved_enhanced_count = 0;
         size_t resolved_faithful_path_count = 0u;
         {
             const std::lock_guard lock(app_->textureCache->textureMapMutex);
             const auto& resolved_paths = app_->textureCache->textureMap
                 .replacementMap.fileSystemResolvedPaths;
-            const size_t expected_file_systems =
-                faithful_textures_requested ? 2u : 1u;
+            const size_t expected_file_systems = has_enhanced ? 3u : 2u;
             if (resolved_paths.size() == expected_file_systems) {
-                const size_t menu_path_index = faithful_textures_requested
-                    ? 1u
-                    : 0u;
+                const size_t menu_path_index = 1u;
                 resolved_count =
                     static_cast<uint32_t>(resolved_paths[menu_path_index].size());
                 for (const uint64_t hash : kSuppressedMenuLogoTextureHashes) {
@@ -2228,7 +2236,7 @@ private:
                         ++resolved_gameplay_ui_count;
                     }
                 }
-                if (faithful_textures_requested) {
+                {
                     resolved_faithful_path_count = resolved_paths[0].size();
                     for (const uint64_t hash : faithful_contract.hashes) {
                         if (resolved_paths[0].find(hash) !=
@@ -2236,13 +2244,16 @@ private:
                             ++resolved_faithful_count;
                         }
                     }
+                    for (const uint64_t hash : enhanced_contract.hashes)
+                        resolved_enhanced_count += resolved_paths[2].count(hash);
                 }
             }
         }
         if (resolved_count != 135 ||
             resolved_suppressed_logo_count != 7 ||
             resolved_gameplay_ui_count != 8 ||
-            (faithful_textures_requested &&
+            resolved_enhanced_count != enhanced_contract.hashes.size() ||
+            (
              (resolved_faithful_count != faithful_contract.hashes.size() ||
               resolved_faithful_path_count != faithful_contract.hashes.size()))) {
             std::fprintf(
@@ -2268,6 +2279,7 @@ private:
         menu_background_variant_ = variant;
         menu_background_pack_loaded_ = true;
         faithful_texture_pack_loaded_ = faithful_textures_requested;
+        enhanced_texture_pack_selected_ = enhanced;
         faithful_texture_count_ = faithful_textures_requested
             ? faithful_contract.hashes.size()
             : 0u;
@@ -2516,6 +2528,7 @@ private:
     uint32_t dpc_tmem_reg_ = 0;
     bool menu_background_pack_loaded_ = false;
     bool faithful_texture_pack_loaded_ = false;
+    bool enhanced_texture_pack_selected_ = false;
     size_t faithful_texture_count_ = 0u;
     bool menu_background_replacements_logged_ = false;
     bool extended_gbi_logged_ = false;

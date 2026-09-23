@@ -10,12 +10,15 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <stdexcept>
 
 #include "common/rt64_performance_profiler.h"
 #include "native_campaign_level_observer.hpp"
 #include "native_checkpoint_bridge.hpp"
 #include "native_pi_dma_bridge.hpp"
 #include "xxHash/xxh3.h"
+#include "librecomp/addresses.hpp"
+#include "ultramodern/ultramodern.hpp"
 
 extern RspUcodeFunc n_aspMain;
 
@@ -31,6 +34,45 @@ constexpr uint32_t kSchedulerLoadCallerPc = 0x80027944u;
 constexpr uint32_t kSchedulerStartCallerPc = 0x8002794Cu;
 constexpr uint64_t kPeriodicSampleInterval = 120u;
 constexpr uint64_t kMaximumSamplesPerType = 64u;
+
+struct ParseWaiter {
+    int32_t queue = 0;
+    bool waiting = false;
+};
+std::mutex g_parse_mutex;
+std::array<ParseWaiter, 2> g_parse_waiters{};
+uint8_t* g_parse_rdram = nullptr;
+uint64_t g_parse_produced = 0;
+uint64_t g_parse_completed = 0;
+std::deque<std::pair<uint32_t, uint64_t>> g_pending_parses;
+thread_local uint64_t g_active_parse = 0;
+
+void initialize_parse_waiters(uint8_t* rdram) {
+    if (g_parse_rdram == rdram) return;
+    if (g_parse_rdram != nullptr) throw std::runtime_error("Graphics input runtime changed");
+    constexpr size_t Stride = sizeof(OSMesgQueue) + sizeof(OSMesg);
+    auto* memory = static_cast<uint8_t*>(recomp::alloc(rdram, Stride * g_parse_waiters.size()));
+    if (!memory) throw std::runtime_error("Graphics input queue allocation failed");
+    const ptrdiff_t offset = memory - rdram;
+    if (offset < 0 || static_cast<size_t>(offset) + Stride * g_parse_waiters.size() > recomp::mem_size) {
+        recomp::free(rdram, memory);
+        throw std::runtime_error("Graphics input queue outside RDRAM");
+    }
+    for (size_t i = 0; i < g_parse_waiters.size(); ++i) {
+        const int32_t queue = static_cast<int32_t>(0x80000000u + offset + i * Stride);
+        osCreateMesgQueue(rdram, queue, queue + sizeof(OSMesgQueue), 1);
+        g_parse_waiters[i].queue = queue;
+    }
+    // Queue storage belongs to RDRAM until all guest and renderer threads have joined.
+    g_parse_rdram = rdram;
+}
+
+void register_graphics_input(uint8_t* rdram, uint32_t task) {
+    std::lock_guard lock(g_parse_mutex);
+    initialize_parse_waiters(rdram);
+    const uint32_t displayList = static_cast<uint32_t>(MEM_W(0x30, static_cast<int32_t>(task)));
+    g_pending_parses.emplace_back(displayList & 0x03FFFFFFu, ++g_parse_produced);
+}
 
 struct TaskSnapshot {
     std::array<uint32_t, 16> words{};
@@ -906,6 +948,24 @@ RspExitReason instrumented_audio_microcode(uint8_t* rdram, uint32_t ucode_addr) 
 
 } // namespace
 
+extern "C" void bumble_wait_graphics_input(uint8_t* rdram, uint32_t waiter_index) {
+    std::unique_lock lock(g_parse_mutex);
+    initialize_parse_waiters(rdram);
+    auto& waiter = g_parse_waiters.at(waiter_index);
+    while (g_parse_completed < g_parse_produced ||
+           (waiter_index == 0 && g_parse_waiters[1].waiting)) {
+        waiter.waiting = true;
+        const int32_t queue = waiter.queue;
+        lock.unlock();
+        osRecvMesg(rdram, queue, 0, OS_MESG_BLOCK);
+        lock.lock();
+        waiter.waiting = false;
+    }
+    if (waiter_index == 1 && g_parse_waiters[0].waiting) {
+        ultramodern::enqueue_external_message(g_parse_waiters[0].queue, 0, false, false);
+    }
+}
+
 extern "C" void buck_native_rsp_task_probe(
     uint8_t* rdram,
     recomp_context* context,
@@ -921,6 +981,7 @@ extern "C" void buck_native_rsp_task_probe(
         );
         const uint32_t task_pointer =
             static_cast<uint32_t>(context->r5) + 0x10u;
+        register_graphics_input(rdram, task_pointer);
         profile_graphics_producer(guest_snapshot(rdram, task_pointer));
     } else if (anchor_pc == kSchedulerStartPc) {
         const uint32_t task_pointer = static_cast<uint32_t>(context->r18);
@@ -960,6 +1021,15 @@ RspUcodeFunc* bumble::native_rsp_task::select_audio_microcode(
 }
 
 void bumble::native_rsp_task::graphics_execution_begin(const OSTask* task) {
+    {
+        std::lock_guard lock(g_parse_mutex);
+        const uint32_t address = static_cast<uint32_t>(task->t.data_ptr) & 0x03FFFFFFu;
+        if (g_pending_parses.empty() || g_pending_parses.front().first != address) {
+            throw std::runtime_error("Graphics input submission ownership mismatch");
+        }
+        g_active_parse = g_pending_parses.front().second;
+        g_pending_parses.pop_front();
+    }
     profile_graphics_execution_begin(host_snapshot(task));
     std::lock_guard lock(g_state_mutex);
     synchronize_capture_locked();
@@ -967,6 +1037,14 @@ void bumble::native_rsp_task::graphics_execution_begin(const OSTask* task) {
 }
 
 void bumble::native_rsp_task::graphics_execution_complete(bool processed) {
+    if (processed) {
+        std::lock_guard lock(g_parse_mutex);
+        g_parse_completed = g_active_parse;
+        g_active_parse = 0;
+        for (const auto& waiter : g_parse_waiters) {
+            if (waiter.waiting) ultramodern::enqueue_external_message(waiter.queue, 0, false, false);
+        }
+    }
     {
         std::lock_guard lock(g_state_mutex);
         execution_complete_locked(

@@ -1,16 +1,24 @@
 #include "native_first_run_assets.hpp"
+#include "native_texture_reconstruction.hpp"
+#include "native_preparation.hpp"
+#include "native_texture_catalog.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <memory>
+#include <deque>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 #include <json/json.hpp>
@@ -32,6 +40,9 @@
 namespace {
 
 using json = nlohmann::json;
+std::atomic_bool g_enhanced_available{false};
+std::atomic_bool g_texture_prompt_requested{false};
+std::filesystem::path g_texture_preference;
 
 constexpr uint64_t kRomSize = 0xC00000u;
 constexpr std::string_view kRomSha256 =
@@ -76,6 +87,10 @@ void write_bytes(
                        static_cast<std::streamsize>(size)))) {
         throw std::runtime_error("cannot write " + path.string());
     }
+    stream.flush();
+    if (!stream) throw std::runtime_error("cannot flush " + path.string());
+    stream.close();
+    if (!stream) throw std::runtime_error("cannot close " + path.string());
 }
 
 void write_json(const std::filesystem::path& path, const json& value) {
@@ -304,7 +319,7 @@ std::vector<uint8_t> decode_texture(
             a = expand_four(value & 0xFu);
         } else if (format == "I8") {
             r = g = b = source[index];
-            a = 255u;
+            a = source[index];
         } else {
             const uint8_t packed = source[index >> 1u];
             const uint8_t value = (index & 1u) == 0u
@@ -481,6 +496,7 @@ json replacement_database(const json& textures, const char* operation) {
             {"hashes", {{"rt64", hash}, {"rice", ""}}},
             {"operation", operation},
             {"shift", "none"},
+            {"preserveOriginalAlpha", texture.value("preserveOriginalAlpha", false)},
         });
     }
     return {
@@ -500,7 +516,8 @@ json replacement_database(const json& textures, const char* operation) {
 
 void build_menu_assets(
     const std::filesystem::path& root,
-    const std::vector<uint8_t>& rom
+    const std::vector<uint8_t>& rom,
+    bumble::first_run::PreparationProgress& progress
 ) {
     const json hashes = parse_json(embedded(
         BumbleMenuHashMapping,
@@ -540,6 +557,7 @@ void build_menu_assets(
     const std::vector<uint8_t> transparent(32u * 32u * 4u, 0u);
 
     for (const auto& [name, width, height] : variants) {
+        progress.check();
         const std::filesystem::path directory = root / name;
         std::filesystem::create_directories(directory);
         const Image background =
@@ -548,6 +566,7 @@ void build_menu_assets(
         json database_textures = json::array();
 
         for (uint32_t row = 0; row < kMenuStripCount; ++row) {
+            progress.check();
             const std::string hash = row_hashes.at(row).get<std::string>();
             const std::string filename = hash + ".png";
             const uint8_t* pixels = background.rgba.data() +
@@ -570,6 +589,7 @@ void build_menu_assets(
             });
         }
         for (const json& texture : ui_textures) {
+            progress.check();
             const uint32_t offset = parse_hex_offset(
                 texture.at("rom_offset").get<std::string>()
             );
@@ -624,15 +644,28 @@ void build_menu_assets(
 
 void build_faithful_pack(
     const std::filesystem::path& root,
-    const std::vector<uint8_t>& rom
+    const std::vector<uint8_t>& rom,
+    bumble::first_run::PreparationProgress& progress,
+    bool enhanced = false
 ) {
     const json mapping = parse_json(embedded(
         BumbleFaithfulTextureMapping,
         BumbleFaithfulTextureMapping_size
     ));
-    const json& textures = mapping.at("textures");
+    json textures = mapping.at("textures");
     if (textures.size() != kFaithfulTextureCount) {
         throw std::runtime_error("faithful texture count changed");
+    }
+    if (enhanced) {
+        textures = bumble::textures::enhanced_catalog(rom, std::move(textures));
+        const auto menu = parse_json(embedded(BumbleMenuHashMapping, BumbleMenuHashMapping_size));
+        std::unordered_set<std::string> reserved;
+        for (const auto& hash : menu.at("row_hashes")) reserved.insert(hash.get<std::string>());
+        for (const auto& hash : menu.at("suppressed_original_logo_hashes")) reserved.insert(hash.get<std::string>());
+        for (auto entry = textures.begin(); entry != textures.end(); ) {
+            if (reserved.count(entry->at("rt64_hash").get<std::string>())) entry = textures.erase(entry);
+            else ++entry;
+        }
     }
 
     mz_zip_archive archive{};
@@ -640,8 +673,55 @@ void build_faithful_pack(
         throw std::runtime_error("cannot create texture archive");
     }
     bool archive_open = true;
+    uint32_t completed = 0;
+    const char* stage = enhanced ? "Enhancing textures" : "Preparing original textures";
+    progress.report(stage, 0, uint32_t(textures.size()));
     try {
-        for (const json& texture : textures) {
+        struct Pending { std::string path; std::future<std::vector<uint8_t>> bytes; };
+        std::deque<Pending> pending;
+        uint32_t reconstructed_source = UINT32_MAX;
+        bumble::textures::Image reconstructed_background;
+        std::vector<json> backgrounds;
+        for (const auto& texture : textures) {
+            if (texture.contains("whole_image_offset") && (backgrounds.empty() ||
+                    backgrounds.back().at("whole_image_offset") != texture.at("whole_image_offset")))
+                backgrounds.push_back(texture);
+        }
+        size_t next_background = 0;
+        std::deque<std::future<bumble::textures::Image>> background_jobs;
+        struct CancelOnFailure {
+            bumble::first_run::PreparationProgress& progress;
+            int exceptions = std::uncaught_exceptions();
+            ~CancelOnFailure() {
+                if (std::uncaught_exceptions() > exceptions) progress.cancelled.store(true);
+            }
+        } cancel_on_failure{progress};
+        const auto queue_backgrounds = [&]() {
+            while (background_jobs.size() < 4 && next_background < backgrounds.size()) {
+                const auto description = backgrounds[next_background++];
+                background_jobs.push_back(std::async(std::launch::async, [&, description]() {
+                    progress.check();
+                    const uint32_t offset = description.at("whole_image_offset");
+                    const uint32_t width = description.at("source_width");
+                    const uint32_t height = description.at("whole_image_height");
+                    const auto decoded = decode_texture(rom.data() + offset, rom.size() - offset,
+                        description.at("source_format").get<std::string>(), width, height);
+                    return bumble::textures::reconstruct_material({width, height, decoded}, [&]() { progress.check(); });
+                }));
+            }
+        };
+        const auto write_next = [&]() {
+            progress.check();
+            const auto bytes = pending.front().bytes.get();
+            progress.check();
+            if (!mz_zip_writer_add_mem(&archive, pending.front().path.c_str(), bytes.data(),
+                    bytes.size(), MZ_BEST_COMPRESSION))
+                throw std::runtime_error("cannot add reconstructed texture");
+            pending.pop_front();
+            progress.report(stage, ++completed, uint32_t(textures.size()));
+        };
+        for (json& texture : textures) {
+            progress.check();
             const uint32_t offset = parse_hex_offset(
                 texture.at("rom_offset").get<std::string>()
             );
@@ -663,39 +743,88 @@ void build_faithful_pack(
                 source_height * (1u << scale) != output_height) {
                 throw std::runtime_error("faithful texture mapping changed");
             }
+            const auto format = texture.at("source_format").get<std::string>();
             std::vector<uint8_t> pixels = decode_texture(
                 rom.data() + offset,
                 size,
-                texture.at("source_format").get<std::string>(),
+                format == "I4_IA16_PALETTE" ? "I4" : format,
                 source_width,
                 source_height
             );
-            pixels = nearest_scale(
-                pixels,
-                source_width,
-                source_height,
-                scale
-            );
-            const std::vector<uint8_t> dds = bumble::first_run::make_faithful_dds(
-                std::move(pixels),
-                output_width,
-                output_height,
-                mip_count
-            );
+            if (texture.contains("source_rows")) {
+                const auto& rows = texture.at("source_rows");
+                if (source_width != 1 || rows.size() != source_height || format != "RGBA32")
+                    throw std::runtime_error("Composite texture layout changed");
+                for (size_t row = 0; row < rows.size(); ++row) {
+                    const auto source = rows[row].get<uint32_t>();
+                    if (source > rom.size() || rom.size() - source < 4)
+                        throw std::runtime_error("Composite texture is truncated");
+                    std::copy_n(rom.data() + source, 4, pixels.data() + row * 4);
+                }
+            }
+            if (format == "I4_IA16_PALETTE") {
+                const uint32_t palette = texture.at("palette_offset");
+                if (palette > rom.size() || rom.size() - palette < 32)
+                    throw std::runtime_error("Texture palette is truncated");
+                for (size_t pixel = 0; pixel < pixels.size() / 4; ++pixel) {
+                    const uint8_t packed = rom[offset + pixel / 2];
+                    const uint32_t index = (pixel & 1) ? (packed & 15) : (packed >> 4);
+                    pixels[pixel * 4] = pixels[pixel * 4 + 1] = pixels[pixel * 4 + 2] = rom[palette + index * 2];
+                    pixels[pixel * 4 + 3] = rom[palette + index * 2 + 1];
+                }
+            }
+            if (enhanced) {
+                bool opaque = true;
+                for (size_t alpha = 3; alpha < pixels.size(); alpha += 4)
+                    opaque &= pixels[alpha] == 255;
+                texture["preserveOriginalAlpha"] = !opaque;
+                texture["output_width"] = source_width * 9u;
+                texture["output_height"] = source_height * 9u;
+                texture.erase("nearest_scale_log2");
+                uint32_t levels = 1;
+                for (uint32_t w = source_width * 9u, h = source_height * 9u; w > 1 || h > 1; ++levels) {
+                    w = std::max(1u, w / 2); h = std::max(1u, h / 2);
+                }
+                texture["mip_levels"] = levels;
+            }
             const std::string output =
                 texture.at("output").get<std::string>();
-            if (!mz_zip_writer_add_mem(
-                    &archive,
-                    output.c_str(),
-                    dds.data(),
-                    dds.size(),
-                    MZ_BEST_COMPRESSION)) {
-                throw std::runtime_error("cannot add faithful texture");
+            const bool strip = enhanced && texture.contains("whole_image_offset");
+            if (strip) {
+                const uint32_t whole = texture.at("whole_image_offset");
+                if (whole != reconstructed_source) {
+                    progress.report("Enhancing backgrounds", completed, uint32_t(textures.size()));
+                    while (!pending.empty()) write_next();
+                    queue_backgrounds();
+                    reconstructed_background = background_jobs.front().get();
+                    background_jobs.pop_front();
+                    reconstructed_source = whole;
+                    progress.check();
+                    queue_backgrounds();
+                }
+                const uint32_t top = texture.at("view_top").get<uint32_t>() * 9;
+                const auto begin = reconstructed_background.rgba.begin() + size_t(top) * source_width * 9 * 4;
+                pixels.assign(begin, begin + size_t(source_height) * source_width * 81 * 4);
+            }
+            pending.push_back({output, std::async(enhanced ? std::launch::async : std::launch::deferred,
+                [pixels = std::move(pixels), source_width, source_height, scale, output_width, output_height, mip_count, enhanced, strip, &progress]() {
+                    return strip ? bumble::textures::make_dds({source_width * 9, source_height * 9, pixels}) : enhanced
+                        ? bumble::textures::make_dds(bumble::textures::reconstruct_material({source_width, source_height, pixels}, [&]() { progress.check(); }))
+                        : bumble::first_run::make_faithful_dds(nearest_scale(pixels, source_width, source_height, scale),
+                            output_width, output_height, mip_count);
+                })});
+            if (pending.size() == (enhanced && !strip ? 4u : 1u)) write_next();
+        }
+        while (!pending.empty()) write_next();
+
+        json database_json = replacement_database(textures, enhanced ? "stream" : "preload");
+        if (enhanced) {
+            database_json["configuration"]["defaultShift"] = "half";
+            for (auto& texture : database_json["textures"]) {
+                texture["shift"] = "half";
             }
         }
-
-        const std::string database =
-            replacement_database(textures, "preload").dump(2) + '\n';
+        const std::string database = database_json.dump(2) + '\n';
         if (!mz_zip_writer_add_mem(
                 &archive,
                 "rt64.json",
@@ -712,8 +841,8 @@ void build_faithful_pack(
                 &archive_size)) {
             throw std::runtime_error("cannot finalize texture archive");
         }
-        write_bytes(root / "textures.rtz", archive_bytes, archive_size);
-        mz_free(archive_bytes);
+        const std::unique_ptr<void, decltype(&mz_free)> archive_data(archive_bytes, mz_free);
+        write_bytes(root / "textures.rtz", archive_data.get(), archive_size);
         if (!mz_zip_writer_end(&archive)) {
             archive_open = false;
             throw std::runtime_error("cannot close texture archive");
@@ -727,9 +856,10 @@ void build_faithful_pack(
             {"source", "verified_external_us_rev0_rom"},
             {"source_rom_size", kRomSize},
             {"source_rom_sha256", std::string(kRomSha256)},
-            {"algorithm", "nearest_texel_exact"},
-            {"output_format", std::string(bumble::first_run::kFaithfulTextureFormat)},
-            {"texture_count", kFaithfulTextureCount},
+            {"algorithm", enhanced ? "coordinate-v7" : "nearest_texel_exact"},
+            {"output_format", enhanced ? "R8G8B8A8_UNORM_area_mips" : std::string(bumble::first_run::kFaithfulTextureFormat)},
+            {"reconstruction_scale", enhanced ? 9u : 0u},
+            {"texture_count", textures.size()},
             {"pack_name", "textures.rtz"},
             {"textures", textures},
         });
@@ -800,12 +930,16 @@ std::vector<uint8_t> read_rom(const std::filesystem::path& path) {
 
 void build_assets(
     const std::filesystem::path& root,
-    const std::filesystem::path& rom_path
+    const std::filesystem::path& rom_path,
+    bumble::first_run::PreparationProgress& progress,
+    bool enhanced
 ) {
     const std::vector<uint8_t> rom = read_rom(rom_path);
     std::filesystem::create_directories(root);
-    build_menu_assets(root / "menu", rom);
-    build_faithful_pack(root / "textures", rom);
+    build_menu_assets(root / "menu", rom, progress);
+    build_faithful_pack(root / "textures", rom, progress);
+    if (enhanced) build_faithful_pack(root / "textures-enhanced", rom, progress, true);
+    progress.report("Saving textures");
 
     const EmbeddedFile manifest = embedded(
         BumbleProjectVisualAssets,
@@ -852,69 +986,123 @@ std::vector<uint8_t> bumble::first_run::make_faithful_dds(
     return make_rgba8_unorm_dds(std::move(pixels), width, height, mip_count);
 }
 
-bool bumble::first_run::ensure_assets(
-    const std::filesystem::path& data_root,
-    const std::filesystem::path& rom_path
-) {
-    const std::filesystem::path assets = data_root / "assets";
-    if (current_assets(assets)) {
-        std::fprintf(
-            stderr,
-            "BUMBLE_FIRST_RUN stage=assets_ready source=existing"
-            " generator=%.*s\n",
-            static_cast<int>(kGenerator.size()),
-            kGenerator.data()
-        );
-        return true;
-    }
+namespace {
+void recover_prepared(const std::filesystem::path& target) {
+    const std::filesystem::path backup = target.string() + ".previous";
+    if (!std::filesystem::exists(target) && std::filesystem::exists(backup))
+        std::filesystem::rename(backup, target);
+}
 
-    const std::filesystem::path staging = data_root / "assets.building";
-    const std::filesystem::path backup = data_root / "assets.previous";
+void publish_prepared(const std::filesystem::path& staging, const std::filesystem::path& target) {
+    const std::filesystem::path backup = target.string() + ".previous";
+    std::filesystem::remove_all(backup);
+    if (std::filesystem::exists(target)) std::filesystem::rename(target, backup);
+    try { std::filesystem::rename(staging, target); }
+    catch (...) {
+        if (std::filesystem::exists(backup) && !std::filesystem::exists(target))
+            std::filesystem::rename(backup, target);
+        throw;
+    }
+    std::error_code error;
+    std::filesystem::remove_all(backup, error);
+}
+
+bool current_enhanced(const std::filesystem::path& root) {
     try {
-        std::error_code error;
-        std::filesystem::remove_all(staging, error);
-        error.clear();
-        std::filesystem::remove_all(backup, error);
-        std::fprintf(
-            stderr,
-            "BUMBLE_FIRST_RUN stage=assets_build_started path=%s\n",
-            assets.string().c_str()
-        );
-        std::fflush(stderr);
-        build_assets(staging, rom_path);
-        if (std::filesystem::exists(assets)) {
-            std::filesystem::rename(assets, backup);
-        }
-        try {
-            std::filesystem::rename(staging, assets);
-        } catch (...) {
-            if (std::filesystem::exists(backup) &&
-                !std::filesystem::exists(assets)) {
-                std::filesystem::rename(backup, assets);
-            }
-            throw;
-        }
-        std::filesystem::remove_all(backup, error);
-        std::fprintf(
-            stderr,
-            "BUMBLE_FIRST_RUN stage=assets_ready source=generated"
-            " generator=%.*s menu_per_variant=%u textures=%u\n",
-            static_cast<int>(kGenerator.size()),
-            kGenerator.data(),
-            kMenuReplacementCount,
-            kFaithfulTextureCount
-        );
-        std::fflush(stderr);
+        std::ifstream stream(root / "manifest.json");
+        const auto manifest = json::parse(stream);
+        return manifest.at("generator").get<std::string>() == kGenerator &&
+            manifest.at("schema_version").get<unsigned>() == 4 &&
+            manifest.at("source_rom_sha256").get<std::string>() == kRomSha256 &&
+            std::filesystem::is_regular_file(root / "textures.rtz");
+    } catch (...) { return false; }
+}
+}
+
+bool bumble::first_run::enhanced_textures_available() {
+    return g_enhanced_available.load(std::memory_order_acquire);
+}
+
+bool bumble::first_run::texture_prompt_requested() {
+    return g_texture_prompt_requested.load(std::memory_order_acquire);
+}
+
+bool bumble::first_run::request_texture_prompt() {
+    try {
+        if (g_texture_preference.empty()) return false;
+        const std::filesystem::path staging = g_texture_preference.string() + ".building";
+        write_json(staging, {{"schema_version", 1}, {"choice", "ask"}});
+        publish_prepared(staging, g_texture_preference);
+        g_texture_prompt_requested.store(true, std::memory_order_release);
         return true;
+    } catch (...) { return false; }
+}
+
+bumble::first_run::AssetResult bumble::first_run::ensure_assets(
+    const std::filesystem::path& data_root,
+    const std::filesystem::path& rom_path,
+    bool unattended
+) {
+    g_enhanced_available.store(false, std::memory_order_release);
+    const auto assets = data_root / "assets";
+    const auto enhanced = assets / "textures-enhanced";
+    const auto preference = data_root / "config" / "texture-preparation.json";
+    g_texture_preference = preference;
+    g_texture_prompt_requested.store(false, std::memory_order_release);
+    std::filesystem::path staging;
+    try {
+        recover_prepared(assets);
+        recover_prepared(enhanced);
+        recover_prepared(preference);
+        const bool base_ready = current_assets(assets);
+        const bool enhanced_ready = base_ready && current_enhanced(enhanced);
+        std::string policy = "ask";
+        if (!unattended) {
+            try {
+                std::ifstream stream(preference);
+                const auto saved = json::parse(stream);
+                if (saved.at("schema_version").get<unsigned>() == 1)
+                    policy = saved.at("choice").get<std::string>();
+            } catch (...) {}
+        }
+        TextureChoice choice;
+        choice.generate = unattended || policy == "generate" || (enhanced_ready && policy != "skip");
+        if (!unattended && !enhanced_ready && policy != "generate" && policy != "skip")
+            choice = choose_enhanced_textures();
+
+        const bool prepare_base = !base_ready;
+        const bool prepare_enhanced = choice.generate && !enhanced_ready;
+        if (prepare_base || prepare_enhanced) {
+            const auto target = prepare_base ? assets : enhanced;
+            staging = target.string() + ".building";
+            std::filesystem::remove_all(staging);
+            run_preparation([&](PreparationProgress& progress) {
+                if (prepare_base) build_assets(staging, rom_path, progress, choice.generate);
+                else build_faithful_pack(staging, read_rom(rom_path), progress, true);
+                progress.check();
+                publish_prepared(staging, target);
+            });
+        }
+        if (choice.remember && !unattended) {
+            const std::filesystem::path temporary = preference.string() + ".building";
+            write_json(temporary, {{"schema_version", 1}, {"choice", choice.generate ? "generate" : "skip"}});
+            publish_prepared(temporary, preference);
+        }
+        g_enhanced_available.store(choice.generate, std::memory_order_release);
+        std::fprintf(stderr, "BUMBLE_FIRST_RUN stage=assets_ready source=%s enhanced=%d generator=%.*s\n",
+            prepare_base || prepare_enhanced ? "generated" : "existing", choice.generate ? 1 : 0,
+            static_cast<int>(kGenerator.size()), kGenerator.data());
+        std::fflush(stderr);
+        return AssetResult::Ready;
+    } catch (const PreparationCancelled&) {
+        std::error_code error;
+        if (!staging.empty()) std::filesystem::remove_all(staging, error);
+        return AssetResult::Cancelled;
     } catch (const std::exception& exception) {
         std::error_code error;
-        std::filesystem::remove_all(staging, error);
-        std::fprintf(
-            stderr,
-            "BUMBLE_FIRST_RUN stage=assets_failed reason=%s\n",
-            exception.what()
-        );
+        if (!staging.empty()) std::filesystem::remove_all(staging, error);
+        std::fprintf(stderr, "BUMBLE_FIRST_RUN stage=assets_failed reason=%s\n", exception.what());
         std::fflush(stderr);
-        return false;
+        return AssetResult::Failed;
     }
 }

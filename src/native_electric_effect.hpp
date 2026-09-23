@@ -28,6 +28,9 @@ namespace bumble::electric_effect {
     );
 
     bool extended_gbi_required();
+    void release_actor(uint32_t actor);
+    void reset_scene();
+    bool validate_actor_lifetime();
 
     void set_diagnostics_enabled(bool enabled);
 }

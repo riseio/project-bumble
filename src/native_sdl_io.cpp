@@ -4571,6 +4571,14 @@ void apply_game_controller(
     snapshot.y = -normalize_axis(
         SDL_GameControllerGetAxis(controller, movement_y_axis)
     );
+    if (bumble::modern_controls::menu_navigation_active()) {
+        bumble::input_bindings::apply_menu_dpad(snapshot.x, snapshot.y,
+            SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0,
+            SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0,
+            SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0,
+            SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0,
+            true);
+    }
     if (!modern_gameplay) {
         constexpr float kLegacyDirectionalThreshold = 0.5f;
         if (snapshot.y > kLegacyDirectionalThreshold) {
@@ -4939,7 +4947,6 @@ void bumble::native_io::add_mouse_wheel_delta(int delta) {
     const auto binding = input_bindings::mouse_binding(delta > 0
         ? input_bindings::MouseButton::WheelUp
         : input_bindings::MouseButton::WheelDown);
-    // Binding capture consumes wheel input.
     if (input_bindings::process_keyboard_capture(binding, true,
             physical_keyboard_mouse_neutral())) return;
     if (!modern_controls::gameplay_input_active() ||

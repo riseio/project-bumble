@@ -14,17 +14,21 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <stdexcept>
+#include <vector>
 
 #include "librecomp/addresses.hpp"
 #include "native_campaign_levels.hpp"
 #include "native_checkpoint_bridge.hpp"
 #include "native_combat_feedback.hpp"
+#include "native_electric_effect.hpp"
 #include "native_gameplay_options.hpp"
 #include "native_graphics_options.hpp"
 #include "native_input_bindings.hpp"
 #include "native_visible_ui_state.hpp"
 #include "native_weapon_system.hpp"
 #include "common/rt64_performance_profiler.h"
+#include "common/rt64_bumble_ui.h"
 
 namespace {
 
@@ -170,7 +174,7 @@ constexpr uint32_t kWeaponCarouselStateBase = 0x800F5E48u;
 constexpr uint32_t kWeaponCarouselLeftBase = 0x800F5E60u;
 constexpr uint32_t kWeaponCarouselMiddleBase = 0x800F5E68u;
 constexpr uint32_t kWeaponCarouselRightBase = 0x800F5E70u;
-constexpr uint32_t kGameplayLeftStackX = 32u;
+constexpr uint32_t kGameplayLeftStackX = RT64::BumbleUI::LeftStackX;
 constexpr uint32_t kGameplayBonusDestinationY = 6u;
 constexpr uint32_t kGameplayScoreDestinationY = 22u;
 constexpr uint32_t kGameplayBonusValue = 0x800E9648u;
@@ -220,6 +224,11 @@ constexpr uint32_t kExtendedOpcode = 0x64u;
 constexpr uint32_t kSetRdramExtendedV1 = 0x00002Cu;
 constexpr uint32_t kMatrixGroupV1 = 0x00000Cu;
 constexpr uint32_t kPopMatrixGroupV1 = 0x00000Du;
+thread_local bool g_world_camera_scope_open = false;
+std::atomic_uint32_t g_world_camera_generation{0};
+std::atomic_uint32_t g_script_camera_record{0};
+thread_local uint32_t g_world_camera_phase = UINT32_MAX;
+thread_local uint32_t g_world_camera_level = UINT32_MAX;
 constexpr uint32_t kSetScissorV1 = 0x000005u;
 constexpr uint32_t kSetRectAlignV1 = 0x000006u;
 constexpr uint32_t kSetViewportAlignV1 = 0x000007u;
@@ -417,6 +426,44 @@ struct TerrainScratchState {
 thread_local TerrainScratchState g_terrain_scratch{};
 thread_local bool g_static_terrain_matrix_scope_open = false;
 thread_local bool g_actor_matrix_scope_open = false;
+thread_local uint32_t g_actor_matrix_owner = 0;
+thread_local uint32_t g_model_role = 0;
+thread_local bool g_model_part_scope_open = false;
+struct ModelPartHistory {
+    std::array<uint32_t, 4> key{};
+    uint32_t id = 0;
+};
+struct ActorHistory {
+    uint32_t address = 0;
+    uint16_t serial = 0;
+    uint32_t id = 0;
+    std::vector<ModelPartHistory> parts;
+};
+std::array<ActorHistory, 512> g_actor_history{};
+std::mutex g_actor_history_mutex;
+uint32_t g_next_actor_id = 0x10000000u;
+
+uint32_t allocate_actor_id() {
+    if (g_next_actor_id == 0x40000000u) {
+        throw std::runtime_error("Actor temporal identity exhausted");
+    }
+    return g_next_actor_id++;
+}
+
+uint32_t actor_history_id(uint8_t* rdram, uint32_t actor) {
+    const uint16_t serial = MEM_HU(0x7E, static_cast<int32_t>(actor));
+    const uint32_t slot = serial & 0x1FFu;
+    const int32_t entry = static_cast<int32_t>(0x800E2408u + slot * 8u);
+    if (static_cast<uint32_t>(MEM_W(4, entry)) != actor || MEM_HU(0, entry) != serial) {
+        throw std::runtime_error("Actor registration does not own draw");
+    }
+    std::lock_guard lock(g_actor_history_mutex);
+    auto& history = g_actor_history[slot];
+    if (history.address != actor || history.serial != serial || history.id == 0) {
+        history = {actor, serial, allocate_actor_id()};
+    }
+    return history.id;
+}
 std::mutex g_terrain_scratch_allocation_mutex;
 thread_local std::array<UiScope, kUiScopeCapacity> g_ui_scopes{};
 thread_local size_t g_ui_scope_depth = 0;
@@ -638,6 +685,12 @@ std::string campaign_grid_name(
 }
 
 bool wide_single_player_world_enabled(uint8_t* rdram) {
+    return bumble::widescreen::horizontal_expansion_scale() > 1.000001 &&
+        rdram != nullptr && read_u32(rdram, kFrontendState + kFrontendWorldActiveOffset) != 0u &&
+        read_u32(rdram, kFrontendState + kFrontendPlayerLayoutOffset) == kSinglePlayerLayout;
+}
+
+bool single_player_ui_enabled(uint8_t* rdram) {
     if (!bumble::widescreen::extended_ui_enabled() || rdram == nullptr) {
         return false;
     }
@@ -1076,7 +1129,8 @@ bool display_list_budget_available(
         }
     }
 
-    const uint32_t native_end = arena_end - kDisplayListFinalCommandReserve;
+    const uint32_t native_end = arena_end - kDisplayListFinalCommandReserve -
+        (g_world_camera_scope_open ? 8u : 0u);
     const bool available = cursor >= arena_start && cursor <= native_end &&
         bytes <= native_end - cursor;
     if (available) {
@@ -1174,6 +1228,7 @@ void close_actor_matrix_scope(uint8_t* rdram) {
         extended_command(kPopMatrixGroupV1), 1u,
     });
     g_actor_matrix_scope_open = false;
+    g_actor_matrix_owner = 0;
 }
 
 uint32_t pack_s16_pair(int32_t high, int32_t low) {
@@ -2117,6 +2172,37 @@ void pop_guest_draw_suppression(
 
 } // namespace
 
+void bumble::widescreen::invalidate_world_camera_history() {
+    g_script_camera_record.store(0, std::memory_order_relaxed);
+    g_world_camera_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+void bumble::widescreen::invalidate_scene_history() {
+    invalidate_world_camera_history();
+    bumble::electric_effect::reset_scene();
+    std::lock_guard lock(g_actor_history_mutex);
+    g_actor_history = {};
+}
+
+extern "C" void bumble_invalidate_world_camera_history(uint8_t*, recomp_context*) {
+    bumble::widescreen::invalidate_world_camera_history();
+}
+
+extern "C" void bumble_publish_script_camera_history(uint8_t*, recomp_context* context) {
+    const uint32_t record = static_cast<uint32_t>(context->r16);
+    if (g_script_camera_record.exchange(record, std::memory_order_relaxed) != record) {
+        g_world_camera_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+extern "C" void bumble_end_world_camera_scope(uint8_t* rdram, recomp_context*) noexcept(false) {
+    if (!g_world_camera_scope_open) return;
+    g_world_camera_scope_open = false;
+    if (!append_commands(rdram, {extended_command(kPopMatrixGroupV1), 0x101u})) {
+        throw std::runtime_error("World camera matrix scope overflow");
+    }
+}
+
 void bumble::widescreen::publish_render_size(
     uint32_t width,
     uint32_t height,
@@ -2266,7 +2352,8 @@ bool bumble::widescreen::visibility_expansion_enabled() {
 }
 
 bool bumble::widescreen::extended_ui_enabled() {
-    return horizontal_expansion_scale() > 1.000001;
+    const uint64_t size = g_render_size.load(std::memory_order_acquire);
+    return uint32_t(size >> 32) != 0 && uint32_t(size) != 0;
 }
 
 uint32_t bumble::widescreen::display_list_frame_base() {
@@ -2708,7 +2795,7 @@ extern "C" void bumble_configure_single_player_color_clear(
 extern "C" void bumble_configure_single_player_world_aperture(
     uint8_t* rdram,
     recomp_context* context
-) {
+) noexcept(false) {
     if (rdram == nullptr || context == nullptr) {
         return;
     }
@@ -2726,6 +2813,25 @@ extern "C" void bumble_configure_single_player_world_aperture(
 
     const bool visibility_requested =
         bumble::widescreen::visibility_expansion_enabled();
+    if (exact_commands) {
+        if (g_world_camera_scope_open || !current_display_list_budget_available(rdram, 24u)) {
+            throw std::runtime_error("Invalid world camera matrix scope");
+        }
+        constexpr uint32_t CameraInterpolation = 1u | (1u << 1u) |
+            (1u << 3u) | (1u << 5u) | (1u << 7u) | (1u << 9u) | (1u << 11u);
+        const uint32_t phase = read_u32(rdram, kFrontendObject + kFrontendCurrentPhaseOffset);
+        const uint32_t level = read_u32(rdram, kFrontendObject + 0x10u);
+        if (phase != g_world_camera_phase || level != g_world_camera_level) {
+            bumble::widescreen::invalidate_scene_history();
+            g_world_camera_phase = phase;
+            g_world_camera_level = level;
+        }
+        const uint32_t cameraId = 0x40000000u |
+            (g_world_camera_generation.load(std::memory_order_relaxed) & 0x3FFFFFFFu);
+        g_world_camera_scope_open = append_commands(rdram, {
+            extended_command(kMatrixGroupV1), cameraId, CameraInterpolation, 0u
+        });
+    }
     const float authored_far = context->f0.fl;
     const float fog_scale = std::clamp(
         bumble::widescreen::fog_scale(),
@@ -2787,7 +2893,7 @@ extern "C" void bumble_configure_single_player_world_aperture(
         std::fflush(stderr);
     }
 
-    const bool wide_requested = bumble::widescreen::extended_ui_enabled();
+    const bool wide_requested = bumble::widescreen::horizontal_expansion_scale() > 1.000001;
     const bool expand = wide_requested && exact_commands;
     write_world_viewport(
         rdram,
@@ -3747,17 +3853,81 @@ extern "C" void bumble_begin_actor_matrix_group(
     constexpr uint32_t AutoPerspective = 2u << 11u;
     constexpr uint32_t AutoVertex = 2u << 13u;
     constexpr uint32_t AutoTile = 2u << 15u;
-    constexpr uint32_t AutoOrdering = 1u << 17u;
     constexpr uint32_t AutoLookAt = 2u << 24u;
+    constexpr uint32_t AutoTexcoord = 2u << 22u;
     constexpr uint32_t ActorInterpolation =
         Push | Decompose | AutoPosition | AutoRotation | AutoScale |
-        AutoSkew | AutoPerspective | AutoVertex | AutoTile | AutoOrdering |
-        AutoLookAt;
+        AutoSkew | AutoPerspective | AutoVertex | AutoTile |
+        AutoLookAt | AutoTexcoord;
 
     g_actor_matrix_scope_open = append_commands(rdram, {
-        extended_command(kMatrixGroupV1), actor,
+        extended_command(kMatrixGroupV1), actor_history_id(rdram, actor),
         ActorInterpolation, 0u,
     });
+    if (g_actor_matrix_scope_open) g_actor_matrix_owner = actor;
+}
+
+extern "C" void bumble_register_actor_history(uint8_t* rdram, recomp_context* context) {
+    const uint32_t actor = static_cast<uint32_t>(context->r5);
+    const uint16_t serial = MEM_HU(0x7E, static_cast<int32_t>(actor));
+    std::lock_guard lock(g_actor_history_mutex);
+    g_actor_history[serial & 0x1FFu] = {actor, serial, allocate_actor_id()};
+}
+
+extern "C" void bumble_unregister_actor_history(uint8_t* rdram, recomp_context* context) {
+    const uint32_t actor = static_cast<uint32_t>(context->r5);
+    bumble::electric_effect::release_actor(actor);
+    const uint16_t serial = MEM_HU(0x7E, static_cast<int32_t>(actor));
+    std::lock_guard lock(g_actor_history_mutex);
+    auto& history = g_actor_history[serial & 0x1FFu];
+    if (history.address == actor && history.serial == serial) history = {};
+}
+
+extern "C" void bumble_set_model_role(uint32_t role) {
+    g_model_role = role;
+}
+
+extern "C" void bumble_end_model_part(uint8_t* rdram) noexcept(false) {
+    if (g_model_part_scope_open) {
+        if (!append_commands(rdram, {extended_command(kPopMatrixGroupV1), 1u})) {
+            throw std::runtime_error("Model part matrix scope overflow");
+        }
+        g_model_part_scope_open = false;
+    }
+}
+
+extern "C" void bumble_begin_model_part(uint8_t* rdram, recomp_context* context) noexcept(false) {
+    if (!g_actor_matrix_scope_open) return;
+    if (g_model_part_scope_open || !current_display_list_budget_available(rdram, 48u)) {
+        throw std::runtime_error("Invalid model part matrix scope");
+    }
+    const uint32_t model = static_cast<uint32_t>(context->r19);
+    const uint32_t child = static_cast<uint32_t>(context->r17);
+    const uint32_t displayLists = read_u32(rdram, model);
+    const std::array<uint32_t, 4> key{g_model_role, model, child,
+        read_u32(rdram, displayLists + child * 4u)};
+    const uint16_t serial = MEM_HU(0x7E, static_cast<int32_t>(g_actor_matrix_owner));
+    uint32_t id = 0;
+    {
+        std::lock_guard lock(g_actor_history_mutex);
+        auto& history = g_actor_history[serial & 0x1FFu];
+        if (history.address != g_actor_matrix_owner || history.serial != serial) {
+            throw std::runtime_error("Model part outlived actor registration");
+        }
+        auto part = std::find_if(history.parts.begin(), history.parts.end(),
+            [&](const auto& candidate) { return candidate.key == key; });
+        if (part == history.parts.end()) {
+            history.parts.push_back({key, allocate_actor_id()});
+            id = history.parts.back().id;
+        }
+        else id = part->id;
+    }
+    constexpr uint32_t PartInterpolation = 1u | (1u << 2u) |
+        (2u << 3u) | (2u << 5u) | (2u << 7u) | (2u << 9u) |
+        (2u << 11u) | (2u << 13u) | (2u << 15u) |
+        (2u << 22u) | (2u << 24u);
+    g_model_part_scope_open = append_commands(rdram, {
+        extended_command(kMatrixGroupV1), id, PartInterpolation, 0u});
 }
 
 extern "C" void bumble_end_actor_matrix_group(uint8_t* rdram) {
@@ -3904,7 +4074,7 @@ extern "C" void bumble_ui_begin_texrect(
         "func_800AE344",
         x,
         0,
-        wide_single_player_world_enabled(rdram)
+        single_player_ui_enabled(rdram)
     );
 }
 
@@ -4406,7 +4576,7 @@ extern "C" void bumble_ui_begin_text(
         "func_800AE9AC",
         alignment,
         pixel_x,
-        wide_single_player_world_enabled(rdram) ||
+        single_player_ui_enabled(rdram) ||
             compact_frontend_menu,
         compact_frontend_menu
             ? compact_frontend_menu_vertical_anchor(rdram)
@@ -4486,7 +4656,7 @@ extern "C" void bumble_ui_begin_sprite_rect(
             "func_800A6824",
             x,
             width,
-            wide_single_player_world_enabled(rdram)
+            single_player_ui_enabled(rdram)
         );
     }
     g_sprite_rect_scopes[g_sprite_rect_depth] = scope_opened;
@@ -4541,7 +4711,7 @@ extern "C" void bumble_ui_begin_hud_rect_batch(
         "BONUS: %" PRId32,
         bonus_value
     );
-    if (wide_single_player_world_enabled(rdram) &&
+    if (single_player_ui_enabled(rdram) &&
         read_guest_word(rdram, kDisplayListCursor, saved_cursor) &&
         bumble::text_overlay::observe(
             bumble::text_overlay::TextKind::GameplayHud,
@@ -4563,7 +4733,7 @@ extern "C" void bumble_ui_begin_hud_rect_batch(
         kGameplayBonusScopeOwner,
         static_cast<int16_t>(context->r4),
         0,
-        wide_single_player_world_enabled(rdram)
+        single_player_ui_enabled(rdram)
     );
 }
 
@@ -4591,7 +4761,7 @@ extern "C" void bumble_ui_begin_gameplay_hud_root(
 ) {
     append_commands(rdram, {extended_command(kHudBeginV1), 0u});
 
-    if (!wide_single_player_world_enabled(rdram) ||
+    if (!single_player_ui_enabled(rdram) ||
         g_gameplay_hud_root_scope_open ||
         g_ui_scope_depth >= g_ui_scopes.size()) {
         return;
@@ -4704,7 +4874,7 @@ extern "C" void bumble_ui_begin_gameplay_weapon_neighbor(
     recomp_context*
 ) {
     if (!g_gameplay_weapon_model_scope_open ||
-        !wide_single_player_world_enabled(rdram) ||
+        !single_player_ui_enabled(rdram) ||
         g_gameplay_weapon_neighbor_suppression.active) {
         return;
     }
@@ -4735,7 +4905,7 @@ extern "C" void bumble_ui_begin_gameplay_key_group(
     uint8_t* rdram,
     recomp_context*
 ) {
-    if (!wide_single_player_world_enabled(rdram) ||
+    if (!single_player_ui_enabled(rdram) ||
         g_gameplay_key_scope_open ||
         g_ui_scope_depth >= g_ui_scopes.size()) {
         return;
@@ -4797,7 +4967,7 @@ extern "C" void bumble_ui_begin_gameplay_lives(
     uint8_t* rdram,
     recomp_context*
 ) {
-    if (!wide_single_player_world_enabled(rdram) ||
+    if (!single_player_ui_enabled(rdram) ||
         !bumble::text_overlay::renderer_ready() ||
         g_gameplay_lives_hidden) {
         return;
@@ -4892,7 +5062,7 @@ extern "C" void bumble_ui_begin_gameplay_status_bar(
     uint8_t* rdram,
     recomp_context*
 ) {
-    if (wide_single_player_world_enabled(rdram) &&
+    if (single_player_ui_enabled(rdram) &&
         bumble::graphics_options::honeycomb_health_enabled() &&
         bumble::text_overlay::renderer_ready()) {
         const float current_health = read_f32(rdram, kPlayerHealthAddress);
@@ -4971,7 +5141,7 @@ extern "C" void bumble_ui_begin_gameplay_text(
         g_gameplay_text_suppression_overflow_depth
     );
     if (suppression == nullptr || context == nullptr ||
-        !wide_single_player_world_enabled(rdram) ||
+        !single_player_ui_enabled(rdram) ||
         g_script_native_text_active || g_briefing_native_line_active) {
         return;
     }
@@ -5047,7 +5217,7 @@ extern "C" void bumble_ui_begin_gameplay_number(
         g_gameplay_number_suppression_overflow_depth
     );
     if (suppression == nullptr || context == nullptr ||
-        !wide_single_player_world_enabled(rdram) ||
+        !single_player_ui_enabled(rdram) ||
         g_gameplay_lives_hidden || g_gameplay_timer_suppression.active) {
         return;
     }
@@ -5099,7 +5269,7 @@ extern "C" void bumble_ui_begin_gameplay_timer(
     recomp_context* context
 ) {
     g_gameplay_timer_suppression = {};
-    if (context == nullptr || !wide_single_player_world_enabled(rdram)) {
+    if (context == nullptr || !single_player_ui_enabled(rdram)) {
         return;
     }
 
@@ -5183,7 +5353,7 @@ extern "C" void bumble_ui_begin_text_line(
         "func_800B9748",
         alignment,
         pixel_x,
-        wide_single_player_world_enabled(rdram) ||
+        single_player_ui_enabled(rdram) ||
             compact_frontend_menu,
         compact_frontend_menu
             ? compact_frontend_menu_vertical_anchor(rdram)
@@ -5699,7 +5869,7 @@ extern "C" void bumble_ui_begin_direct_text(
         "func_800B8180",
         alignment,
         pixel_x,
-        wide_single_player_world_enabled(rdram) ||
+        single_player_ui_enabled(rdram) ||
             compact_frontend_menu,
         compact_frontend_menu
             ? compact_frontend_menu_vertical_anchor(rdram)

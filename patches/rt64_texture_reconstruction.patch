@@ -1,0 +1,457 @@
+diff --git a/src/common/rt64_replacement_database.h b/src/common/rt64_replacement_database.h
+index 3f74ea2..a1e0fa6 100644
+--- a/src/common/rt64_replacement_database.h
++++ b/src/common/rt64_replacement_database.h
+@@ -73,6 +73,7 @@ namespace RT64 {
+         ReplacementHashes hashes;
+         ReplacementOperation operation = ReplacementOperation::Auto;
+         ReplacementShift shift = ReplacementShift::Auto;
++        bool preserveOriginalAlpha = false;
+ 
+         bool isEmpty() const {
+             return hashes.rt64.empty();
+@@ -99,6 +100,7 @@ namespace RT64 {
+         ReplacementOperation originalOperation = ReplacementOperation::Auto;
+         ReplacementShift resolvedShift = ReplacementShift::Auto;
+         ReplacementShift originalShift = ReplacementShift::Auto;
++        bool preserveOriginalAlpha = false;
+     };
+ 
+     struct ReplacementMipmapCacheHeader {
+@@ -150,4 +152,4 @@ namespace RT64 {
+     extern void from_json(const json &j, ReplacementShiftFilter &shiftFilter);
+     extern void to_json(json &j, const ReplacementDatabase &db);
+     extern void from_json(const json &j, ReplacementDatabase &db);
+-};
+\ No newline at end of file
++};
+diff --git a/src/common/rt64_replacement_database.cpp b/src/common/rt64_replacement_database.cpp
+index 9f331c9..bae875d 100644
+--- a/src/common/rt64_replacement_database.cpp
++++ b/src/common/rt64_replacement_database.cpp
+@@ -172,7 +172,7 @@ namespace RT64 {
+             }
+         }
+ 
+-        auto addResolvedPath = [&](uint64_t hash, const std::string &relativePath, ReplacementOperation operation, ReplacementShift shift) {
++        auto addResolvedPath = [&](uint64_t hash, const std::string &relativePath, ReplacementOperation operation, ReplacementShift shift, bool preserveOriginalAlpha = false) {
+             // Do not modify the entry if it's already in the map.
+             if (resolvedPathMap.find(hash) != resolvedPathMap.end()) {
+                 return;
+@@ -184,6 +184,7 @@ namespace RT64 {
+             resolvedPath.relativePath = relativePath;
+             resolvedPath.originalOperation = operation;
+             resolvedPath.originalShift = shift;
++            resolvedPath.preserveOriginalAlpha = preserveOriginalAlpha;
+             resolvedPath.resolvedOperation = resolveOperation(relativePath, operation);
+             resolvedPath.resolvedShift = resolveShift(relativePath, shift);
+ 
+@@ -208,7 +209,7 @@ namespace RT64 {
+                     if (!canonicalPath.empty() && fileSystem->exists(canonicalPath)) {
+                         if (!onlyDDS || (i == 0)) {
+                             std::string relativePathFinal = FileSystem::toForwardSlashes(canonicalPath);
+-                            addResolvedPath(hashRT64, relativePathFinal, texture.operation, texture.shift);
++                            addResolvedPath(hashRT64, relativePathFinal, texture.operation, texture.shift, texture.preserveOriginalAlpha);
+                         }
+ 
+                         fileExists = true;
+@@ -234,7 +235,7 @@ namespace RT64 {
+                 auto it = autoPathMap.find(searchString);
+                 if (it != autoPathMap.end()) {
+                     uint64_t hashRT64 = ReplacementDatabase::stringToHash(texture.hashes.rt64);
+-                    addResolvedPath(hashRT64, it->second, texture.operation, texture.shift);
++                    addResolvedPath(hashRT64, it->second, texture.operation, texture.shift, texture.preserveOriginalAlpha);
+                 }
+             }
+ 
+@@ -355,6 +356,7 @@ namespace RT64 {
+         if (texture.shift != defaultTexture.shift) {
+             j["shift"] = texture.shift;
+         }
++        if (texture.preserveOriginalAlpha) j["preserveOriginalAlpha"] = true;
+     }
+ 
+     void from_json(const json &j, ReplacementTexture &texture) {
+@@ -363,6 +365,7 @@ namespace RT64 {
+         texture.hashes = j.value("hashes", defaultTexture.hashes);
+         texture.operation = j.value("operation", defaultTexture.operation);
+         texture.shift = j.value("shift", defaultTexture.shift);
++        texture.preserveOriginalAlpha = j.value("preserveOriginalAlpha", false);
+     }
+ 
+     void to_json(json &j, const ReplacementOperationFilter &operationFilter) {
+@@ -407,4 +410,4 @@ namespace RT64 {
+         // Update configuration version to the latest one after parsing is over.
+         db.config.configurationVersion = defaultConfig.configurationVersion;
+     }
+-};
+\ No newline at end of file
++};
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -58,6 +58,7 @@
+     struct ReplacementDirectory {
+         std::filesystem::path dirOrZipPath;
+         std::string zipBasePath; // Only applies to Zip.
++        bool enabled = true;
+ 
+         ReplacementDirectory(const std::filesystem::path &dirOrZipPath, const std::string &zipBasePath = "") {
+             this->dirOrZipPath = dirOrZipPath;
+@@ -117,6 +118,7 @@
+         Texture *texture = nullptr;
+         ReplacementShift shift = ReplacementShift::None;
+         bool referenceCounted = false;
++        bool preserveOriginalAlpha = false;
+     };
+ 
+     struct TextureMap {
+@@ -131,6 +133,7 @@
+         std::vector<interop::float3> cachedTextureReplacementDimensions;
+         std::vector<bool> textureReplacementShiftedByHalf;
+         std::vector<bool> textureReplacementReferenceCounted;
++        std::vector<bool> textureReplacementPreserveOriginalAlpha;
+         std::vector<interop::float2> textureScales;
+         std::vector<uint64_t> hashes;
+         std::vector<uint32_t> freeSpaces;
+@@ -149,7 +152,7 @@
+         ~TextureMap();
+         void clearReplacements();
+         void add(uint64_t hash, uint64_t creationFrame, Texture *texture);
+-        void replace(uint64_t hash, Texture *texture, bool shiftedByHalf, bool referenceCounted);
++        void replace(uint64_t hash, Texture *texture, bool shiftedByHalf, bool referenceCounted, bool preserveOriginalAlpha = false);
+         bool use(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf);
+         bool evict(uint64_t submissionFrame, std::vector<uint64_t> &evictedHashes);
+         void incrementLock();
+@@ -217,6 +220,9 @@
+         std::vector<TextureUpload> uploadQueue;
+         std::vector<ReplacementResolvedPath> resolvedPathQueue;
+         std::vector<StreamResult> streamResultQueue;
++        std::vector<bool> directorySelectionQueue;
++        bool directorySelectionInFlight = false;
++        bool uploadBatchInFlight = false;
+         std::vector<std::unique_ptr<RenderBuffer>> tmemUploadResources;
+         std::vector<std::unique_ptr<RenderBuffer>> replacementUploadResources;
+         std::vector<std::unique_ptr<TextureDecodeDescriptorSet>> descriptorSets;
+@@ -261,6 +267,7 @@
+         void reloadReplacements(bool clearQueue, uint64_t exclusiveDbHash = 0);
+         bool loadReplacementDirectory(const ReplacementDirectory &replacementDirectory);
+         bool loadReplacementDirectories(const std::vector<ReplacementDirectory> &replacementDirectories);
++        bool queueReplacementDirectorySelection(const std::vector<bool> &enabled);
+         bool saveReplacementDatabase();
+         void setReplacementDefaultShift(ReplacementShift shift);
+         void setReplacementDefaultOperation(ReplacementOperation shift);
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -208,9 +208,11 @@
+     void TextureMap::clearReplacements() {
+         for (size_t i = 0; i < textureReplacements.size(); i++) {
+             if (textureReplacements[i] != nullptr) {
++                if (textureReplacementReferenceCounted[i]) replacementMap.decrementReference(textureReplacements[i]);
+                 textureReplacements[i] = nullptr;
+                 textureReplacementShiftedByHalf[i] = false;
+                 textureReplacementReferenceCounted[i] = false;
++                textureReplacementPreserveOriginalAlpha[i] = false;
+                 versions[i]++;
+             }
+         }
+@@ -235,6 +237,7 @@
+             cachedTextureReplacementDimensions.emplace_back();
+             textureReplacementShiftedByHalf.emplace_back(false);
+             textureReplacementReferenceCounted.emplace_back(false);
++            textureReplacementPreserveOriginalAlpha.emplace_back(false);
+             textureScales.push_back(IdentityScale);
+             hashes.push_back(0);
+             versions.push_back(0);
+@@ -248,6 +251,7 @@
+         textureReplacements[textureIndex] = nullptr;
+         textureReplacementShiftedByHalf[textureIndex] = false;
+         textureReplacementReferenceCounted[textureIndex] = false;
++        textureReplacementPreserveOriginalAlpha[textureIndex] = false;
+         textureScales[textureIndex] = IdentityScale;
+         hashes[textureIndex] = hash;
+         versions[textureIndex]++;
+@@ -259,7 +263,7 @@
+         listIterators[textureIndex] = accessList.begin();
+     }
+ 
+-    void TextureMap::replace(uint64_t hash, Texture *texture, bool shiftedByHalf, bool referenceCounted) {
++    void TextureMap::replace(uint64_t hash, Texture *texture, bool shiftedByHalf, bool referenceCounted, bool preserveOriginalAlpha) {
+         const auto it = hashMap.find(hash);
+         if (it == hashMap.end()) {
+             return;
+@@ -270,6 +274,7 @@
+         if (texture == textureReplacements[it->second]) {
+             // The exception is that the shifting mode can be changed in real-time by the user while editing, so we update it regardless.
+             textureReplacementShiftedByHalf[it->second] = shiftedByHalf;
++            textureReplacementPreserveOriginalAlpha[it->second] = preserveOriginalAlpha;
+             return;
+         }
+ 
+@@ -282,6 +287,7 @@
+         textureReplacements[it->second] = texture;
+         textureReplacementShiftedByHalf[it->second] = shiftedByHalf;
+         textureReplacementReferenceCounted[it->second] = referenceCounted;
++        textureReplacementPreserveOriginalAlpha[it->second] = preserveOriginalAlpha;
+         textureScales[it->second] = { float(texture->width) / float(replacedTexture->width), float(texture->height) / float(replacedTexture->height) };
+         cachedTextureReplacementDimensions[it->second] = interop::float3(float(texture->width), float(texture->height), float(texture->mipmaps));
+         versions[it->second]++;
+@@ -1203,12 +1209,14 @@
+         std::vector<StreamResult> streamResultQueueCopy;
+         std::vector<TextureMapAddition> textureMapAdditions;
+         std::vector<ReplacementMapAddition> replacementMapAdditions;
++        std::vector<bool> directorySelection;
+         std::vector<RenderTextureBarrier> beforeCopyBarriers;
+         std::vector<RenderTextureBarrier> beforeDecodeBarriers;
+         std::vector<RenderTextureBarrier> afterDecodeBarriers;
+         std::vector<uint8_t> replacementBytes;
+ 
+         while (uploadThreadRunning) {
++            directorySelection.clear();
+             resolvedPathQueueCopy.clear();
+             streamResultQueueCopy.clear();
+             beforeCopyBarriers.clear();
+@@ -1219,7 +1227,7 @@
+             {
+                 std::unique_lock queueLock(uploadQueueMutex);
+                 uploadQueueChanged.wait(queueLock, [this]() {
+-                    return !uploadThreadRunning || !uploadQueue.empty() || !resolvedPathQueue.empty() || !streamResultQueue.empty();
++                    return !uploadThreadRunning || !uploadQueue.empty() || !resolvedPathQueue.empty() || !streamResultQueue.empty() || !directorySelectionQueue.empty();
+                 });
+ 
+                 if (!uploadQueue.empty()) {
+@@ -1235,6 +1243,36 @@
+                     streamResultQueueCopy.insert(streamResultQueueCopy.end(), streamResultQueue.begin(), streamResultQueue.end());
+                     streamResultQueue.clear();
+                 }
++                directorySelection.swap(directorySelectionQueue);
++                directorySelectionInFlight = !directorySelection.empty();
++                uploadBatchInFlight = true;
++            }
++
++            if (!directorySelection.empty()) {
++                std::unique_lock lock(textureMapMutex);
++                auto &map = textureMap.replacementMap;
++                for (size_t i = 0; i < directorySelection.size(); ++i)
++                    map.replacementDirectories[i].enabled = directorySelection[i];
++                resolvedPathQueueCopy.clear();
++                for (auto &paths : map.fileSystemStreamResolvedPaths) paths.clear();
++                {
++                    std::unique_lock streamLock(streamDescStackMutex);
++                    std::stack<StreamDescription> retained;
++                    while (!streamDescStack.empty()) {
++                        auto entry = streamDescStack.top();
++                        streamDescStack.pop();
++                        if (entry.fromPreload || map.replacementDirectories[entry.fileSystemIndex].enabled)
++                            retained.push(entry);
++                        else map.fileSystemStreamSets[entry.fileSystemIndex].erase(entry.relativePath);
++                    }
++                    while (!retained.empty()) { streamDescStack.push(retained.top()); retained.pop(); }
++                }
++                textureMap.clearReplacements();
++                for (size_t i = 0; i < textureMap.textures.size(); ++i) {
++                    Texture *texture = textureMap.textures[i];
++                    if (texture) addResolvedPaths(textureMap.hashes[i], texture->width, texture->height,
++                        texture->tlut, texture->loadTile, texture->bytesTMEM, texture->decodeTMEM, resolvedPathQueueCopy);
++                }
+             }
+             
+             if (!streamResultQueueCopy.empty()) {
+@@ -1422,7 +1460,7 @@
+                     if (replacementTexture != nullptr) {
+                         // We don't use reference counting on preloaded textures or low mip cache versions, as they're permanently allocated in memory.
+                         bool referenceCounted = (resolvedPath.resolvedOperation != ReplacementOperation::Preload) && (replacementTexture != lowMipCacheTexture);
+-                        replacementMapAdditions.emplace_back(ReplacementMapAddition{ resolvedPath.textureHash, replacementTexture, resolvedPath.resolvedShift, referenceCounted });
++                        replacementMapAdditions.emplace_back(ReplacementMapAddition{ resolvedPath.textureHash, replacementTexture, resolvedPath.resolvedShift, referenceCounted, resolvedPath.preserveOriginalAlpha });
+                     }
+                 }
+                 
+@@ -1513,7 +1551,7 @@
+                     }
+ 
+                     for (const ReplacementMapAddition &addition : replacementMapAdditions) {
+-                        textureMap.replace(addition.hash, addition.texture, addition.shift == ReplacementShift::Half, addition.referenceCounted);
++                        textureMap.replace(addition.hash, addition.texture, addition.shift == ReplacementShift::Half, addition.referenceCounted, addition.preserveOriginalAlpha);
+                     }
+ 
+                     textureMap.replacementMap.evict(textureMap.evictedTextures);
+@@ -1533,6 +1571,12 @@
+                 directWorker->wait();
+                 replacementUploadResources.clear();
+             }
++            {
++                std::unique_lock queueLock(uploadQueueMutex);
++                directorySelectionInFlight = false;
++                uploadBatchInFlight = false;
++            }
++            uploadQueueFinished.notify_all();
+         }
+     }
+ 
+@@ -1570,7 +1614,7 @@
+         std::unique_lock queueLock(uploadQueueMutex);
+         const uint64_t queuedUploads = uploadQueue.size();
+         uploadQueueFinished.wait(queueLock, [this]() {
+-            return uploadQueue.empty();
++            return uploadQueue.empty() && directorySelectionQueue.empty() && !directorySelectionInFlight;
+         });
+         queueLock.unlock();
+         PerformanceProfiler::recordDuration(
+@@ -1596,6 +1640,7 @@
+         }
+ 
+         for (int32_t i = int32_t(textureMap.replacementMap.fileSystemResolvedPaths.size()) - 1; i >= 0; i--) {
++            if (!textureMap.replacementMap.replacementDirectories[i].enabled) continue;
+             const auto &fsResolvedPaths = textureMap.replacementMap.fileSystemResolvedPaths[i];
+             uint32_t hashVersion = textureMap.replacementMap.fileSystemHashVersions[i];
+             if ((exclusiveDbHash == 0) || (exclusiveDbHash == hashes[hashVersion])) {
+@@ -1603,6 +1648,7 @@
+                 if (it != fsResolvedPaths.end()) {
+                     // Stop searching for replacements as soon as we find one.
+                     resolvedPaths.emplace_back(it->second);
++                    resolvedPaths.back().textureHash = hash;
+                     break;
+                 }
+             }
+@@ -1671,6 +1717,7 @@
+         ReplacementOperation resolvedOperation = replacementDb.resolveOperation(replacement.path, replacement.operation);
+         ReplacementShift resolvedShift = replacementDb.resolveShift(replacement.path, replacement.shift);
+         ReplacementResolvedPath resolvedPath = { 0, hash, relativePathForward, resolvedOperation, replacement.operation, resolvedShift, replacement.shift };
++        resolvedPath.preserveOriginalAlpha = replacement.preserveOriginalAlpha;
+         textureMap.replacementMap.fileSystemResolvedPaths[0][hash] = resolvedPath;
+ 
+         uploadQueueMutex.lock();
+@@ -1704,8 +1751,21 @@
+     }
+ 
+     void TextureCache::clearReplacementDirectories() {
+-        // Wait for the streaming threads to be finished.
+-        waitForAllStreamThreads(true);
++        // Remount only after both producers have stopped using the old bank.
++        for (;;) {
++            {
++                std::unique_lock queueLock(uploadQueueMutex);
++                uploadQueueFinished.wait(queueLock, [this]() {
++                    return uploadQueue.empty() && resolvedPathQueue.empty() && streamResultQueue.empty() &&
++                        directorySelectionQueue.empty() && !uploadBatchInFlight;
++                });
++            }
++            waitForAllStreamThreads(false);
++            std::scoped_lock idleLock(uploadQueueMutex, streamDescStackMutex);
++            if (uploadQueue.empty() && resolvedPathQueue.empty() && streamResultQueue.empty() &&
++                directorySelectionQueue.empty() && !uploadBatchInFlight &&
++                streamDescStack.empty() && streamDescStackActiveCount <= 0) break;
++        }
+ 
+         // Reset the benchmark counters.
+         resetStreamPerformanceCounters();
+@@ -2034,6 +2094,17 @@
+         }
+     }
+ 
++    bool TextureCache::queueReplacementDirectorySelection(const std::vector<bool> &enabled) {
++        std::unique_lock lock(textureMapMutex);
++        if (enabled.size() != textureMap.replacementMap.replacementDirectories.size()) return false;
++        {
++            std::unique_lock queueLock(uploadQueueMutex);
++            directorySelectionQueue = enabled;
++        }
++        uploadQueueChanged.notify_all();
++        return true;
++    }
++
+     void TextureCache::waitForAllStreamThreads(bool clearQueueImmediately) {
+         std::unique_lock<std::mutex> queueLock(streamDescStackMutex);
+         if (clearQueueImmediately) {
+diff --git a/src/shared/rt64_gpu_tile.h b/src/shared/rt64_gpu_tile.h
+index 4548f15..eaff713 100644
+--- a/src/shared/rt64_gpu_tile.h
++++ b/src/shared/rt64_gpu_tile.h
+@@ -18,6 +18,8 @@ namespace interop {
+             uint rawTMEM : 1;
+             uint hasMipmaps : 1;
+             uint shiftedByHalf : 1;
++            uint preserveOriginalAlpha : 1;
++            uint originalAlphaRawTMEM : 1;
+         };
+ 
+         uint value;
+@@ -49,6 +51,8 @@ namespace interop {
+     bool gpuTileFlagShiftedByHalf(GPUTileFlags flags) {
+         return flags & 0x20;
+     }
++    bool gpuTileFlagPreserveOriginalAlpha(GPUTileFlags flags) { return flags & 0x40; }
++    bool gpuTileFlagOriginalAlphaRawTMEM(GPUTileFlags flags) { return flags & 0x80; }
+ #endif
+     struct GPUTile {
+         float2 ulScale;
+@@ -58,7 +62,8 @@ namespace interop {
+         uint textureIndex;
+         float3 textureDimensions;
+         GPUTileFlags flags;
++        uint originalAlphaTextureIndex;
+     };
+ #ifdef HLSL_CPU
+ };
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+--- a/src/shaders/TextureSampler.hlsli
++++ b/src/shaders/TextureSampler.hlsli
+@@ -215,7 +215,7 @@
+     }
+ }
+ 
+-float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
++float4 sampleTextureRGBA(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
+     const bool texturePerspective = (otherMode.textPersp() == G_TP_PERSP);
+     const bool applyCorrection = (!texturePerspective && !renderFlagRect(renderFlags));
+ 
+@@ -357,3 +357,17 @@
+     
+     return textureColor;
+ }
++
++float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
++    float4 result = sampleTextureRGBA(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, gpuTile, nextPixelBug);
++    if (gpuTileFlagPreserveOriginalAlpha(gpuTile.flags)) {
++        GPUTile alphaTile = gpuTile;
++        alphaTile.textureIndex = gpuTile.originalAlphaTextureIndex;
++        alphaTile.textureDimensions = float3(gpuTile.textureDimensions.xy / gpuTile.tcScale, 1.0f);
++        alphaTile.tcScale = float2(1.0f, 1.0f);
++        alphaTile.ulScale = float2(1.0f, 1.0f);
++        alphaTile.flags = gpuTileFlagOriginalAlphaRawTMEM(gpuTile.flags) ? 0x8 : 0;
++        result.a = sampleTextureRGBA(otherMode, renderFlags, inputUV, ddxUV, ddyUV, rdpTile, alphaTile, nextPixelBug).a;
++    }
++    return result;
++}
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -2005,6 +2005,9 @@
+             }
+             
+             interop::GPUTile &gpuTile = dstGPUTiles[i];
++            gpuTile.flags.preserveOriginalAlpha = false;
++            gpuTile.flags.originalAlphaRawTMEM = false;
++            gpuTile.originalAlphaTextureIndex = 0;
+             if (callTile.tileCopyUsed) {
+                 const auto &it = fbManager->tileCopies.find(callTile.tmemHashOrID);
+                 if (it != fbManager->tileCopies.end()) {
+@@ -2050,6 +2053,14 @@
+                 gpuTile.flags.rawTMEM = !textureReplaced && callTile.rawTMEM;
+                 gpuTile.flags.hasMipmaps = hasMipmaps;
+                 gpuTile.flags.shiftedByHalf = shiftedByHalf;
++                gpuTile.flags.preserveOriginalAlpha = textureReplaced &&
++                    textureCache->textureMap.textureReplacementPreserveOriginalAlpha[textureIndex];
++                if (gpuTile.flags.preserveOriginalAlpha) {
++                    gpuTile.flags.originalAlphaRawTMEM = callTile.rawTMEM;
++                    gpuTile.originalAlphaTextureIndex = getTextureIndex(
++                        callTile.rawTMEM ? textureCacheTextures[textureIndex]->tmem.get() :
++                            textureCacheTextures[textureIndex]->texture.get(), nullptr);
++                }
+             }
+         }
+     }

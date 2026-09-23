@@ -32,6 +32,7 @@
 #include "native_weapon_system.hpp"
 
 #include "common/rt64_plume.h"
+#include "common/rt64_bumble_ui.h"
 #include "render/rt64_descriptor_sets.h"
 #include "render/rt64_shader_library.h"
 #include "render/rt64_texture_cache.h"
@@ -57,7 +58,7 @@ constexpr float kWidePanelMaximumFontScale = 1.00f;
 constexpr float kWidePanelMinimumMarginGuestPixels = 24.0f;
 constexpr float kBriefingPanelAuthoredWidth = 250.0f;
 constexpr float kBriefingPanelTextInset = 4.0f;
-constexpr uint32_t kRasterPadding = 4u;
+constexpr uint32_t kRasterPadding = RT64::BumbleUI::RasterPadding;
 constexpr uint32_t kMenuBackgroundWidth = 1672u;
 constexpr uint32_t kMenuBackgroundHeight = 941u;
 constexpr char kMenuBackgroundHash[] =
