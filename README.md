@@ -5,7 +5,7 @@ and keyboard, mouse and controller controls. This is hobby project originally bu
 ## Download and play
 
 Get the latest build *FuzzyBumble* from [Releases](https://github.com/riseio/project-bumble/releases).
-You need your own **Buck Bumble (USA), revision 0** ROM. Select it when prompted
+You need your own **Buck Bumble (USA), revision 0** ROM in the Z64 format. Select it when prompted
 on first launch. No ROM or game assets are included.
 
 On first launch, choose whether to generate enhanced textures (about 120 MB).
@@ -108,4 +108,4 @@ to copy or redistribute the original game or its assets.
 
 Built with N64ModernRuntime, RT64 and JoltPhysics.
 
-[Report a bug](https://github.com/riseio/project-bumble/issues)
+[Report a bug](https://github.com/riseio/project-bumble/issues) When raising issues please make sure you include the build version you experienced the bug in ^_^
