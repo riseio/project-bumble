@@ -1,0 +1,74 @@
+diff --git a/src/gui/rt64_file_dialog.cpp b/src/gui/rt64_file_dialog.cpp
+index 72faede..9d02b2e 100644
+--- a/src/gui/rt64_file_dialog.cpp
++++ b/src/gui/rt64_file_dialog.cpp
+@@ -5,20 +5,33 @@
+ #include "rt64_file_dialog.h"
+ 
+ #include <cassert>
++#include <mutex>
+ 
+ #include <nfd.h>
+ 
+ namespace RT64 {
++    namespace {
++        std::mutex dialogMutex;
++        bool initialized = false;
++    }
+     // FileDialog
+ 
+     std::atomic<bool> FileDialog::isOpen = false;
+ 
+     void FileDialog::initialize() {
+-        NFD_Init();
++        std::lock_guard lock(dialogMutex);
++        if (!initialized) {
++            initialized = NFD_Init() == NFD_OKAY;
++            if (!initialized) NFD_ClearError();
++        }
+     }
+ 
+     void FileDialog::finish() {
+-        NFD_Quit();
++        std::lock_guard lock(dialogMutex);
++        if (initialized) {
++            NFD_Quit();
++            initialized = false;
++        }
+     }
+ 
+     static std::vector<nfdnfilteritem_t> convertFilters(const std::vector<FileFilter> &filters) {
+@@ -31,6 +44,8 @@ namespace RT64 {
+     }
+ 
+     std::filesystem::path FileDialog::getDirectoryPath() {
++        std::lock_guard lock(dialogMutex);
++        if (!initialized) return {};
+         isOpen = true;
+ 
+         std::filesystem::path path;
+@@ -46,6 +61,8 @@ namespace RT64 {
+     }
+ 
+     std::filesystem::path FileDialog::getOpenFilename(const std::vector<FileFilter> &filters) {
++        std::lock_guard lock(dialogMutex);
++        if (!initialized) return {};
+         isOpen = true;
+         
+         std::filesystem::path path;
+@@ -62,6 +79,8 @@ namespace RT64 {
+     }
+ 
+     std::filesystem::path FileDialog::getSaveFilename(const std::vector<FileFilter> &filters) {
++        std::lock_guard lock(dialogMutex);
++        if (!initialized) return {};
+         isOpen = true;
+ 
+         std::filesystem::path path;
+@@ -76,4 +95,4 @@ namespace RT64 {
+         isOpen = false;
+         return path;
+     }
+-};
+\ No newline at end of file
++};
