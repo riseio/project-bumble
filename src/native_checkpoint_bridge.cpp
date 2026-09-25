@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <limits>
 #include <unordered_map>
 
 #include "funcs.h"
@@ -23,6 +24,10 @@
 #include "recomp.h"
 
 namespace {
+
+bool living_health_can_be_restored(float health, uint32_t state) {
+    return std::isfinite(health) && health > 0.0f && state != 8u && state != 9u;
+}
 
 constexpr uint32_t kRawPadBase = 0x800CC874u;
 constexpr uint32_t kRawPadStride = 6u;
@@ -394,7 +399,6 @@ struct PlayerCheatState {
     bool unlimited_ammo_logged = false;
     bool unlimited_health_logged = false;
     uint32_t water_recovery_frames = 0u;
-    float water_recovery_health = 0.0f;
 };
 
 std::array<PlayerCheatState, 2> g_player_cheat_states{};
@@ -590,8 +594,7 @@ uint32_t read_u32(uint8_t* rdram, uint32_t address) {
 }
 
 bool settled_gameplay_is_live(uint8_t* rdram) {
-    // +0 is current state; +0x84 is the requested next state and may be stale.
-    // Do not save or restore during a pending transition.
+    // +0x84 is pending state; only save settled transitions.
     return rdram != nullptr &&
         read_u32(rdram, kFrontendLiveObject + 0x00u) == kGameplayFrontendPhase &&
         read_u32(rdram, kFrontendLiveObject + 0x40u) == 0u;
@@ -1023,7 +1026,10 @@ void apply_player_cheats(uint8_t* rdram, recomp_context* context) {
             }
         }
     }
-    if (unlimited_health) {
+    const float current_health = float_from_word(read_u32(rdram,
+        weapon_state + kPlayerHealthOffset));
+    const uint32_t actor_state = read_u32(rdram, actor + 0x8Cu);
+    if (unlimited_health && living_health_can_be_restored(current_health, actor_state)) {
         write_u32(
             rdram,
             weapon_state + kPlayerHealthOffset,
@@ -2038,6 +2044,19 @@ bool chain_identity_matches(
 
 } // namespace
 
+bool bumble::native_checkpoint::validate_player_lifecycle_contracts() {
+    bool passed = true;
+    for (uint32_t state = 0; state <= 10; ++state) {
+        for (float health : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::infinity()})
+            passed &= !living_health_can_be_restored(health, state);
+        passed &= living_health_can_be_restored(1.0f, state) == (state != 8 && state != 9);
+    }
+    std::fprintf(stderr, "BUMBLE_PLAYER_LIFECYCLE_CONTRACT result=%s terminal_health_preserved=1\n",
+        passed ? "pass" : "fail");
+    return passed;
+}
+
 void bumble::native_campaign_level::observe(
     uint8_t* rdram,
     ObservationSite site
@@ -2369,7 +2388,7 @@ extern "C" void bumble_remove_lives_gate(
     context->r2 = 1;
 }
 
-extern "C" void bumble_apply_unlimited_health_gate(
+extern "C" void bumble_apply_damage_immunity(
     uint8_t* rdram,
     recomp_context* context
 ) {
@@ -2377,14 +2396,34 @@ extern "C" void bumble_apply_unlimited_health_gate(
         !bumble::graphics_options::unlimited_health_enabled()) {
         return;
     }
-    const uint32_t health_word = maximum_health_word(rdram);
-    write_u32(
-        rdram,
-        kWeaponStateBase + kPlayerHealthOffset,
-        health_word
-    );
-    // Health is already loaded into f2; update the register as well as memory.
-    context->f2.u32l = health_word;
+    const uint32_t actor = guest_u32(context->r18);
+    uint8_t player_index = 0xFFu;
+    if (!exact_player_actor(rdram, actor, player_index)) return;
+    const uint32_t state = read_u32(rdram, actor + 0x8Cu);
+    if (state == 8u || state == 9u) return;
+    // The collision callback rejects dead actors before reaching this point.
+    write_u32(rdram, kWeaponStateBase + player_index * kWeaponStateStride +
+        kPlayerHealthOffset, maximum_health_word(rdram));
+}
+
+extern "C" void bumble_retire_player_lifetime(uint8_t* rdram, recomp_context* context) {
+    if (context == nullptr) return;
+    const uint32_t actor = guest_u32(context->r4);
+    for (auto& state : g_player_cheat_states)
+        if (state.actor == actor) state = {};
+    if (g_water_mission_start.actor == actor) g_water_mission_start = {};
+    if (g_health_gameplay_actor == actor) {
+        g_health_gameplay_actor = 0u;
+        g_health_gameplay_level = UINT32_MAX;
+    }
+    {
+        std::scoped_lock lock(g_mission_checkpoint_mutex);
+        if (g_mission_checkpoint.actor == actor)
+            invalidate_mission_checkpoint_locked();
+        else if (g_pending_portal_checkpoint.actor == actor)
+            g_pending_portal_checkpoint = {};
+    }
+    bumble::modern_controls::retire_player_lifetime(rdram, actor);
 }
 
 extern "C" void bumble_apply_honeycomb_water_rescue(
@@ -2411,27 +2450,19 @@ extern "C" void bumble_apply_honeycomb_water_rescue(
 
     const uint32_t weapon_state =
         kWeaponStateBase + player_index * kWeaponStateStride;
+    const float health = float_from_word(read_u32(
+        rdram, weapon_state + kPlayerHealthOffset));
+    const uint32_t actor_state = read_u32(rdram, actor + 0x8Cu);
+    if (!living_health_can_be_restored(health, actor_state)) {
+        state.water_recovery_frames = 0u;
+        return;
+    }
     const bool recovering = state.water_recovery_frames > 0u;
     if (recovering) {
-        const float health = float_from_word(read_u32(
-            rdram,
-            weapon_state + kPlayerHealthOffset
-        ));
-        if (std::isfinite(health)) {
-            if (health < state.water_recovery_health) {
-                write_u32(
-                    rdram,
-                    weapon_state + kPlayerHealthOffset,
-                    std::bit_cast<uint32_t>(state.water_recovery_health)
-                );
-            } else {
-                state.water_recovery_health = health;
-            }
-        }
         --state.water_recovery_frames;
     }
 
-    if (read_u32(rdram, actor + 0x8Cu) != 10u) {
+    if (actor_state != 10u) {
         return;
     }
     if (recovering) {
@@ -2444,10 +2475,6 @@ extern "C" void bumble_apply_honeycomb_water_rescue(
     const float maximum = float_from_word(read_u32(
         rdram,
         kPlayerMaximumHealthAddress
-    ));
-    const float health = float_from_word(read_u32(
-        rdram,
-        weapon_state + kPlayerHealthOffset
     ));
     const uint32_t cells =
         bumble::graphics_options::half_player_health_enabled() ? 5u : 10u;
@@ -2473,7 +2500,6 @@ extern "C" void bumble_apply_honeycomb_water_rescue(
 
     resume_after_water_recovery(rdram, actor);
     state.water_recovery_frames = kWaterRecoveryFrames;
-    state.water_recovery_health = recovered_health;
     std::fprintf(
         stderr,
         "BUMBLE_WATER stage=honeycomb_rescue"
@@ -2516,7 +2542,12 @@ extern "C" void bumble_initialize_campaign_level_grid(
         return;
     }
     const uint32_t live_object = guest_u32(context->r18);
-    if (!campaign_grid_identity(rdram, live_object)) {
+    const bool grid = campaign_grid_identity(rdram, live_object);
+    const bool new_game = bumble::graphics_options::interactive_menu_enabled() &&
+        valid_guest_pointer(live_object, 0x88u) &&
+        read_u32(rdram, kFrontendDescriptorAddress) == kDefaultFrontendDescriptor &&
+        MEM_BU(0, guest_address(kLevelSelectEnabledAddress)) == 0u;
+    if (!grid && !new_game) {
         return;
     }
     const uint32_t progress_level = g_campaign_grid_progress_level.load(
@@ -2543,6 +2574,11 @@ extern "C" void bumble_initialize_campaign_level_grid(
         selected_level
     );
     g_campaign_selector_index.store(selected_level, std::memory_order_release);
+    if (!grid) {
+        g_campaign_grid_active.store(false, std::memory_order_release);
+        bumble::graphics_options::set_campaign_grid_pointer_active(false);
+        return;
+    }
     g_campaign_grid_selected_slot.store(
         static_cast<uint32_t>(selected_slot),
         std::memory_order_release

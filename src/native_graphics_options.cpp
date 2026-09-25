@@ -94,7 +94,7 @@ constexpr uint32_t kMainMenuTrainingSuccessor = 0x00000027u;
 constexpr uint32_t kMainMenuOptionsSuccessor = 0x0000000Fu;
 constexpr uint32_t kLevelSelectDescriptorTableEntry = 0x800FE5A8u;
 constexpr uint32_t kLevelSelectDescriptor = 0x800FD320u;
-constexpr uint32_t kNewGameDescriptor = 0x800FE508u;
+constexpr uint32_t kNewGameDescriptor = 0x800FD388u;
 constexpr uint32_t kLevelSelectEnabled = 0x800F598Du;
 constexpr uint32_t kMissionCompletePhase = 0x0000001Au;
 constexpr uint32_t kMissionCompleteDescriptor = 0x800FD648u;
@@ -147,6 +147,11 @@ enum class RowKind : uint32_t {
     KeyboardBindingsMenu,
     ControllerBindingsMenu,
     JoystickSettingsMenu,
+    MouseSettingsMenu,
+    MouseSensitivity,
+    MouseSensitivityX,
+    MouseSensitivityY,
+    MouseAcceleration,
     ResetControls,
     StickLayout,
     JoystickSensitivity,
@@ -172,6 +177,8 @@ enum class RowKind : uint32_t {
     BindMenuConfirm,
     BindMenuBack,
     BindToggleModernVisuals,
+    BindFlyUp,
+    BindFlyDown,
     ResetKeyboardBindings,
     ResetControllerBindings,
     DisplaySettings,
@@ -194,6 +201,7 @@ enum class RowKind : uint32_t {
     WaterHazard,
     AmmoPickupAmount,
     MissionTimeLimits,
+    CutsceneTextSpeed,
     EnemyHealth,
     EnemyAwareness,
     AdStrafing,
@@ -217,6 +225,7 @@ enum class MenuPage : uint32_t {
     KeyboardBindings,
     ControllerBindings,
     JoystickSettings,
+    MouseSettings,
     Display,
     Rendering,
     CheatsAndTests,
@@ -240,6 +249,11 @@ enum class PauseRowKind : uint32_t {
     KeyboardBindingsMenu,
     ControllerBindingsMenu,
     JoystickSettingsMenu,
+    MouseSettingsMenu,
+    MouseSensitivity,
+    MouseSensitivityX,
+    MouseSensitivityY,
+    MouseAcceleration,
     StickLayout,
     JoystickSensitivity,
     JoystickSensitivityX,
@@ -264,6 +278,8 @@ enum class PauseRowKind : uint32_t {
     BindMenuConfirm,
     BindMenuBack,
     BindToggleModernVisuals,
+    BindFlyUp,
+    BindFlyDown,
     ResetKeyboardBindings,
     ResetControllerBindings,
     CheatsMenu,
@@ -291,6 +307,7 @@ enum class PauseRowKind : uint32_t {
     PlayerMaximumHealth,
     AmmoPickupAmount,
     MissionTimeLimits,
+    CutsceneTextSpeed,
     EnemyHealth,
     EnemyAwareness,
     AdStrafing,
@@ -307,6 +324,7 @@ enum class PauseMenuPage : uint32_t {
     KeyboardBindings,
     ControllerBindings,
     JoystickSettings,
+    MouseSettings,
     Graphics,
     Display,
     Rendering,
@@ -451,6 +469,7 @@ std::atomic_bool g_unlimited_health{false};
 std::atomic_bool g_honeycomb_water_rescue{false};
 std::atomic_bool g_double_ammo_pickups{false};
 std::atomic_bool g_double_mission_time_limits{false};
+std::atomic_uint32_t g_cutscene_text_speed{4u};
 std::atomic_bool g_double_enemy_health{false};
 std::atomic_bool g_double_enemy_awareness{false};
 std::atomic_bool g_a_d_strafing{true};
@@ -458,7 +477,6 @@ std::atomic_bool g_unlock_all_levels{false};
 std::atomic_bool g_honeycomb_health{false};
 std::atomic_bool g_half_player_health{false};
 std::atomic_bool g_play_menu_return_requested{false};
-std::atomic_bool g_new_game_auto_confirm_pending{false};
 std::atomic_bool g_main_menu_handoff_pending{false};
 std::atomic_bool g_pause_restart_handoff_pending{false};
 std::atomic_bool g_main_menu_handoff_ready{false};
@@ -1588,7 +1606,6 @@ bool handle_main_menu_input_locked(
             kFrontendObject + 0x10u,
             bumble::graphics_options::campaign_unlocked_level()
         );
-        g_new_game_auto_confirm_pending.store(true, std::memory_order_release);
         g_main_menu_handoff_ready.store(false, std::memory_order_release);
         g_main_menu_handoff_pending.store(true, std::memory_order_release);
         std::fprintf(
@@ -1862,7 +1879,7 @@ bumble::input_bindings::Settings load_control_settings() {
         L"Version",
         0u
     );
-    Settings controls = default_settings(version == 0u ? 7u : version);
+    Settings controls = default_settings(version == 0u ? 8u : version);
     if (version == 0u) {
         return controls;
     }
@@ -1882,6 +1899,10 @@ bumble::input_bindings::Settings load_control_settings() {
         ),
         static_cast<uint32_t>(StickLayout::RightMoveLeftLook)
     ));
+    controls.mouse_sensitivity = read_ini_section_uint(L"Controls", L"MouseSensitivity", 100u);
+    controls.mouse_sensitivity_x = read_ini_section_uint(L"Controls", L"MouseSensitivityX", 100u);
+    controls.mouse_sensitivity_y = read_ini_section_uint(L"Controls", L"MouseSensitivityY", 100u);
+    controls.mouse_acceleration = read_ini_section_uint(L"Controls", L"MouseAcceleration", 0u) != 0u;
     controls.joystick_look_sensitivity = read_ini_section_uint(
         L"Controls", L"JoystickLookSensitivity", 100u
     );
@@ -1952,6 +1973,26 @@ bumble::input_bindings::Settings load_control_settings() {
         }
     }
     upgrade_keyboard_defaults(controls, version);
+    if (version < 8u) {
+        const auto legacy = default_settings(7u);
+        const auto defaults = default_settings();
+        for (const auto action : {InputAction::ForwardDash, InputAction::BarrelRoll}) {
+            const auto index = size_t(action);
+            if (controls.controller[index] == legacy.controller[index])
+                controls.controller[index] = defaults.controller[index];
+        }
+        for (const auto action : {InputAction::FlyUp, InputAction::FlyDown}) {
+            const auto index = size_t(action);
+            for (auto* table : {&controls.keyboard_mouse, &controls.controller}) {
+                const auto& initial = table == &controls.controller ? defaults.controller : defaults.keyboard_mouse;
+                const uint16_t binding = initial[index][0];
+                const bool used = std::any_of(table->begin(), table->end(), [binding](const auto& slots) {
+                    return std::find(slots.begin(), slots.end(), binding) != slots.end();
+                });
+                if (!used) (*table)[index] = initial[index];
+            }
+        }
+    }
     return controls;
 }
 
@@ -1961,8 +2002,11 @@ void save_control_settings() {
     clear_ini_section(L"Controls");
     clear_ini_section(L"KeyboardMouseBindings");
     clear_ini_section(L"ControllerBindings");
-    // Schema 7 changes only untouched PC defaults and adds wheel bindings.
-    write_ini_section_uint(L"Controls", L"Version", 7u);
+    write_ini_section_uint(L"Controls", L"Version", 8u);
+    write_ini_section_uint(L"Controls", L"MouseSensitivity", controls.mouse_sensitivity);
+    write_ini_section_uint(L"Controls", L"MouseSensitivityX", controls.mouse_sensitivity_x);
+    write_ini_section_uint(L"Controls", L"MouseSensitivityY", controls.mouse_sensitivity_y);
+    write_ini_section_uint(L"Controls", L"MouseAcceleration", controls.mouse_acceleration ? 1u : 0u);
     write_ini_section_uint(
         L"Controls",
         L"DeviceMode",
@@ -2055,6 +2099,7 @@ void save_settings(const bumble::graphics_options::Settings& settings) {
         L"DoubleMissionTimeLimits",
         settings.double_mission_time_limits ? 1u : 0u
     );
+    write_ini_section_uint(L"Gameplay", L"CutsceneTextSpeed", settings.cutscene_text_speed);
     write_ini_section_uint(
         L"Gameplay",
         L"DoubleEnemyHealth",
@@ -2187,6 +2232,8 @@ void publish_settings(const bumble::graphics_options::Settings& settings) {
         settings.double_mission_time_limits,
         std::memory_order_release
     );
+    g_cutscene_text_speed.store(settings.cutscene_text_speed == 1u || settings.cutscene_text_speed == 2u
+        ? settings.cutscene_text_speed : 4u, std::memory_order_release);
     g_double_enemy_health.store(
         settings.double_enemy_health,
         std::memory_order_release
@@ -2464,6 +2511,13 @@ const char* row_name(RowKind row) {
     case RowKind::KeyboardBindingsMenu: return "keyboard_bindings_menu";
     case RowKind::ControllerBindingsMenu: return "controller_bindings_menu";
     case RowKind::JoystickSettingsMenu: return "joystick_settings_menu";
+    case RowKind::MouseSettingsMenu: return "mouse_settings_menu";
+    case RowKind::MouseSensitivity: return "MouseSensitivity";
+    case RowKind::MouseSensitivityX: return "MouseSensitivityX";
+    case RowKind::MouseSensitivityY: return "MouseSensitivityY";
+    case RowKind::MouseAcceleration: return "MouseAcceleration";
+    case RowKind::BindFlyUp: return "BindFlyUp";
+    case RowKind::BindFlyDown: return "BindFlyDown";
     case RowKind::ResetControls: return "reset_controls";
     case RowKind::StickLayout: return "stick_layout";
     case RowKind::JoystickSensitivity: return "joystick_sensitivity";
@@ -2510,6 +2564,7 @@ const char* row_name(RowKind row) {
     case RowKind::UnlimitedHealth: return "unlimited_health";
     case RowKind::WaterHazard: return "water_hazard";
     case RowKind::AmmoPickupAmount: return "ammo_pickup_amount";
+    case RowKind::CutsceneTextSpeed: return "cutscene_text_speed";
     case RowKind::MissionTimeLimits: return "mission_time_limits";
     case RowKind::EnemyHealth: return "enemy_health";
     case RowKind::EnemyAwareness: return "enemy_awareness";
@@ -2536,6 +2591,7 @@ const char* menu_page_name(MenuPage page) {
     case MenuPage::Gameplay: return "gameplay";
     case MenuPage::KeyboardBindings: return "keyboard_bindings";
     case MenuPage::ControllerBindings: return "controller_bindings";
+    case MenuPage::MouseSettings: return "mouse_settings";
     case MenuPage::JoystickSettings: return "joystick_settings";
     case MenuPage::Display: return "display";
     case MenuPage::Rendering: return "rendering";
@@ -2561,6 +2617,7 @@ MenuPage menu_parent_page(MenuPage page) {
         return MenuPage::Gameplay;
     case MenuPage::KeyboardBindings:
     case MenuPage::ControllerBindings:
+    case MenuPage::MouseSettings:
     case MenuPage::JoystickSettings:
         return MenuPage::Controls;
     case MenuPage::Cheats:
@@ -2577,6 +2634,8 @@ bool row_binding_action(
 ) {
     using bumble::input_bindings::InputAction;
     switch (row) {
+    case RowKind::BindFlyUp: action = InputAction::FlyUp; return true;
+    case RowKind::BindFlyDown: action = InputAction::FlyDown; return true;
     case RowKind::BindMoveForward: action = InputAction::MoveForward; return true;
     case RowKind::BindMoveBackward: action = InputAction::MoveBackward; return true;
     case RowKind::BindStrafeLeft: action = InputAction::StrafeLeft; return true;
@@ -2678,6 +2737,25 @@ std::string row_text(
                 : "NOT CONNECTED"
         );
         break;
+    case RowKind::MouseSettingsMenu:
+        std::snprintf(buffer, sizeof(buffer), "MOUSE SETTINGS");
+        break;
+    case RowKind::MouseSensitivity:
+    case RowKind::MouseSensitivityX:
+    case RowKind::MouseSensitivityY:
+    case RowKind::MouseAcceleration: {
+        const auto controls = bumble::input_bindings::current();
+        if (row == RowKind::MouseAcceleration)
+            std::snprintf(buffer, sizeof(buffer), "ACCELERATION <%s>", controls.mouse_acceleration ? "ON" : "OFF");
+        else {
+            const char* label = row == RowKind::MouseSensitivity ? "SENSITIVITY" :
+                row == RowKind::MouseSensitivityX ? "HORIZONTAL SENSITIVITY" : "VERTICAL SENSITIVITY";
+            const uint32_t value = row == RowKind::MouseSensitivity ? controls.mouse_sensitivity :
+                row == RowKind::MouseSensitivityX ? controls.mouse_sensitivity_x : controls.mouse_sensitivity_y;
+            std::snprintf(buffer, sizeof(buffer), "%s <%u%%>", label, value);
+        }
+        break;
+    }
     case RowKind::JoystickSettingsMenu:
         std::snprintf(buffer, sizeof(buffer), "JOYSTICK SETTINGS");
         break;
@@ -2726,6 +2804,8 @@ std::string row_text(
     case RowKind::ResetJoystick:
         std::snprintf(buffer, sizeof(buffer), "RESET JOYSTICK SETTINGS");
         break;
+    case RowKind::BindFlyUp:
+    case RowKind::BindFlyDown:
     case RowKind::BindMoveForward:
     case RowKind::BindMoveBackward:
     case RowKind::BindStrafeLeft:
@@ -2923,6 +3003,9 @@ std::string row_text(
             "AMMO PICKUP AMOUNT  <%s>",
             settings.double_ammo_pickups ? "2X" : "ORIGINAL"
         );
+        break;
+    case RowKind::CutsceneTextSpeed:
+        std::snprintf(buffer, sizeof(buffer), "CUTSCENE TEXT SPEED <%uX>", settings.cutscene_text_speed);
         break;
     case RowKind::MissionTimeLimits:
         std::snprintf(
@@ -3160,9 +3243,17 @@ bool install_native_menu_locked(
     case MenuPage::Controls:
         add_row(RowKind::InputDevice);
         add_row(RowKind::JoystickSettingsMenu);
+        add_row(RowKind::MouseSettingsMenu);
         add_row(RowKind::KeyboardBindingsMenu);
         add_row(RowKind::ControllerBindingsMenu);
         add_row(RowKind::ResetControls);
+        add_row(RowKind::Back);
+        break;
+    case MenuPage::MouseSettings:
+        add_row(RowKind::MouseSensitivity);
+        add_row(RowKind::MouseSensitivityX);
+        add_row(RowKind::MouseSensitivityY);
+        add_row(RowKind::MouseAcceleration);
         add_row(RowKind::Back);
         break;
     case MenuPage::JoystickSettings:
@@ -3184,6 +3275,7 @@ bool install_native_menu_locked(
         add_row(RowKind::PlayerMaximumHealth);
         add_row(RowKind::AmmoPickupAmount);
         add_row(RowKind::MissionTimeLimits);
+        add_row(RowKind::CutsceneTextSpeed);
         add_row(RowKind::EnemyHealth);
         add_row(RowKind::EnemyAwareness);
         add_row(RowKind::AdStrafing);
@@ -3197,6 +3289,8 @@ bool install_native_menu_locked(
         add_row(RowKind::BindStrafeRight);
         add_row(RowKind::BindPrimaryFire);
         add_row(RowKind::BindTakeOffLand);
+        add_row(RowKind::BindFlyUp);
+        add_row(RowKind::BindFlyDown);
         add_row(RowKind::BindPreviousWeapon);
         add_row(RowKind::BindNextWeapon);
         add_row(RowKind::BindLoopDeLoop);
@@ -3214,6 +3308,8 @@ bool install_native_menu_locked(
         add_row(RowKind::StickLayout);
         add_row(RowKind::BindPrimaryFire);
         add_row(RowKind::BindTakeOffLand);
+        add_row(RowKind::BindFlyUp);
+        add_row(RowKind::BindFlyDown);
         add_row(RowKind::BindPause);
         add_row(RowKind::BindPreviousWeapon);
         add_row(RowKind::BindNextWeapon);
@@ -3469,6 +3565,20 @@ void cycle_row_locked(RowKind row, int direction) {
     case RowKind::InputDevice:
         bumble::input_bindings::cycle_device_mode(step);
         break;
+    case RowKind::MouseSensitivity:
+    case RowKind::MouseSensitivityX:
+    case RowKind::MouseSensitivityY:
+    case RowKind::MouseAcceleration: {
+        auto controls = bumble::input_bindings::current();
+        if (row == RowKind::MouseAcceleration) controls.mouse_acceleration = !controls.mouse_acceleration;
+        else {
+            auto& value = row == RowKind::MouseSensitivity ? controls.mouse_sensitivity :
+                row == RowKind::MouseSensitivityX ? controls.mouse_sensitivity_x : controls.mouse_sensitivity_y;
+            value = uint32_t(std::clamp(int(value) + step * 5, 10, 400));
+        }
+        bumble::input_bindings::configure(controls);
+        break;
+    }
     case RowKind::StickLayout:
         bumble::input_bindings::cycle_stick_layout(step);
         break;
@@ -3587,6 +3697,11 @@ void cycle_row_locked(RowKind row, int direction) {
     case RowKind::AmmoPickupAmount:
         settings.double_ammo_pickups = !settings.double_ammo_pickups;
         break;
+    case RowKind::CutsceneTextSpeed:
+        settings.cutscene_text_speed = step > 0
+            ? (settings.cutscene_text_speed == 4u ? 1u : settings.cutscene_text_speed * 2u)
+            : (settings.cutscene_text_speed == 1u ? 4u : settings.cutscene_text_speed / 2u);
+        break;
     case RowKind::MissionTimeLimits:
         settings.double_mission_time_limits =
             !settings.double_mission_time_limits;
@@ -3614,9 +3729,12 @@ void cycle_row_locked(RowKind row, int direction) {
     case RowKind::GameplaySettings:
     case RowKind::KeyboardBindingsMenu:
     case RowKind::ControllerBindingsMenu:
+    case RowKind::MouseSettingsMenu:
     case RowKind::JoystickSettingsMenu:
     case RowKind::ResetJoystick:
     case RowKind::ResetControls:
+    case RowKind::BindFlyUp:
+    case RowKind::BindFlyDown:
     case RowKind::BindMoveForward:
     case RowKind::BindMoveBackward:
     case RowKind::BindStrafeLeft:
@@ -3670,6 +3788,7 @@ const char* pause_page_name(PauseMenuPage page) {
     case PauseMenuPage::Gameplay: return "gameplay";
     case PauseMenuPage::KeyboardBindings: return "keyboard_bindings";
     case PauseMenuPage::ControllerBindings: return "controller_bindings";
+    case PauseMenuPage::MouseSettings: return "mouse_settings";
     case PauseMenuPage::JoystickSettings: return "joystick_settings";
     case PauseMenuPage::Graphics: return "graphics";
     case PauseMenuPage::Display: return "display";
@@ -3697,6 +3816,13 @@ const char* pause_row_name(PauseRowKind row) {
     case PauseRowKind::KeyboardBindingsMenu: return "keyboard_bindings_menu";
     case PauseRowKind::ControllerBindingsMenu: return "controller_bindings_menu";
     case PauseRowKind::JoystickSettingsMenu: return "joystick_settings_menu";
+    case PauseRowKind::MouseSettingsMenu: return "mouse_settings_menu";
+    case PauseRowKind::MouseSensitivity: return "MouseSensitivity";
+    case PauseRowKind::MouseSensitivityX: return "MouseSensitivityX";
+    case PauseRowKind::MouseSensitivityY: return "MouseSensitivityY";
+    case PauseRowKind::MouseAcceleration: return "MouseAcceleration";
+    case PauseRowKind::BindFlyUp: return "BindFlyUp";
+    case PauseRowKind::BindFlyDown: return "BindFlyDown";
     case PauseRowKind::StickLayout: return "stick_layout";
     case PauseRowKind::JoystickSensitivity: return "joystick_sensitivity";
     case PauseRowKind::JoystickSensitivityX: return "joystick_sensitivity_x";
@@ -3747,6 +3873,7 @@ const char* pause_row_name(PauseRowKind row) {
     case PauseRowKind::WaterHazard: return "water_hazard";
     case PauseRowKind::PlayerMaximumHealth: return "player_maximum_health";
     case PauseRowKind::AmmoPickupAmount: return "ammo_pickup_amount";
+    case PauseRowKind::CutsceneTextSpeed: return "cutscene_text_speed";
     case PauseRowKind::MissionTimeLimits: return "mission_time_limits";
     case PauseRowKind::EnemyHealth: return "enemy_health";
     case PauseRowKind::EnemyAwareness: return "enemy_awareness";
@@ -3763,6 +3890,18 @@ bool pause_row_setting(PauseRowKind pause_row, RowKind& setting_row) {
         return true;
     case PauseRowKind::StickLayout:
         setting_row = RowKind::StickLayout;
+        return true;
+    case PauseRowKind::MouseSensitivity:
+        setting_row = RowKind::MouseSensitivity;
+        return true;
+    case PauseRowKind::MouseSensitivityX:
+        setting_row = RowKind::MouseSensitivityX;
+        return true;
+    case PauseRowKind::MouseSensitivityY:
+        setting_row = RowKind::MouseSensitivityY;
+        return true;
+    case PauseRowKind::MouseAcceleration:
+        setting_row = RowKind::MouseAcceleration;
         return true;
     case PauseRowKind::JoystickSensitivity:
         setting_row = RowKind::JoystickSensitivity;
@@ -3784,6 +3923,12 @@ bool pause_row_setting(PauseRowKind pause_row, RowKind& setting_row) {
         return true;
     case PauseRowKind::ResetJoystick:
         setting_row = RowKind::ResetJoystick;
+        return true;
+    case PauseRowKind::BindFlyUp:
+        setting_row = RowKind::BindFlyUp;
+        return true;
+    case PauseRowKind::BindFlyDown:
+        setting_row = RowKind::BindFlyDown;
         return true;
     case PauseRowKind::BindMoveForward:
         setting_row = RowKind::BindMoveForward;
@@ -3881,6 +4026,9 @@ bool pause_row_setting(PauseRowKind pause_row, RowKind& setting_row) {
     case PauseRowKind::AmmoPickupAmount:
         setting_row = RowKind::AmmoPickupAmount;
         return true;
+    case PauseRowKind::CutsceneTextSpeed:
+        setting_row = RowKind::CutsceneTextSpeed;
+        return true;
     case PauseRowKind::MissionTimeLimits:
         setting_row = RowKind::MissionTimeLimits;
         return true;
@@ -3938,12 +4086,15 @@ std::string pause_row_text(
         return bumble::native_io::connected_controller_count() != 0u
             ? "CONTROLLER BINDINGS  <CONNECTED>"
             : "CONTROLLER BINDINGS  <NOT CONNECTED>";
+    case PauseRowKind::MouseSettingsMenu: return "MOUSE SETTINGS";
     case PauseRowKind::JoystickSettingsMenu:
         return "JOYSTICK SETTINGS";
     case PauseRowKind::InputDevice:
         return row_text(RowKind::InputDevice, settings);
     case PauseRowKind::StickLayout:
         return row_text(RowKind::StickLayout, settings);
+    case PauseRowKind::BindFlyUp:
+    case PauseRowKind::BindFlyDown:
     case PauseRowKind::BindMoveForward:
     case PauseRowKind::BindMoveBackward:
     case PauseRowKind::BindStrafeLeft:
@@ -4021,6 +4172,7 @@ PauseMenuPage pause_parent_page(PauseMenuPage page) {
         return PauseMenuPage::Root;
     case PauseMenuPage::KeyboardBindings:
     case PauseMenuPage::ControllerBindings:
+    case PauseMenuPage::MouseSettings:
     case PauseMenuPage::JoystickSettings:
         return PauseMenuPage::Controls;
     case PauseMenuPage::ConfirmTitle:
@@ -4131,8 +4283,16 @@ bool install_pause_menu_locked(uint8_t* rdram, PauseMenuPage page) {
     case PauseMenuPage::Controls:
         add_row(PauseRowKind::InputDevice);
         add_row(PauseRowKind::JoystickSettingsMenu);
+        add_row(PauseRowKind::MouseSettingsMenu);
         add_row(PauseRowKind::KeyboardBindingsMenu);
         add_row(PauseRowKind::ControllerBindingsMenu);
+        add_row(PauseRowKind::Back);
+        break;
+    case PauseMenuPage::MouseSettings:
+        add_row(PauseRowKind::MouseSensitivity);
+        add_row(PauseRowKind::MouseSensitivityX);
+        add_row(PauseRowKind::MouseSensitivityY);
+        add_row(PauseRowKind::MouseAcceleration);
         add_row(PauseRowKind::Back);
         break;
     case PauseMenuPage::JoystickSettings:
@@ -4154,6 +4314,7 @@ bool install_pause_menu_locked(uint8_t* rdram, PauseMenuPage page) {
         add_row(PauseRowKind::PlayerMaximumHealth);
         add_row(PauseRowKind::AmmoPickupAmount);
         add_row(PauseRowKind::MissionTimeLimits);
+        add_row(PauseRowKind::CutsceneTextSpeed);
         add_row(PauseRowKind::EnemyHealth);
         add_row(PauseRowKind::EnemyAwareness);
         add_row(PauseRowKind::AdStrafing);
@@ -4166,6 +4327,8 @@ bool install_pause_menu_locked(uint8_t* rdram, PauseMenuPage page) {
         add_row(PauseRowKind::BindStrafeRight);
         add_row(PauseRowKind::BindPrimaryFire);
         add_row(PauseRowKind::BindTakeOffLand);
+        add_row(PauseRowKind::BindFlyUp);
+        add_row(PauseRowKind::BindFlyDown);
         add_row(PauseRowKind::BindPreviousWeapon);
         add_row(PauseRowKind::BindNextWeapon);
         add_row(PauseRowKind::BindLoopDeLoop);
@@ -4183,6 +4346,8 @@ bool install_pause_menu_locked(uint8_t* rdram, PauseMenuPage page) {
         add_row(PauseRowKind::StickLayout);
         add_row(PauseRowKind::BindPrimaryFire);
         add_row(PauseRowKind::BindTakeOffLand);
+        add_row(PauseRowKind::BindFlyUp);
+        add_row(PauseRowKind::BindFlyDown);
         add_row(PauseRowKind::BindPause);
         add_row(PauseRowKind::BindPreviousWeapon);
         add_row(PauseRowKind::BindNextWeapon);
@@ -4591,6 +4756,10 @@ void handle_pause_menu_input_locked(uint8_t* rdram) {
     case PauseRowKind::ControllerBindingsMenu:
         MEM_H(2, current_pad) = static_cast<int16_t>(consumed_a);
         install_pause_menu_locked(rdram, PauseMenuPage::ControllerBindings);
+        break;
+    case PauseRowKind::MouseSettingsMenu:
+        MEM_H(2, current_pad) = static_cast<int16_t>(consumed_a);
+        install_pause_menu_locked(rdram, PauseMenuPage::MouseSettings);
         break;
     case PauseRowKind::JoystickSettingsMenu:
         MEM_H(2, current_pad) = static_cast<int16_t>(consumed_a);
@@ -5011,6 +5180,9 @@ bool bumble::graphics_options::publish_native_menu_overlay(
             title = "CONTROLLER BINDINGS";
             layout = MenuOverlayLayout::DenseBindings;
             break;
+        case MenuPage::MouseSettings:
+            title = "MOUSE SETTINGS";
+            break;
         case MenuPage::JoystickSettings:
             title = "JOYSTICK SETTINGS";
             break;
@@ -5061,6 +5233,9 @@ bool bumble::graphics_options::publish_native_menu_overlay(
         case PauseMenuPage::ControllerBindings:
             title = "CONTROLLER BINDINGS";
             layout = MenuOverlayLayout::DenseBindings;
+            break;
+        case PauseMenuPage::MouseSettings:
+            title = "MOUSE SETTINGS";
             break;
         case PauseMenuPage::JoystickSettings:
             title = "JOYSTICK SETTINGS";
@@ -5328,6 +5503,7 @@ bool bumble::graphics_options::initialize(
         L"DoubleAmmoPickups",
         0u
     ) != 0u;
+    settings.cutscene_text_speed = read_ini_section_uint(L"Gameplay", L"CutsceneTextSpeed", 4u);
     settings.double_mission_time_limits = read_ini_section_uint(
         L"Gameplay",
         L"DoubleMissionTimeLimits",
@@ -5435,7 +5611,6 @@ void bumble::graphics_options::shutdown() {
     g_main_menu = NativeMainMenuState{};
     g_pause_menu = NativePauseMenuState{};
     g_mission_complete_pointer_motion_revision = 0u;
-    g_new_game_auto_confirm_pending.store(false, std::memory_order_release);
     g_main_menu_handoff_pending.store(false, std::memory_order_release);
     g_pause_restart_handoff_pending.store(false, std::memory_order_release);
     g_main_menu_handoff_ready.store(false, std::memory_order_release);
@@ -5496,6 +5671,7 @@ bumble::graphics_options::Settings bumble::graphics_options::current() {
         g_honeycomb_water_rescue.load(std::memory_order_acquire);
     settings.double_ammo_pickups =
         g_double_ammo_pickups.load(std::memory_order_acquire);
+    settings.cutscene_text_speed = g_cutscene_text_speed.load(std::memory_order_acquire);
     settings.double_mission_time_limits =
         g_double_mission_time_limits.load(std::memory_order_acquire);
     settings.double_enemy_health =
@@ -5576,6 +5752,10 @@ void bumble::graphics_options::toggle_modern_visuals() {
 
 bool bumble::graphics_options::enhanced_textures_enabled() {
     return bumble::first_run::enhanced_textures_available() && g_enhanced_textures.load(std::memory_order_acquire);
+}
+
+uint32_t bumble::graphics_options::cutscene_text_speed() {
+    return g_cutscene_text_speed.load(std::memory_order_acquire);
 }
 
 bool bumble::graphics_options::all_weapons_enabled() {
@@ -6327,8 +6507,7 @@ extern "C" void bumble_prepare_native_graphics_options_menu(
         return;
     }
     if (phase == kMainMenuPhase && descriptor == kMainMenuDescriptor) {
-        g_new_game_auto_confirm_pending.store(false, std::memory_order_release);
-        g_main_menu_handoff_pending.store(false, std::memory_order_release);
+            g_main_menu_handoff_pending.store(false, std::memory_order_release);
         g_pause_restart_handoff_pending.store(false, std::memory_order_release);
         g_main_menu_handoff_ready.store(false, std::memory_order_release);
         g_pause_restart_handoff_started_ms.store(0, std::memory_order_release);
@@ -6615,30 +6794,6 @@ extern "C" void bumble_handle_native_graphics_options_input(
             std::fflush(stderr);
         }
         return;
-    }
-    if (live_object == kFrontendObject && phase == kLevelSelectPhase &&
-        descriptor == kNewGameDescriptor &&
-        MEM_B(0, guest_address(kLevelSelectEnabled)) == 0 &&
-        g_new_game_auto_confirm_pending.exchange(
-            false,
-            std::memory_order_acq_rel
-        )) {
-        const gpr current_pad = guest_address(kCurrentPad);
-        MEM_H(2, current_pad) = static_cast<int16_t>(
-            MEM_HU(2, current_pad) | kButtonA
-        );
-        context->r2 = static_cast<gpr>(
-            static_cast<uint16_t>(context->r2) | kButtonA
-        );
-        std::fprintf(
-            stderr,
-            "BUMBLE_MAIN_MENU stage=new_game_selector_confirmed"
-            " phase=0x%08" PRIX32 " descriptor=0x%08" PRIX32
-            " outgoing_composition_retained=1\n",
-            phase,
-            descriptor
-        );
-        std::fflush(stderr);
     }
     if (handle_main_menu_input_locked(
             rdram,
@@ -6956,6 +7111,7 @@ extern "C" void bumble_handle_native_graphics_options_input(
             selected == RowKind::GameplaySettings ||
             selected == RowKind::KeyboardBindingsMenu ||
             selected == RowKind::ControllerBindingsMenu ||
+            selected == RowKind::MouseSettingsMenu ||
             selected == RowKind::JoystickSettingsMenu ||
             selected == RowKind::DisplaySettings ||
             selected == RowKind::RenderingSettings ||
@@ -7042,6 +7198,9 @@ extern "C" void bumble_handle_native_graphics_options_input(
             break;
         case RowKind::ControllerBindingsMenu:
             target = MenuPage::ControllerBindings;
+            break;
+        case RowKind::MouseSettingsMenu:
+            target = MenuPage::MouseSettings;
             break;
         case RowKind::JoystickSettingsMenu:
             target = MenuPage::JoystickSettings;

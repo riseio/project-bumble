@@ -85,13 +85,13 @@ bool closing(const SDL_Event& event, Uint32 id) {
 }
 }
 
-void run_preparation(const std::function<void(PreparationProgress&)>& work) {
+void run_preparation(const std::function<void(PreparationProgress&)>& work, bool checking) {
     PreparationWindow ui(240);
     auto& window = ui.window;
     auto& canvas = ui.canvas;
     const auto text = [&](const std::string& value, int x, int y) { ui.text(value, x, y); };
     PreparationProgress progress;
-    progress.report("Preparing menus");
+    progress.report(checking ? "Checking textures" : "Preparing menus");
     auto pending = std::async(std::launch::async, [&]() { work(progress); });
     std::string lastStage;
     uint32_t lastCompleted = UINT32_MAX, lastTotal = UINT32_MAX;
@@ -114,8 +114,8 @@ void run_preparation(const std::function<void(PreparationProgress&)>& work) {
         if (progress.cancelled.load()) state = {"Cancelling...", 0, 0};
         if (redraw || seconds != lastSecond || state.stage != lastStage || state.completed != lastCompleted || state.total != lastTotal) {
             SDL_FillRect(canvas.get(), nullptr, SDL_MapRGB(canvas->format, 28, 30, 36));
-            text("Preparing game textures", 30, 47);
-            text("This runs once. Please keep the game open.", 30, 82);
+            text(checking ? "Checking game textures" : "Preparing game textures", 30, 47);
+            text(checking ? "Validating cached files." : "This runs once. Please keep the game open.", 30, 82);
             text(state.stage, 30, 120);
             SDL_Rect track{30, 139, 580, 20};
             SDL_FillRect(canvas.get(), &track, SDL_MapRGB(canvas->format, 64, 67, 76));

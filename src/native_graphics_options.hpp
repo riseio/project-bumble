@@ -72,6 +72,7 @@ struct Settings {
     bool unlock_all_levels = false;
     bool honeycomb_health = false;
     bool half_player_health = false;
+    uint32_t cutscene_text_speed = 4u;
 };
 
 static_assert(!Settings{}.all_weapons && !Settings{}.unlimited_ammo &&
@@ -96,6 +97,7 @@ bool high_resolution_textures_enabled();
 bool hd_terrain_enabled();
 bool modern_lighting_enabled();
 bool enhanced_textures_enabled();
+uint32_t cutscene_text_speed();
 void toggle_modern_visuals();
 void publish_lighting_environment(uint8_t* rdram);
 GrassMode grass_mode();

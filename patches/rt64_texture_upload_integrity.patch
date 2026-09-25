@@ -1,0 +1,195 @@
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+index bbad028..8bc47f3 100644
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -653,11 +653,11 @@ namespace RT64 {
+             }
+         }
+         else {
+-            memcpy(dst, src, dstRowPitch * rowCount);
++            memcpy(dst, src, size_t(dstRowPitch) * rowCount);
+         }
+     }
+     
+-    void TextureCache::setRGBA32(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, uint32_t width, uint32_t height, uint32_t rowPitch, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool, std::mutex *uploadResourcePoolMutex) {
++    bool TextureCache::setRGBA32(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, uint32_t width, uint32_t height, uint32_t rowPitch, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool, std::mutex *uploadResourcePoolMutex) {
+         assert(dstTexture != nullptr);
+         assert(device != nullptr);
+         assert(commandList != nullptr);
+@@ -665,25 +665,36 @@ namespace RT64 {
+         assert(width > 0);
+         assert(height > 0);
+ 
++        if (!dstTexture || !device || !commandList || !bytes || width == 0 || height == 0 ||
++            uint64_t(width) * 4 > rowPitch || rowPitch > UINT32_MAX - TextureDataPitchAlignment ||
++            uint64_t(rowPitch) * height > byteCount || (uploadResourcePool && !uploadResourcePoolMutex)) return false;
++        const uint32_t alignedRowPitch = nextSizeAlignedTo(rowPitch, TextureDataPitchAlignment);
++        const uint64_t uploadBytes = uint64_t(alignedRowPitch) * height;
++        if (uploadBytes > SIZE_MAX) return false;
++
+         dstTexture->format = RenderFormat::R8G8B8A8_UNORM;
+         dstTexture->width = width;
+         dstTexture->height = height;
+         dstTexture->mipmaps = 1;
+-        dstTexture->texture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, dstTexture->format));
++        auto desc = RenderTextureDesc::Texture2D(width, height, 1, dstTexture->format);
++        desc.sharedWithCopyQueue = true;
++        dstTexture->texture = device->createTexture(desc);
++        if (!dstTexture->texture) return false;
+ 
+-        uint32_t alignedRowPitch = nextSizeAlignedTo(rowPitch, TextureDataPitchAlignment);
+         if (uploadResourcePool != nullptr) {
+             assert(uploadResourcePoolMutex != nullptr);
+             std::unique_lock queueLock(*uploadResourcePoolMutex);
+-            dstUploadResource = uploadResourcePool->createBuffer(RenderBufferDesc::UploadBuffer(alignedRowPitch * height));
++            dstUploadResource = uploadResourcePool->createBuffer(RenderBufferDesc::UploadBuffer(uploadBytes));
+         }
+         else {
+-            dstUploadResource = device->createBuffer(RenderBufferDesc::UploadBuffer(alignedRowPitch * height));
++            dstUploadResource = device->createBuffer(RenderBufferDesc::UploadBuffer(uploadBytes));
+         }
+ 
+-        dstTexture->memorySize = alignedRowPitch * height;
++        if (!dstUploadResource) return false;
++        dstTexture->memorySize = uploadBytes;
+ 
+         uint8_t *dstData = reinterpret_cast<uint8_t *>(dstUploadResource->map());
++        if (!dstData) return false;
+         const uint8_t *srcData = reinterpret_cast<const uint8_t *>(bytes);
+         memcpyRows(dstData, alignedRowPitch, srcData, rowPitch, height);
+         dstUploadResource->unmap();
+@@ -691,6 +702,7 @@ namespace RT64 {
+         uint32_t alignedRowWidth = alignedRowPitch / RenderFormatSize(dstTexture->format);
+         commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(dstTexture->texture.get(), RenderTextureLayout::COPY_DEST));
+         commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(dstTexture->texture.get()), RenderTextureCopyLocation::PlacedFootprint(dstUploadResource.get(), dstTexture->format, width, height, 1, alignedRowWidth));
++        return true;
+     }
+ 
+     static RenderTextureDimension toRenderDimension(ddspp::TextureType type) {
+@@ -892,6 +904,7 @@ namespace RT64 {
+ 
+         RenderTextureDesc desc;
+         desc.dimension = toRenderDimension(ddsDescriptor.type);
++        desc.sharedWithCopyQueue = true;
+         desc.width = nextSizeAlignedTo(ddsDescriptor.width, blockWidth);
+         desc.height = nextSizeAlignedTo(ddsDescriptor.height, blockHeight);
+         desc.depth = 1;
+@@ -1087,6 +1100,7 @@ namespace RT64 {
+                     break;
+                 }
+                 RenderTextureDesc textureDesc = RenderTextureDesc::Texture2D(cacheHeader->width, cacheHeader->height, cacheHeader->mipCount, renderFormat);
++                textureDesc.sharedWithCopyQueue = true;
+                 Texture *newTexture = new Texture();
+                 newTexture->texture = device->createTexture(textureDesc);
+                 if (newTexture->texture == nullptr) {
+@@ -1177,9 +1191,8 @@ namespace RT64 {
+             stbi_uc *data = pixels.get();
+             if (data != nullptr) {
+                 uint32_t rowPitch = uint32_t(width) * 4;
+-                size_t byteCount = uint32_t(height) * rowPitch;
+-                TextureCache::setRGBA32(replacementTexture.get(), device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource, resourcePool, uploadResourcePoolMutex);
+-                loadedTexture = true;
++                size_t byteCount = size_t(height) * rowPitch;
++                loadedTexture = TextureCache::setRGBA32(replacementTexture.get(), device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource, resourcePool, uploadResourcePoolMutex);
+             }
+ 
+             break;
+@@ -1346,7 +1359,9 @@ namespace RT64 {
+                     newTexture->format = RenderFormat::R8_UINT;
+                     newTexture->width = upload.width;
+                     newTexture->height = upload.height;
+-                    newTexture->tmem = copyWorker->device->createTexture(RenderTextureDesc::Texture1D(std::max(uint32_t(upload.bytesTMEM.size()), 1U), 1, newTexture->format));
++                    auto tmemDesc = RenderTextureDesc::Texture1D(std::max(uint32_t(upload.bytesTMEM.size()), 1U), 1, newTexture->format);
++                    tmemDesc.sharedWithCopyQueue = true;
++                    newTexture->tmem = copyWorker->device->createTexture(tmemDesc);
+                     newTexture->tmem->setName("Texture Cache TMEM #" + std::to_string(TMEMGlobalCounter++));
+                     newTexture->bytesTMEM = upload.bytesTMEM;
+                     newTexture->loadTile = upload.loadTile;
+@@ -1450,6 +1465,7 @@ namespace RT64 {
+                         else if (textureMap.replacementMap.fileSystems[resolvedPath.fileSystemIndex]->load(resolvedPath.relativePath, replacementBytes)) {
+                             replacementUploadResources.emplace_back();
+                             replacementTexture = TextureCache::loadTextureFromBytes(copyWorker->device, copyWorker->commandList.get(), replacementBytes, replacementUploadResources.back());
++                            if (replacementTexture == nullptr) continue;
+                             textureMapMutex.lock();
+                             textureMap.replacementMap.addLoadedTexture(replacementTexture, resolvedPath.fileSystemIndex, resolvedPath.relativePath, true);
+                             textureMapMutex.unlock();
+
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+index c55e87a..0ccccd7 100644
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -284,7 +284,7 @@ namespace RT64 {
+         void setReplacementPoolMaxSize(uint64_t maxSize);
+         void getReplacementPoolStats(uint64_t &usedSize, uint64_t &cachedSize, uint64_t &maxSize);
+         Texture *getTexture(uint32_t textureIndex);
+-        static void setRGBA32(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, uint32_t width, uint32_t height, uint32_t rowPitch, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
++        static bool setRGBA32(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, uint32_t width, uint32_t height, uint32_t rowPitch, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+         static bool setDDS(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+         static bool setLowMipCache(RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, std::unordered_map<std::string, LowMipCacheTexture> &dstTextureMap, uint64_t &totalMemory);
+         static Texture *loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+
+diff --git a/src/common/rt64_filesystem_zip.cpp b/src/common/rt64_filesystem_zip.cpp
+index e1a03ee..3505635 100644
+--- a/src/common/rt64_filesystem_zip.cpp
++++ b/src/common/rt64_filesystem_zip.cpp
+@@ -135,6 +135,10 @@ namespace RT64 {
+             return false;
+         }
+ 
++        const auto &info = it->second;
++        const size_t archiveSize = impl->zipMappedFile.size();
++        if (info.localHeaderOffset > archiveSize ||
++            MZ_ZIP_LOCAL_DIR_HEADER_SIZE > archiveSize - info.localHeaderOffset) return false;
+         // Validate the local dir header.
+         const char *localDirHeader = reinterpret_cast<const char *>(&impl->zipMappedFile.data()[it->second.localHeaderOffset]);
+         if (MZ_READ_LE32(localDirHeader) != MZ_ZIP_LOCAL_DIR_HEADER_SIG) {
+@@ -145,6 +149,8 @@ namespace RT64 {
+         uint32_t ldhFilenameLenOfs = MZ_READ_LE16(localDirHeader + MZ_ZIP_LDH_FILENAME_LEN_OFS);
+         uint32_t ldhExtraLenOfs = MZ_READ_LE16(localDirHeader + MZ_ZIP_LDH_EXTRA_LEN_OFS);
+         size_t dataAddress = it->second.localHeaderOffset + MZ_ZIP_LOCAL_DIR_HEADER_SIZE + ldhFilenameLenOfs + ldhExtraLenOfs;
++        if (dataAddress < info.localHeaderOffset || dataAddress > archiveSize ||
++            info.compressedSize > archiveSize - dataAddress) return false;
+ 
+         // Make sure output vector has enough bytes to hold the data.
+         const uint8_t *zipFileData = reinterpret_cast<const uint8_t *>(&impl->zipMappedFile.data()[dataAddress]);
+@@ -154,15 +160,16 @@ namespace RT64 {
+             }
+         }
+         else if (it->second.compression == FileSystemZipInfo::Compression::Deflate) {
+-            if (tinfl_decompress_mem_to_mem(fileData, it->second.uncompressedSize, zipFileData, it->second.compressedSize, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF) == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) {
++            if (tinfl_decompress_mem_to_mem(fileData, it->second.uncompressedSize, zipFileData, it->second.compressedSize, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF) != it->second.uncompressedSize) {
+                 return false;
+             }
+         }
+         else {
++            if (info.compressedSize != info.uncompressedSize) return false;
+             memcpy(fileData, zipFileData, it->second.uncompressedSize);
+         }
+ 
+-        return true;
++        return mz_crc32(MZ_CRC32_INIT, fileData, info.uncompressedSize) == info.checksumCRC32;
+     }
+ 
+     size_t FileSystemZip::getSize(const std::string &path) const {
+@@ -219,4 +226,4 @@ namespace RT64 {
+         const FileSystemZipIterator *otherZipIt = static_cast<const FileSystemZipIterator *>(other);
+         return (iterator == otherZipIt->iterator);
+     }
+-};
+\ No newline at end of file
++};
+
+diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index e8989f0..a30a072 100644
+--- a/src/hle/rt64_application.cpp
++++ b/src/hle/rt64_application.cpp
+@@ -493,7 +493,8 @@ namespace RT64 {
+         std::unique_ptr<RenderBuffer> blueNoiseUploadBuffer;
+         {
+             RenderWorkerExecution execution(workloadGraphicsWorker.get());
+-            TextureCache::setRGBA32(&blueNoiseTexture, workloadGraphicsWorker->device, workloadGraphicsWorker->commandList, LDR_64_64_64_RGB1_BGRA8, int(sizeof(LDR_64_64_64_RGB1_BGRA8)), 512, 512, 512 * 4, blueNoiseUploadBuffer);
++            if (!TextureCache::setRGBA32(&blueNoiseTexture, workloadGraphicsWorker->device, workloadGraphicsWorker->commandList, LDR_64_64_64_RGB1_BGRA8, int(sizeof(LDR_64_64_64_RGB1_BGRA8)), 512, 512, 512 * 4, blueNoiseUploadBuffer))
++                return SetupResult::GraphicsDeviceNotFound;
+         }
+ 
+         blueNoiseUploadBuffer.reset();

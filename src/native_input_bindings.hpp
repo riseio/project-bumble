@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace bumble::input_bindings {
 
@@ -40,6 +41,8 @@ enum class InputAction : uint32_t {
     MenuConfirm,
     MenuBack,
     ToggleModernVisuals,
+    FlyUp,
+    FlyDown,
     Count,
 };
 
@@ -100,6 +103,10 @@ struct Settings {
     uint32_t joystick_look_deadzone = 7000u;
     bool invert_joystick_look_x = false;
     bool invert_joystick_look_y = false;
+    uint32_t mouse_sensitivity = 100u;
+    uint32_t mouse_sensitivity_x = 100u;
+    uint32_t mouse_sensitivity_y = 100u;
+    bool mouse_acceleration = false;
     BindingTable keyboard_mouse{};
     BindingTable controller{};
 };
@@ -111,7 +118,8 @@ struct CaptureState {
     InputAction action = InputAction::MoveForward;
 };
 
-Settings default_settings(uint32_t version = 7u);
+Settings default_settings(uint32_t version = 8u);
+std::pair<float, float> scale_mouse_delta(const Settings& settings, float x, float y, float seconds);
 inline void apply_menu_dpad(float& x, float& y, bool up, bool down,
                             bool left, bool right, bool menu_active) {
     if (!menu_active) return;

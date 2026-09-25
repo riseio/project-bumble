@@ -1133,6 +1133,7 @@ extern "C" void bumble_guard_post_object_matrix_capacity(
         return;
     }
 
+    // Other values skip drawing.
     context->r3 = 2;
     if (!diagnostics_enabled()) {
         return;

@@ -1,4 +1,5 @@
 #include "native_level_editor.hpp"
+#include "librecomp/game.hpp"
 
 #if defined(_WIN32)
 #include <Windows.h>
@@ -538,25 +539,10 @@ uint32_t read_be32(const std::vector<uint8_t>& bytes, size_t offset) {
         static_cast<uint32_t>(bytes[offset + 3u]);
 }
 
-bool load_catalog_from_rom_locked(const std::filesystem::path& rom_path) {
-    std::ifstream stream(rom_path, std::ios::binary | std::ios::ate);
-    if (!stream) {
-        return false;
-    }
-    const std::streamoff size = stream.tellg();
-    if (size < static_cast<std::streamoff>(kRecordBytes + 4u) ||
-        size > static_cast<std::streamoff>(32u * 1024u * 1024u)) {
-        return false;
-    }
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    stream.seekg(0, std::ios::beg);
-    stream.read(
-        reinterpret_cast<char*>(bytes.data()),
-        static_cast<std::streamsize>(bytes.size())
-    );
-    if (!stream) {
-        return false;
-    }
+bool load_catalog_from_rom_locked() {
+    const auto rom = recomp::get_rom();
+    if (rom.size() != 0xC00000u) return false;
+    const std::vector<uint8_t> bytes(rom.begin(), rom.end());
 
     g_catalog.clear();
     g_authored_record_count = 0u;
@@ -2588,7 +2574,6 @@ void process_tick_locked(
 
 bool bumble::level_editor::initialize(
     const std::filesystem::path& data_root,
-    const std::filesystem::path& rom_path,
     bool enabled
 ) {
     std::lock_guard lock(g_mutex);
@@ -2627,7 +2612,7 @@ bool bumble::level_editor::initialize(
     }
     if (!coordinate_self_check() || !catalog_label_self_check() ||
         !page_action_self_check() ||
-        !load_catalog_from_rom_locked(rom_path) ||
+        !load_catalog_from_rom_locked() ||
         !load_document_locked()) {
         std::fprintf(
             stderr,

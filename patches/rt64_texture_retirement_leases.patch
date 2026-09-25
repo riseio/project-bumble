@@ -1,0 +1,298 @@
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 6c381b7..f97bacf 100644
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -91,7 +91,7 @@ namespace RT64 {
+         workloadId = 0;
+         lastPresentId = 0;
+         pendingTextureLocks = 0;
+-        interpolationWorkerTextureLocks.fill(false);
++        interpolationWorkerTextureLocks.fill(0);
+         for (auto &query : performanceGPUQueries) {
+             query.reset();
+         }
+@@ -687,12 +687,11 @@ namespace RT64 {
+         // A sibling queue user may already have retired this fence.
+         collectPerformanceGPUQuery(workerIndex);
+         finishGeometryReadback(geometryReadbacks[workerIndex]);
+-        if (!retired) {
+-            return;
+-        }
+         if (interpolationWorkerTextureLocks[workerIndex]) {
+-            ext.textureCache->decrementLock();
+-            interpolationWorkerTextureLocks[workerIndex] = false;
++            if (!retired) PerformanceProfiler::recordInstant(PerformanceCategory::Wait,
++                "Renderer.TextureLockRetiredAfterSibling", presentationFrameCounter, workerIndex);
++            ext.textureCache->decrementLock(interpolationWorkerTextureLocks[workerIndex]);
++            interpolationWorkerTextureLocks[workerIndex] = 0;
+             assert(pendingTextureLocks > 0);
+             pendingTextureLocks--;
+         }
+@@ -1140,7 +1139,8 @@ namespace RT64 {
+             }
+ 
+             // Indicate to the texture cache the textures must not be deleted.
+-            ext.textureCache->incrementLock();
++            assert(!interpolationWorkerTextureLocks[submission.workerIndex]);
++            interpolationWorkerTextureLocks[submission.workerIndex] = ext.textureCache->incrementLock();
+             pendingTextureLocks++;
+ 
+             // Reset the texture cache vectors for the framebuffer renderer.
+@@ -1260,7 +1260,7 @@ namespace RT64 {
+ 
+             const uint64_t workerLockStart =
+                 PerformanceProfiler::nowNanoseconds();
+-            workerMutex.lock();
++            std::unique_lock workerLock(workerMutex);
+             PerformanceProfiler::recordDuration(
+                 PerformanceCategory::Wait,
+                 "Renderer.WorkerMutexWait",
+@@ -1615,6 +1615,7 @@ namespace RT64 {
+ 
+             // A stop request can arrive during command construction.
+             if (!threadsRunning) {
++                if (performanceGPUQuery != nullptr) performanceGPUQuery->pending = false;
+                 return;
+             }
+             if (submission.targetReadySemaphore != nullptr) {
+@@ -1627,8 +1628,6 @@ namespace RT64 {
+             else {
+                 ext.workloadGraphicsWorker->execute();
+             }
+-            assert(!interpolationWorkerTextureLocks[submission.workerIndex]);
+-            interpolationWorkerTextureLocks[submission.workerIndex] = true;
+             if (geometryReadback) {
+                 assert(!geometryReadbacks[submission.workerIndex].pending);
+                 geometryReadbacks[submission.workerIndex] = std::move(geometryCopy);
+@@ -1675,8 +1674,7 @@ namespace RT64 {
+                 }
+                 const uint64_t fenceWaitStart =
+                     PerformanceProfiler::nowNanoseconds();
+-                ext.workloadGraphicsWorker->wait();
+-                finishGeometryReadback(geometryReadbacks[submission.workerIndex]);
++                retireInterpolationWorker(submission.workerIndex);
+                 const uint64_t fenceWaitEnd =
+                     PerformanceProfiler::nowNanoseconds();
+                 if (measureFenceWait) {
+@@ -1694,7 +1692,7 @@ namespace RT64 {
+                     rendererFenceWaitProfiler.reset();
+                 }
+             }
+-            workerMutex.unlock();
++            workerLock.unlock();
+ 
+             if (performanceInstrumentationEnabled) {
+                 rendererRelockWaitProfiler.start();
+
+diff --git a/src/hle/rt64_workload_queue.h b/src/hle/rt64_workload_queue.h
+index 39c6c2c..7ecbf1f 100644
+--- a/src/hle/rt64_workload_queue.h
++++ b/src/hle/rt64_workload_queue.h
+@@ -112,7 +112,7 @@ namespace RT64 {
+         std::array<std::unique_ptr<RenderWorker>,
+             MaximumInterpolationFramesInFlight> interpolationGraphicsWorkers;
+         std::array<GeometryReadback, MaximumInterpolationFramesInFlight> geometryReadbacks;
+-        std::array<bool, MaximumInterpolationFramesInFlight>
++        std::array<uint64_t, MaximumInterpolationFramesInFlight>
+             interpolationWorkerTextureLocks{};
+         std::mutex threadMutex;
+         std::atomic<bool> threadsRunning = false;
+
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 8b2fba5..ad04159 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -1261,6 +1261,7 @@ namespace RT64 {
+         );
+         stageStart = PerformanceProfiler::nowNanoseconds();
+ 
++        uint64_t textureLock = 0;
+         if (renderToRDRAM) {
+             const hlslpp::float2 resolutionScale(1.0f, 1.0f);
+             RT64::Framebuffer *colorFb = nullptr;
+@@ -1650,7 +1651,7 @@ namespace RT64 {
+             checkRenderTargetSafety(true);
+ 
+             // Indicate to the texture cache the textures must not be deleted.
+-            ext.textureCache->incrementLock();
++            textureLock = ext.textureCache->incrementLock();
+ 
+             // Perform any preliminar setup before processing the framebuffer pairs.
+             renderSetup();
+@@ -1695,7 +1696,7 @@ namespace RT64 {
+ 
+         if (renderToRDRAM) {
+             // Indicate to the texture cache it's safe to delete the textures if no locks are active.
+-            ext.textureCache->decrementLock();
++            ext.textureCache->decrementLock(textureLock);
+ 
+             framebufferManager.hashTracking(RDRAM);
+ 
+
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+index 8bc47f3..1b5405e 100644
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <cinttypes>
+ #include <cstdio>
++#include <stdexcept>
+ 
+ #include "ddspp/ddspp.h"
+ #include "stb/stb_image.h"
+@@ -585,6 +586,7 @@ namespace RT64 {
+         }
+ 
+         lockCounter = 0;
++        activeLocks.reserve(WorkloadQueue::MaximumInterpolationFramesInFlight + 1);
+ 
+         // Copy the command list and fence used by the methods called from the main thread.
+         loaderCommandList = copyWorker->commandQueue->createCommandList();
+@@ -633,6 +635,10 @@ namespace RT64 {
+         tmemUploadResources.clear();
+         replacementUploadResources.clear();
+         uploadResourcePool.reset(nullptr);
++        assert(activeLocks.empty());
++        for (const auto &batch : retiredTextures) {
++            for (Texture *texture : batch.textures) delete texture;
++        }
+     }
+ 
+     static uint32_t nextSizeAlignedTo(uint32_t size, uint32_t alignment) {
+@@ -1261,6 +1267,7 @@ namespace RT64 {
+                 uploadBatchInFlight = true;
+             }
+ 
++            const uint64_t uploadLock = incrementLock();
+             if (!directorySelection.empty()) {
+                 std::unique_lock lock(textureMapMutex);
+                 auto &map = textureMap.replacementMap;
+@@ -1587,6 +1594,7 @@ namespace RT64 {
+                 directWorker->wait();
+                 replacementUploadResources.clear();
+             }
++            decrementLock(uploadLock);
+             {
+                 std::unique_lock queueLock(uploadQueueMutex);
+                 directorySelectionInFlight = false;
+@@ -2098,23 +2106,38 @@ namespace RT64 {
+         return textureMap.evict(submissionFrame, evictedHashes);
+     }
+ 
+-    void TextureCache::incrementLock() {
++    uint64_t TextureCache::incrementLock() {
+         std::unique_lock lock(textureMapMutex);
++        const uint64_t lockId = nextLockId++;
++        activeLocks.push_back(lockId);
+         lockCounter++;
++        return lockId;
+     }
+ 
+-    void TextureCache::decrementLock() {
++    void TextureCache::decrementLock(uint64_t lockId) {
++        std::vector<Texture *> ready;
+         std::unique_lock lock(textureMapMutex);
++        const auto user = std::find(activeLocks.begin(), activeLocks.end(), lockId);
++        if (user == activeLocks.end()) throw std::logic_error("Unknown texture-cache lock");
++        *user = activeLocks.back();
++        activeLocks.pop_back();
+         lockCounter--;
+ 
+-        if (lockCounter == 0) {
+-            // Delete evicted textures from texture map.
+-            for (Texture *texture : textureMap.evictedTextures) {
+-                delete texture;
+-            }
+-
++        if (!textureMap.evictedTextures.empty()) {
++            retiredTextures.push_back({nextLockId - 1, std::move(textureMap.evictedTextures)});
+             textureMap.evictedTextures.clear();
+         }
++        const uint64_t oldestUser = activeLocks.empty() ? nextLockId :
++            *std::min_element(activeLocks.begin(), activeLocks.end());
++        while (!retiredTextures.empty() && retiredTextures.front().lastUser < oldestUser) {
++            auto &textures = retiredTextures.front().textures;
++            if (ready.empty()) ready.swap(textures);
++            else ready.insert(ready.end(), textures.begin(), textures.end());
++            retiredTextures.pop_front();
++        }
++        lock.unlock();
++        PerformanceScope retirement(PerformanceCategory::CPU, "Texture.RetireResources", 0, ready.size());
++        for (Texture *texture : ready) delete texture;
+     }
+ 
+     bool TextureCache::queueReplacementDirectorySelection(const std::vector<bool> &enabled) {
+
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+index 0ccccd7..00d5891 100644
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -6,6 +6,7 @@
+ 
+ #include <atomic>
+ #include <condition_variable>
++#include <deque>
+ #include <filesystem>
+ #include <mutex>
+ #include <stack>
+@@ -251,6 +252,13 @@ namespace RT64 {
+         std::unique_ptr<RenderPool> uploadResourcePool;
+         std::mutex uploadResourcePoolMutex;
+         uint32_t lockCounter;
++        uint64_t nextLockId = 1;
++        std::vector<uint64_t> activeLocks;
++        struct RetiredTextures {
++            uint64_t lastUser;
++            std::vector<Texture *> textures;
++        };
++        std::deque<RetiredTextures> retiredTextures;
+         bool developerMode;
+ 
+         TextureCache(RenderWorker *directWorker, RenderWorker *copyWorker, RenderWorker *workloadWorker, uint32_t threadCount, const ShaderLibrary *shaderLibrary);
+@@ -275,8 +283,8 @@ namespace RT64 {
+         void setReplacementOperation(uint64_t hash, ReplacementOperation operation);
+         void removeUnusedEntriesFromDatabase();
+         bool evict(uint64_t submissionFrame, std::vector<uint64_t> &evictedHashes);
+-        void incrementLock();
+-        void decrementLock();
++        uint64_t incrementLock();
++        void decrementLock(uint64_t lockId);
+         void waitForAllStreamThreads(bool clearQueueImmediately);
+         void resetStreamPerformanceCounters();
+         void addStreamLoadTime(uint64_t streamLoadTime);
+
+diff --git a/src/gui/rt64_debugger_inspector.cpp b/src/gui/rt64_debugger_inspector.cpp
+index 0e9cde0..549eb4c 100644
+--- a/src/gui/rt64_debugger_inspector.cpp
++++ b/src/gui/rt64_debugger_inspector.cpp
+@@ -1235,17 +1235,23 @@ namespace RT64 {
+                                             showHashAndReplaceButton(callTile.tmemHashOrID, shift);
+                                         }
+ 
+-                                        uint32_t textureIndex = 0;
+-                                        const Texture *texture = nullptr;
+                                         if (ImGui::Button("Dump TMEM")) {
+-                                            textureCache.useTexture(callTile.tmemHashOrID, workload.submissionFrame, textureIndex);
+-                                            texture = textureCache.getTexture(textureIndex);
+-                                            if (texture != nullptr) {
++                                            std::vector<uint8_t> bytes;
++                                            bool found = false;
++                                            {
++                                                std::lock_guard lock(textureCache.textureMapMutex);
++                                                const auto entry = textureCache.textureMap.hashMap.find(callTile.tmemHashOrID);
++                                                if (entry != textureCache.textureMap.hashMap.end()) {
++                                                    bytes = textureCache.textureMap.get(entry->second)->bytesTMEM;
++                                                    found = true;
++                                                }
++                                            }
++                                            if (found) {
+                                                 std::filesystem::path binFilename = FileDialog::getSaveFilename({ FileFilter("BIN Files", "bin") });
+                                                 if (!binFilename.empty()) {
+                                                     std::ofstream o(binFilename, std::ios_base::out | std::ios_base::binary);
+                                                     if (o.is_open()) {
+-                                                        o.write(reinterpret_cast<const char *>(texture->bytesTMEM.data()), texture->bytesTMEM.size());
++                                                        o.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+                                                     }
+                                                 }
+                                             }

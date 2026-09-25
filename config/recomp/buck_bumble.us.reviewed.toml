@@ -522,9 +522,9 @@ before_vram = 0x800B1FF0
 text = "bumble_mark_modern_gameplay_active(rdram, ctx);"
 
 [[patches.hook]]
-func = "gameplay_pause_update"
-before_vram = 0x800B1F98
-text = "bumble_apply_unlimited_health_gate(rdram, ctx);"
+func = "func_80058500"
+before_vram = 0x80059DBC
+text = "bumble_apply_damage_immunity(rdram, ctx);"
 
 [[patches.hook]]
 func = "func_800AFE28"
@@ -738,11 +738,6 @@ text = "bumble_autosave_campaign_progress(rdram, ctx); buck_mission1_level_incre
 
 [[patches.hook]]
 func = "func_800B2BB8"
-before_vram = 0x800B2C08
-text = "bumble_apply_unlimited_health_gate(rdram, ctx);"
-
-[[patches.hook]]
-func = "func_800B2BB8"
 before_vram = 0x800B2C48
 text = "bumble_cancel_life_decrement(rdram, ctx);"
 
@@ -750,11 +745,6 @@ text = "bumble_cancel_life_decrement(rdram, ctx);"
 func = "func_800B2BB8"
 before_vram = 0x800B2C54
 text = "bumble_remove_lives_gate(rdram, ctx);"
-
-[[patches.hook]]
-func = "func_800B518C"
-before_vram = 0x800B51B4
-text = "bumble_apply_unlimited_health_gate(rdram, ctx);"
 
 [[patches.hook]]
 func = "func_800B518C"
@@ -885,6 +875,16 @@ text = "bumble_enemy_spawner_retire_collision(rdram, (uint32_t)ctx->r17);"
 func = "player_actor_update"
 before_vram = 0x8005A520
 text = "bumble_apply_honeycomb_water_rescue(rdram, ctx); buck_player_state_dispatch_probe(rdram, ctx);"
+
+[[patches.hook]]
+func = "player_actor_construct"
+before_vram = 0x800574C0
+text = "bumble_retire_player_lifetime(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8005DB14"
+before_vram = 0x8005DB14
+text = "bumble_retire_player_lifetime(rdram, ctx);"
 
 [[patches.hook]]
 func = "player_actor_update"
@@ -1763,3 +1763,8 @@ text = "bumble_apply_mission_time_limit(rdram, ctx);"
 func = "func_80094544"
 before_vram = 0x80094690
 text = "bumble_apply_mission_time_limit(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800A92AC"
+before_vram = 0x800A9400
+text = "bumble_scale_cutscene_text_delay(rdram, ctx);"

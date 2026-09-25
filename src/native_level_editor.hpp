@@ -21,7 +21,6 @@ struct Preview {
 
 bool initialize(
     const std::filesystem::path& data_root,
-    const std::filesystem::path& rom_path,
     bool enabled
 );
 void shutdown();

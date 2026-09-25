@@ -23,7 +23,7 @@ private:
     Snapshot value;
 };
 
-void run_preparation(const std::function<void(PreparationProgress&)>& work);
+void run_preparation(const std::function<void(PreparationProgress&)>& work, bool checking = false);
 struct TextureChoice { bool generate = false; bool remember = false; };
 TextureChoice choose_enhanced_textures();
 }

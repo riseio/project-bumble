@@ -1,0 +1,29 @@
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -920,6 +920,25 @@ namespace plume {
++        if (!readRange || readRange->end > readRange->begin) {
++            res = vmaInvalidateAllocation(device->allocator, allocation,
++                readRange ? readRange->begin : 0,
++                readRange ? readRange->end - readRange->begin : VK_WHOLE_SIZE);
++            if (res != VK_SUCCESS) {
++                vmaUnmapMemory(device->allocator, allocation);
++                fprintf(stderr, "vmaInvalidateAllocation failed with error code 0x%X.\n", res);
++                return nullptr;
++            }
++        }
+         return data;
+     }
+ 
+     void VulkanBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
++        if (!writtenRange || writtenRange->end > writtenRange->begin) {
++            const VkResult res = vmaFlushAllocation(device->allocator, allocation,
++                writtenRange ? writtenRange->begin : 0,
++                writtenRange ? writtenRange->end - writtenRange->begin : VK_WHOLE_SIZE);
++            if (res != VK_SUCCESS) {
++                fprintf(stderr, "vmaFlushAllocation failed with error code 0x%X.\n", res);
++                std::abort();
++            }
++        }
+         vmaUnmapMemory(device->allocator, allocation);
+     }

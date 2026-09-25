@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <json/json.hpp>
+#include "common/rt64_performance_profiler.h"
 
 #include "native_checkpoint_bridge.hpp"
 #include "native_graphics_options.hpp"
@@ -4277,6 +4278,7 @@ void close_controllers_locked() {
 }
 
 void scan_controllers_locked() {
+    RT64::PerformanceScope scope(RT64::PerformanceCategory::CPU, "Input.ControllerScan");
     close_controllers_locked();
 
     size_t slot = 0;
@@ -4947,6 +4949,7 @@ void bumble::native_io::add_mouse_wheel_delta(int delta) {
     const auto binding = input_bindings::mouse_binding(delta > 0
         ? input_bindings::MouseButton::WheelUp
         : input_bindings::MouseButton::WheelDown);
+    // Binding capture consumes wheel input.
     if (input_bindings::process_keyboard_capture(binding, true,
             physical_keyboard_mouse_neutral())) return;
     if (!modern_controls::gameplay_input_active() ||
@@ -5112,7 +5115,10 @@ void bumble::native_io::shutdown() {
 }
 
 void bumble::native_io::pump_events() {
+    RT64::PerformanceScope scope(RT64::PerformanceCategory::CPU, "Input.EventPump");
+    RT64::PerformanceScope lock_scope(RT64::PerformanceCategory::Wait, "Input.EventPumpLock");
     std::lock_guard lock(g_controller_mutex);
+    lock_scope.end();
 #if !defined(_WIN32)
     bumble::graphics_options::apply_pending_windowed_resolution();
     const bool replay_configured =
@@ -5235,7 +5241,10 @@ bool bumble::native_io::quit_requested() {
 }
 
 void bumble::native_io::poll_input() {
+    RT64::PerformanceScope scope(RT64::PerformanceCategory::CPU, "Input.Poll");
+    RT64::PerformanceScope lock_scope(RT64::PerformanceCategory::Wait, "Input.PollLock");
     std::lock_guard lock(g_controller_mutex);
+    lock_scope.end();
     for (size_t index = 0; index < kKeyboardWordCount; ++index) {
         g_keyboard_pressed_for_poll[index] =
             g_keyboard_pressed_since_poll[index].exchange(
@@ -5253,7 +5262,10 @@ void bumble::native_io::poll_input() {
         false,
         physical_keyboard_mouse_neutral()
     );
-    SDL_GameControllerUpdate();
+    {
+        RT64::PerformanceScope update_scope(RT64::PerformanceCategory::CPU, "Input.ControllerUpdate");
+        SDL_GameControllerUpdate();
+    }
     const input_bindings::ControllerInput capture_candidate =
         first_controller_input(g_controllers[0]);
     input_bindings::process_controller_capture(
@@ -5456,7 +5468,13 @@ void bumble::native_io::poll_input() {
                     );
                     bumble::modern_controls::set_movement_input(
                         modern_forward,
-                        modern_strafe
+                        modern_strafe,
+                        modern_gameplay && bumble::modern_controls::window_focused()
+                            ? float((allow_keyboard && keyboard_action_down(bindings, input_bindings::InputAction::FlyUp)) ||
+                                (allow_controller && controller_action_down(g_controllers[index], bindings, input_bindings::InputAction::FlyUp))) -
+                              float((allow_keyboard && keyboard_action_down(bindings, input_bindings::InputAction::FlyDown)) ||
+                                (allow_controller && controller_action_down(g_controllers[index], bindings, input_bindings::InputAction::FlyDown)))
+                            : 0.0f
                     );
                     bumble::modern_controls::add_controller_look(
                         modern_look_x,

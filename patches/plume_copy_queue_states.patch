@@ -1,0 +1,25 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -2064,7 +2064,10 @@
+                 barrierVector.emplace_back(resourceBarrier);
+             }
+ 
+-            interfaceBuffer->resourceStates = stateAfter;
++            // Copy-queue promotion decays at submission completion.
++            if (interfaceBuffer->desc.heapType == RenderHeapType::DEFAULT)
++                interfaceBuffer->resourceStates = queue->type == RenderCommandListType::COPY
++                    ? D3D12_RESOURCE_STATE_COMMON : stateAfter;
+         }
+         
+         bool resetSamplePositionsRequired = false;
+@@ -2074,7 +2077,8 @@
+             D3D12_RESOURCE_STATES stateBefore = interfaceTexture->resourceStates;
+             D3D12_RESOURCE_STATES stateAfter = toTextureState(stages, textureBarrier.layout, interfaceTexture->desc.flags);
+             bool madeBarrier = makeBarrier(interfaceTexture->d3d, stateBefore, stateAfter, interfaceTexture->desc.flags & RenderTextureFlag::UNORDERED_ACCESS, resourceBarrier);
+-            interfaceTexture->resourceStates = stateAfter;
++            interfaceTexture->resourceStates = queue->type == RenderCommandListType::COPY
++                ? D3D12_RESOURCE_STATE_COMMON : stateAfter;
+             interfaceTexture->layout = textureBarrier.layout;
+             if (!madeBarrier) {
+                 continue;

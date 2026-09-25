@@ -4,7 +4,8 @@
 #include <SDL2/SDL.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -13,12 +14,16 @@
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <chrono>
+#include <cstddef>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
 #include <exception>
 #include <filesystem>
 #include <string>
+#include <stdexcept>
 #include <system_error>
 #include <vector>
 
@@ -54,6 +59,10 @@
 #include "ultramodern/ultramodern.hpp"
 #include "../lib/RT64/src/common/rt64_performance_profiler.h"
 #include "ultramodern/rt64_guest_vi_bridge.hpp"
+
+#if !defined(_WIN32)
+#include <sys/auxv.h>
+#endif
 
 extern RspUcodeFunc n_aspMain;
 
@@ -140,18 +149,14 @@ bool acquire_single_instance() {
     return g_single_instance_mutex != nullptr &&
         GetLastError() != ERROR_ALREADY_EXISTS;
 #else
-    const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
-    std::filesystem::path lock_path = runtime_dir != nullptr && *runtime_dir != '\0'
-        ? std::filesystem::path(runtime_dir)
-        : std::filesystem::temp_directory_path();
-    lock_path /= "bumble-recomp-" + std::to_string(getuid()) + ".lock";
-    g_single_instance_fd = open(
-        lock_path.c_str(),
-        O_CREAT | O_CLOEXEC | O_RDWR,
-        0600
-    );
-    return g_single_instance_fd >= 0 &&
-        flock(g_single_instance_fd, LOCK_EX | LOCK_NB) == 0;
+    const std::string name = "bumble-recomp-" + std::to_string(getuid());
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path + 1, name.data(), name.size());
+    g_single_instance_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    return g_single_instance_fd >= 0 && bind(g_single_instance_fd,
+        reinterpret_cast<const sockaddr*>(&address),
+        offsetof(sockaddr_un, sun_path) + 1 + name.size()) == 0;
 #endif
 }
 
@@ -179,6 +184,12 @@ std::filesystem::path executable_directory() {
     buffer.resize(length);
     return std::filesystem::path(buffer).parent_path();
 #else
+    if (const auto* executed = reinterpret_cast<const char*>(getauxval(AT_EXECFN));
+        executed != nullptr && *executed != '\0') {
+        std::error_code error;
+        const auto path = std::filesystem::canonical(executed, error);
+        if (!error) return path.parent_path();
+    }
     std::array<char, PATH_MAX> buffer{};
     const ssize_t length = readlink(
         "/proc/self/exe",
@@ -193,7 +204,7 @@ std::filesystem::path executable_directory() {
 #endif
 }
 
-std::filesystem::path default_release_data_root() {
+std::filesystem::path legacy_release_data_root() {
 #if defined(_WIN32)
     std::wstring buffer(32768, L'\0');
     const DWORD length = GetEnvironmentVariableW(
@@ -216,6 +227,40 @@ std::filesystem::path default_release_data_root() {
     }
     return executable_directory() / "userdata";
 #endif
+}
+
+std::filesystem::path default_release_data_root() {
+    auto directory = executable_directory();
+#if !defined(_WIN32)
+    if (const char* image = std::getenv("APPIMAGE"); image && *image)
+        directory = std::filesystem::absolute(image).parent_path();
+#endif
+    if (directory.empty()) throw std::runtime_error("Cannot locate the game folder");
+    const auto target = directory / "userdata";
+    const auto legacy = legacy_release_data_root();
+    if (!std::filesystem::exists(target) && legacy != target &&
+        std::filesystem::is_directory(legacy)) {
+        const auto staging = directory / ("userdata.migrating-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directory(staging);
+        try {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(legacy)) {
+                if (entry.is_symlink()) throw std::runtime_error("Legacy data contains a symbolic link");
+            }
+            for (const auto& entry : std::filesystem::directory_iterator(legacy)) {
+                if (entry.path().filename() == "cache") continue;
+                std::filesystem::copy(entry.path(), staging / entry.path().filename(),
+                    std::filesystem::copy_options::recursive);
+            }
+            std::filesystem::rename(staging, target);
+        } catch (...) {
+            std::error_code ignored;
+            std::filesystem::remove_all(staging, ignored);
+            throw;
+        }
+    }
+    std::filesystem::create_directories(target);
+    return target;
 }
 
 void configure_rt64_pipeline_cache(const std::filesystem::path& data_root) {
@@ -249,6 +294,58 @@ void configure_rt64_pipeline_cache(const std::filesystem::path& data_root) {
             "BUMBLE_RT64_PROBE stage=pipeline_cache_path_failed error=%d\n",
             static_cast<int>(result)
         );
+    }
+}
+
+void configure_portable_environment(const std::filesystem::path& data_root) {
+    std::filesystem::create_directories(data_root);
+    auto reject_link = [](const std::filesystem::path& path) {
+#if defined(_WIN32)
+        const auto attributes = GetFileAttributesW(path.c_str());
+        const bool linked = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+        const bool linked = std::filesystem::is_symlink(std::filesystem::symlink_status(path));
+#endif
+        if (linked) throw std::runtime_error("Portable data must not contain redirected files or folders: " + path.string());
+    };
+    reject_link(data_root);
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(data_root))
+        reject_link(entry.path());
+    const auto cache = data_root / "cache";
+    const auto temporary = cache / "temp";
+    std::filesystem::create_directories(temporary);
+#if defined(_WIN32)
+    if (_wputenv_s(L"TEMP", temporary.c_str()) || _wputenv_s(L"TMP", temporary.c_str()))
+        throw std::runtime_error("Cannot configure portable temporary storage");
+#else
+    for (const auto* name : {"TMPDIR", "TMP", "TEMP"})
+        if (setenv(name, temporary.c_str(), 1))
+            throw std::runtime_error("Cannot configure portable temporary storage");
+    for (const auto& entry : {std::pair{"XDG_CACHE_HOME", cache},
+            std::pair{"MESA_SHADER_CACHE_DIR", cache / "mesa"},
+            std::pair{"__GL_SHADER_DISK_CACHE_PATH", cache / "nvidia"}}) {
+        std::filesystem::create_directories(entry.second);
+        if (setenv(entry.first, entry.second.c_str(), 1))
+            throw std::runtime_error("Cannot configure portable shader cache");
+    }
+#endif
+    const auto root = std::filesystem::canonical(data_root);
+    for (const auto* name : {"BUMBLE_WIDESCREEN_HUD_CAPTURE_DIR", "BUMBLE_RT64_TEXTURE_DUMP_DIR",
+            "BUMBLE_RT64_FRAME_PACING_REPORT", "RT64_PROFILE_OUTPUT", "RT64_PROFILE_CONTROL",
+            "RT64_PROFILE_SUMMARY"}) {
+        const char* value = std::getenv(name);
+        if (!value || !*value) continue;
+        const auto path = std::filesystem::weakly_canonical(root / std::filesystem::path(value));
+        const auto relative = path.lexically_relative(root);
+        if (relative.empty() || *relative.begin() == "..")
+            throw std::runtime_error(std::string(name) + " must be inside portable userdata");
+#if defined(_WIN32)
+        const std::wstring wideName(name, name + std::strlen(name));
+        if (_wputenv_s(wideName.c_str(), path.c_str()))
+#else
+        if (setenv(name, path.c_str(), 1))
+#endif
+            throw std::runtime_error("Cannot configure portable diagnostics");
     }
 }
 
@@ -381,7 +478,6 @@ bool register_raw_mouse(HWND window) {
         log_error("modern_mouse_registration_failed", GetLastError());
         return false;
     }
-    log_stage("modern_mouse_registered");
     return true;
 }
 
@@ -582,13 +678,9 @@ RspUcodeFunc* get_rsp_microcode(const OSTask* task) {
 }
 
 void on_game_init(uint8_t* rdram, recomp_context*) {
-    log_stage("game_init_callback_enter");
     install_buck_cart_rom_mirror(rdram);
-    log_stage("cart_rom_mirror_installed offset=0x30000000 size=0x00C00000 read_only=1");
     unload_overlays(kLoadedCoreAlias, kLoadedCoreSize);
-    log_stage("loaded_core_alias_unloaded");
     load_overlays(kLoadedCoreRom, kLoadedCoreRam, kLoadedCoreSize);
-    log_stage("loaded_core_mapping_registered");
     bumble::native_io::arm_replay();
 }
 
@@ -598,9 +690,7 @@ void diagnostic_entrypoint(uint8_t* rdram, recomp_context* context) {
     for (uint32_t address = kInitialBssStart; address < kInitialBssEnd; address += 4) {
         MEM_W(0, static_cast<int32_t>(address)) = 0;
     }
-    log_stage("guest_initial_bss_cleared");
     buck_main(rdram, context);
-    log_stage("entrypoint_thread_terminated_after_first_guest_thread_start");
     throw ultramodern::thread_terminated{};
 }
 
@@ -1255,7 +1345,23 @@ int main(int argc, char** argv) {
 
     std::filesystem::path rom_path;
     if (data_root.empty()) {
-        data_root = default_release_data_root();
+        try { data_root = default_release_data_root(); }
+        catch (const std::exception& error) {
+            std::fprintf(stderr, "Cannot prepare portable user data: %s\n", error.what());
+#if defined(_WIN32)
+            MessageBoxA(nullptr, "Bumble needs a writable game folder. Move it to a folder you own, then try again. Existing saves have not been removed.",
+                "Bumble startup error", MB_OK | MB_ICONERROR);
+#endif
+            return 3;
+        }
+    }
+    try { configure_portable_environment(data_root); }
+    catch (const std::exception& error) {
+        std::fprintf(stderr, "Cannot prepare portable cache: %s\n", error.what());
+#if defined(_WIN32)
+        MessageBoxA(nullptr, error.what(), "Bumble portable storage error", MB_OK | MB_ICONERROR);
+#endif
+        return 3;
     }
 #if defined(_WIN32)
     if (!bumble::portable::prepare(data_root, release_diagnostic_logging)) {
@@ -1272,6 +1378,7 @@ int main(int argc, char** argv) {
     } else {
         rom_path = std::filesystem::absolute(argv[1]);
     }
+    std::filesystem::current_path(data_root);
     const std::filesystem::path config_path = data_root / "config";
     if (controller_pak_root.empty()) {
         controller_pak_root = data_root / "controller-pak";
@@ -1333,10 +1440,8 @@ int main(int argc, char** argv) {
         log_stage("game_registration_failed");
         return 4;
     }
-    log_stage("game_registered");
 
     register_bumble_overlays();
-    log_stage("overlays_registered");
 
     const recomp::RomValidationError validation = recomp::select_rom(rom_path, game.game_id);
     if (validation != recomp::RomValidationError::Good) {
@@ -1360,13 +1465,11 @@ int main(int argc, char** argv) {
         }
         return 5;
     }
-    log_stage("rom_selected_and_copied_to_ignored_runtime_store");
     if (!recomp::load_stored_rom(game.game_id)) {
         log_stage("stored_rom_preflight_failed");
         return 6;
     }
-    log_stage("stored_rom_preflight_passed");
-    const auto assets = bumble::first_run::ensure_assets(data_root, rom_path, !replay_path.empty());
+    const auto assets = bumble::first_run::ensure_assets(data_root, !replay_path.empty());
     if (assets == bumble::first_run::AssetResult::Cancelled) return 0;
     if (assets != bumble::first_run::AssetResult::Ready) {
         log_stage("first_run_asset_generation_failed");
@@ -1383,7 +1486,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!replay_path.empty() && !bumble::input_bindings::validate_default_contracts()) {
+    if (!replay_path.empty() && (!bumble::input_bindings::validate_default_contracts() ||
+        !bumble::native_checkpoint::validate_player_lifecycle_contracts())) {
         return 2;
     }
     bumble::rt64_renderer::set_contract_validation_enabled(!replay_path.empty());
@@ -1435,7 +1539,6 @@ int main(int argc, char** argv) {
     }
     if (!bumble::level_editor::initialize(
             data_root,
-            rom_path,
             replay_path.empty()
         )) {
         bumble::native_io::shutdown();
@@ -1513,7 +1616,6 @@ int main(int argc, char** argv) {
         .graphics_action_completed = profile_graphics_action_completed,
     };
     config.message_queue_control = ultramodern::MessageQueueControl{};
-    log_stage("message_queue_policy timer=1 sp=1 si=1 ai=0 vi=0 pi=0 dp=1");
 
     log_stage("runtime_start_enter");
     recomp::start(config);

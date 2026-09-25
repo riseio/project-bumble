@@ -2,6 +2,7 @@
 
 #include "funcs.h"
 #include "native_checkpoint_bridge.hpp"
+#include "native_input_bindings.hpp"
 #include "native_menu_actions.hpp"
 #include "native_widescreen.hpp"
 
@@ -150,6 +151,10 @@ std::atomic_bool g_resync_aim{true};
 std::atomic_bool g_gameplay_arm_deferred_logged{false};
 std::atomic_int64_t g_pending_look_x{0};
 std::atomic_int64_t g_pending_look_y{0};
+std::atomic_int64_t g_pending_mouse_x{0};
+std::atomic_int64_t g_pending_mouse_y{0};
+std::mutex g_mouse_clock_mutex;
+std::chrono::steady_clock::time_point g_mouse_sample_time = std::chrono::steady_clock::now();
 std::atomic_bool g_primary_fire{false};
 std::atomic_bool g_primary_fire_require_release{false};
 std::atomic_bool g_frontend_confirm_pending{false};
@@ -217,6 +222,7 @@ std::atomic_uint32_t g_manual_landing_authorized_actor{0};
 std::atomic_uint32_t g_manual_takeoff_request_actor{0};
 std::atomic_int32_t g_movement_forward{0};
 std::atomic_int32_t g_movement_strafe{0};
+std::atomic_int32_t g_movement_vertical{0};
 std::atomic_uint64_t g_player_aim_update_count{0};
 std::atomic_uint64_t g_movement_frame_count{0};
 std::atomic_uint64_t g_active_player_frame_count{0};
@@ -847,6 +853,23 @@ bool restore_airborne_idle_anchor(uint8_t* rdram, uint32_t actor) {
 void clear_pending_look() {
     g_pending_look_x.exchange(0, std::memory_order_acq_rel);
     g_pending_look_y.exchange(0, std::memory_order_acq_rel);
+    g_pending_mouse_x.exchange(0, std::memory_order_acq_rel);
+    g_pending_mouse_y.exchange(0, std::memory_order_acq_rel);
+    std::lock_guard lock(g_mouse_clock_mutex);
+    g_mouse_sample_time = std::chrono::steady_clock::now();
+}
+
+std::pair<float, float> consume_look() {
+    std::lock_guard lock(g_mouse_clock_mutex);
+    const auto now = std::chrono::steady_clock::now();
+    const float seconds = std::clamp(std::chrono::duration<float>(now - g_mouse_sample_time).count(), 0.001f, 0.1f);
+    g_mouse_sample_time = now;
+    const float x = float(g_pending_mouse_x.exchange(0, std::memory_order_acq_rel));
+    const float y = float(g_pending_mouse_y.exchange(0, std::memory_order_acq_rel));
+    const auto options = bumble::input_bindings::current();
+    const auto scaled = bumble::input_bindings::scale_mouse_delta(options, x, y, seconds);
+    return {float(g_pending_look_x.exchange(0, std::memory_order_acq_rel)) + scaled.first,
+        float(g_pending_look_y.exchange(0, std::memory_order_acq_rel)) + scaled.second};
 }
 
 void clear_manual_flight_actions() {
@@ -1580,7 +1603,7 @@ void add_saturated(std::atomic_int64_t& destination, int64_t delta) {
 }
 
 bool living_player_one_actor_is_owned(uint8_t* rdram, uint32_t actor) {
-    // At zero health, release flight control so Buck can fall and enter the death states.
+    // Let the guest handle falling and death at zero health.
     if (rdram == nullptr) return false;
     const float health = float_from_word(read_u32(rdram, kPlayerOneHealth));
     return std::isfinite(health) && health > 0.0f &&
@@ -2154,12 +2177,7 @@ bool update_aim_from_pending_input(uint32_t actor) {
         return false;
     }
 
-    const int32_t delta_x = static_cast<int32_t>(
-        g_pending_look_x.exchange(0, std::memory_order_acq_rel)
-    );
-    const int32_t delta_y = static_cast<int32_t>(
-        g_pending_look_y.exchange(0, std::memory_order_acq_rel)
-    );
+    const auto [delta_x, delta_y] = consume_look();
     if (delta_x == 0 && delta_y == 0) {
         return true;
     }
@@ -2185,7 +2203,7 @@ bool update_aim_from_pending_input(uint32_t actor) {
         std::fprintf(
             stderr,
             "BUMBLE_RT64_PROBE stage=modern_player_aim_update count=%" PRIu64
-            " actor=0x%08" PRIX32 " delta_x=%d delta_y=%d"
+            " actor=0x%08" PRIX32 " delta_x=%.3f delta_y=%.3f"
             " yaw=%.3f pitch=%.3f\n",
             count,
             actor,
@@ -2359,6 +2377,7 @@ void bumble::modern_controls::rebase_after_mission_checkpoint_restore(
     g_primary_fire_require_release.store(true, std::memory_order_release);
     g_movement_forward.store(0, std::memory_order_release);
     g_movement_strafe.store(0, std::memory_order_release);
+    g_movement_vertical.store(0, std::memory_order_release);
     const bool portal_checkpoint = destination_teleport != 0u;
     const bool aim_adopted = rebase_after_authored_portal_exit(
         rdram,
@@ -2446,6 +2465,45 @@ extern "C" void bumble_clear_web_box_contacts() {
     g_web_box_player_id = 0u;
 }
 
+void bumble::modern_controls::retire_player_lifetime(uint8_t* rdram, uint32_t actor) {
+    if (!rdram || !actor) return;
+    std::scoped_lock lock(g_aim_mutex);
+    bool owned = read_u32(rdram, kPlayerOneOwnerSlot) == actor || g_aim_actor == actor ||
+        g_web_box_player == actor || g_barrel_roll_saved_actor == actor;
+    for (const auto* owner : {&g_movement_checkpoint_actor, &g_maneuver_actor,
+            &g_collision_safe_anchor_actor, &g_surface_glide_actor, &g_guided_missile_player_actor,
+            &g_player_update_actor, &g_airborne_collision_finalize_actor, &g_quick_flip_actor,
+            &g_barrel_roll_visual_actor, &g_quick_turn_actor, &g_manual_land_request_actor,
+            &g_manual_landing_authorized_actor, &g_manual_takeoff_request_actor,
+            &g_manual_grounded_entry_actor, &g_manual_takeoff_injection_actor,
+            &g_manual_takeoff_animation_actor, &g_automatic_takeoff_pending_actor,
+            &g_automatic_takeoff_animation_actor, &g_landing_anchor_actor, &g_airborne_idle_anchor_actor})
+        owned |= owner->load(std::memory_order_acquire) == actor;
+    if (!owned) return;
+    g_aim_ready = false;
+    g_aim_actor = 0u;
+    g_resync_aim.store(true, std::memory_order_release);
+    g_aim_input_consumed_this_update.store(false, std::memory_order_release);
+    clear_pending_look();
+    clear_manual_flight_actions();
+    set_movement_input(0.0f, 0.0f);
+    g_guided_missile_actor.store(0u, std::memory_order_release);
+    g_guided_missile_player_actor.store(0u, std::memory_order_release);
+    g_player_update_actor.store(0u, std::memory_order_release);
+    g_player_update_entry_state.store(0u, std::memory_order_release);
+    g_airborne_collision_finalize_actor.store(0u, std::memory_order_release);
+    g_teleport_cooldown_actor.store(0u, std::memory_order_release);
+    g_teleport_cooldown_pair_id.store(0u, std::memory_order_release);
+    g_teleport_cooldown_deadline_ns.store(0, std::memory_order_release);
+    g_teleport_visual_logged_deadline_ns.store(0, std::memory_order_release);
+    g_primary_fire.store(false, std::memory_order_release);
+    g_primary_fire_require_release.store(true, std::memory_order_release);
+    if (g_barrel_roll_saved_actor == actor) g_barrel_roll_saved_actor = 0u;
+    invalidate_collision_safe_anchor();
+    clear_surface_glide(actor);
+    bumble_clear_web_box_contacts();
+}
+
 void bumble::modern_controls::configure(
     bool enabled_value,
     float look_sensitivity,
@@ -2477,6 +2535,7 @@ void bumble::modern_controls::configure(
     g_guided_missile_player_actor.store(0u, std::memory_order_release);
     g_movement_forward.store(0, std::memory_order_release);
     g_movement_strafe.store(0, std::memory_order_release);
+    g_movement_vertical.store(0, std::memory_order_release);
     g_resync_aim.store(true, std::memory_order_release);
     g_gameplay_arm_deferred_logged.store(false, std::memory_order_release);
     g_mouse_captured.store(false, std::memory_order_release);
@@ -2531,15 +2590,6 @@ void bumble::modern_controls::configure(
     invalidate_collision_safe_anchor();
     g_manual_grounded_entry_actor.store(0, std::memory_order_release);
     g_enabled.store(enabled_value, std::memory_order_release);
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=modern_controls_configured enabled=%d"
-        " look_sensitivity=%.3f invert_look_y=%d scheme=actor_aim_wasd_movement\n",
-        enabled_value ? 1 : 0,
-        static_cast<double>(g_look_sensitivity),
-        invert_look_y ? 1 : 0
-    );
-    std::fflush(stderr);
 }
 
 bool bumble::modern_controls::enabled() {
@@ -2549,13 +2599,6 @@ bool bumble::modern_controls::enabled() {
 void bumble::modern_controls::set_replay_automation(bool enabled_value) {
     const bool active = enabled() && enabled_value;
     g_replay_automation.store(active, std::memory_order_release);
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=modern_replay_automation_configured"
-        " active=%d physical_input_suppressed=1 focus_spoofed=0\n",
-        active ? 1 : 0
-    );
-    std::fflush(stderr);
 }
 
 bool bumble::modern_controls::replay_automation_enabled() {
@@ -2633,8 +2676,8 @@ void bumble::modern_controls::add_raw_mouse_delta(
     if (!enabled() || !window_focused() || !mouse_captured()) {
         return;
     }
-    add_saturated(g_pending_look_x, delta_x);
-    add_saturated(g_pending_look_y, delta_y);
+    add_saturated(g_pending_mouse_x, delta_x);
+    add_saturated(g_pending_mouse_y, delta_y);
 }
 
 void bumble::modern_controls::add_controller_look(float axis_x, float axis_y) {
@@ -2819,7 +2862,8 @@ void bumble::modern_controls::set_barrel_roll_pressed(bool pressed) {
     );
 }
 
-void bumble::modern_controls::set_movement_input(float forward, float strafe) {
+void bumble::modern_controls::set_movement_input(float forward, float strafe, float vertical) {
+    g_movement_vertical.store(static_cast<int32_t>(std::lround(std::clamp(vertical, -1.0f, 1.0f) * 32767.0f)), std::memory_order_release);
     forward = std::clamp(forward, -1.0f, 1.0f);
     strafe = std::clamp(strafe, -1.0f, 1.0f);
     const float magnitude = std::hypot(forward, strafe);
@@ -3034,10 +3078,12 @@ bool bumble::modern_controls::query_spatial_intent(
 
     float forward_axis = decode_movement_axis(g_movement_forward);
     float strafe_axis = decode_movement_axis(g_movement_strafe);
-    const float magnitude = std::hypot(forward_axis, strafe_axis);
+    float vertical_axis = state == kFlyingState ? decode_movement_axis(g_movement_vertical) : 0.0f;
+    const float magnitude = std::sqrt(forward_axis * forward_axis + strafe_axis * strafe_axis + vertical_axis * vertical_axis);
     if (magnitude > 1.0f) {
         forward_axis /= magnitude;
         strafe_axis /= magnitude;
+        vertical_axis /= magnitude;
     }
 
     {
@@ -3066,6 +3112,7 @@ bool bumble::modern_controls::query_spatial_intent(
             multiply(movement_forward, forward_axis),
             multiply(movement_right, -strafe_axis)
         );
+        direction.y -= vertical_axis;
         Vec3 normalized_direction{};
         if (magnitude >= 0.001f && normalize(direction, normalized_direction)) {
             const float speed = kMovementSpeed *
@@ -3451,6 +3498,7 @@ extern "C" void bumble_update_modern_player_aim(
             clear_manual_flight_actions();
             g_movement_forward.store(0, std::memory_order_release);
             g_movement_strafe.store(0, std::memory_order_release);
+            g_movement_vertical.store(0, std::memory_order_release);
             {
                 std::scoped_lock lock(g_aim_mutex);
                 g_aim_ready = false;
@@ -3659,12 +3707,7 @@ extern "C" uint32_t bumble_apply_modern_guided_missile_aim(
     }
     begin_guided_missile_control(player_actor, missile_actor);
 
-    const int32_t delta_x = static_cast<int32_t>(
-        g_pending_look_x.exchange(0, std::memory_order_acq_rel)
-    );
-    const int32_t delta_y = static_cast<int32_t>(
-        g_pending_look_y.exchange(0, std::memory_order_acq_rel)
-    );
+    const auto [delta_x, delta_y] = consume_look();
     float sensitivity = 0.0f;
     float pitch_sign = 1.0f;
     {
@@ -3707,8 +3750,8 @@ extern "C" uint32_t bumble_apply_modern_guided_missile_aim(
             stderr,
             "BUMBLE_RT64_PROBE stage=modern_guided_missile_aim_update"
             " count=%" PRIu64 " player=0x%08" PRIX32
-            " missile=0x%08" PRIX32 " delta_x=%" PRId32
-            " delta_y=%" PRId32 " yaw=%.3f pitch=%.3f"
+            " missile=0x%08" PRIX32 " delta_x=%.3f"
+            " delta_y=%.3f yaw=%.3f pitch=%.3f"
             " legacy_stick_bypassed=1 camera_owner=game_guided_solver\n",
             count,
             player_actor,
@@ -3870,8 +3913,7 @@ extern "C" void bumble_resolve_modern_airborne_collision(
         return;
     }
 
-    // Consume the existing query result; rerunning it requires unavailable call state.
-    // Resolve from the checkpoint, before temporary side-probe offsets.
+    // Resolve the existing query before side-probe offsets.
     Vec3 checkpoint{};
     Vec3 checkpoint_target{};
     const bool movement_path_resolved = consume_movement_checkpoint(
@@ -4063,7 +4105,7 @@ extern "C" void bumble_gate_manual_landing(
             std::memory_order_release
         );
         if (!request_consumed) {
-            // The token can be revoked concurrently; leave the integrated position unchanged.
+            // A revoked token must not change position.
             invalidate_movement_checkpoint();
             context->r2 = 0;
             std::fprintf(
@@ -4893,10 +4935,12 @@ extern "C" void bumble_prepare_modern_player_movement(
 
     float forward_axis = decode_movement_axis(g_movement_forward);
     float strafe_axis = decode_movement_axis(g_movement_strafe);
-    const float magnitude = std::hypot(forward_axis, strafe_axis);
+    float vertical_axis = state == kFlyingState ? decode_movement_axis(g_movement_vertical) : 0.0f;
+    const float magnitude = std::sqrt(forward_axis * forward_axis + strafe_axis * strafe_axis + vertical_axis * vertical_axis);
     if (magnitude > 1.0f) {
         forward_axis /= magnitude;
         strafe_axis /= magnitude;
+        vertical_axis /= magnitude;
     }
 
     const bool maneuver_movement_pending = state == kFlyingState &&
@@ -5018,7 +5062,8 @@ extern "C" void bumble_prepare_modern_player_movement(
 
     Vec3 movement_right{};
     Vec3 movement_up{};
-    if (maneuver_active) {
+    const bool right_valid = normalize(cross(movement_up_axis, normalized_movement), movement_right);
+    if (maneuver_active || !right_valid) {
         const Vec3 projected_right = add(
             aim_right,
             multiply(
@@ -5027,10 +5072,10 @@ extern "C" void bumble_prepare_modern_player_movement(
             )
         );
         if (!normalize(projected_right, movement_right)) {
-            movement_right = cross(movement_up_axis, normalized_movement);
+            const Vec3 reference = std::abs(normalized_movement.y) < .9f
+                ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+            movement_right = cross(reference, normalized_movement);
         }
-    } else {
-        movement_right = cross(movement_up_axis, normalized_movement);
     }
     if (!normalize(movement_right, movement_right) ||
         !normalize(cross(normalized_movement, movement_right), movement_up)) {

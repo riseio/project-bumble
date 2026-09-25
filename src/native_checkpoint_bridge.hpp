@@ -7,6 +7,7 @@
 #include "recomp.h"
 
 namespace bumble::native_checkpoint {
+bool validate_player_lifecycle_contracts();
 
 struct RuntimePerformanceCounts {
     uint32_t active_actors = 0;

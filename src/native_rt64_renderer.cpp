@@ -2284,32 +2284,6 @@ private:
             ? faithful_contract.hashes.size()
             : 0u;
         menu_background_replacements_logged_ = false;
-        std::fprintf(
-            stderr,
-            "BUMBLE_MENU_BACKGROUND stage=rt64_pack_ready variant=%s"
-            " path=%s window_width=%" PRIu32 " window_height=%" PRIu32
-            " aspect_mode=%s faithful_textures_enabled=%d texture_pack=%s"
-            " faithful_texture_count=%zu"
-            " project_menu_background_strips=120 guest_rom_logo_suppressed=1"
-            " transparent_logo_tiles=7"
-            " guest_text=native_embedded_roboto"
-            " gameplay_ui_textures=8 gameplay_ui_resolution=1024x1024"
-            " gameplay_ui_upscale=palette_preserving_scale2x"
-            " gameplay_ui_screen_scale=0.5 dynamic_radar=live"
-            " replacement_roots=%zu guest_writes=0\n",
-            bumble::menu_background::variant_name(variant),
-            directory.string().c_str(),
-            width,
-            height,
-            bumble::graphics_options::widescreen_enabled()
-                ? "expand"
-                : "original",
-            faithful_textures_requested ? 1 : 0,
-            faithful_contract.pack_path.string().c_str(),
-            faithful_texture_count_,
-            replacement_directories.size()
-        );
-        std::fflush(stderr);
         return true;
     }
 
@@ -2461,17 +2435,6 @@ private:
             if (high_resolution_textures) {
                 menu_background_replacements_logged_ = false;
             }
-            std::fprintf(
-                stderr,
-                "BUMBLE_RT64_PROBE stage=rt64_texture_replacements enabled=%d"
-                " mandatory_pack=project_menu_and_native_text"
-                " faithful_pack=%s"
-                " faithful_hashes=%zu streaming=1\n",
-                high_resolution_textures ? 1 : 0,
-                faithful_texture_pack_loaded_ ? "rom_nearest_exact" : "disabled",
-                faithful_texture_count_
-            );
-            std::fflush(stderr);
         }
 
         const bool requested_raytracing =
@@ -2489,20 +2452,6 @@ private:
             ray_tracing_requested_ != requested_raytracing) {
             ray_tracing_requested_ = requested_raytracing;
             ray_tracing_active_ = active_raytracing;
-            std::fprintf(
-                stderr,
-                "BUMBLE_RT64_PROBE stage=rt64_ray_tracing requested=%d"
-                " supported=%d active=%d compiled=%d\n",
-                requested_raytracing ? 1 : 0,
-                supported_raytracing ? 1 : 0,
-                active_raytracing ? 1 : 0,
-#if defined(RT_ENABLED) && RT_ENABLED
-                1
-#else
-                0
-#endif
-            );
-            std::fflush(stderr);
         }
     }
 
@@ -2591,7 +2540,7 @@ bool bumble::rt64_renderer::request_shutdown() {
 }
 
 void bumble::rt64_renderer::release_diagnostic_capture_resources() {
-    // Both queues are joined and RenderDevice is still alive: release readback here.
+    // Queues are joined; release readback before the device.
     g_widescreen_hud_capture.readback.reset();
     g_widescreen_hud_capture.readback_size = 0u;
     g_widescreen_hud_capture.row_width = 0u;

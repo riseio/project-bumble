@@ -115,7 +115,7 @@ void bumble_mission1_completion_player_update(uint8_t* rdram, recomp_context* ct
 void bumble_apply_player_maximum_health(uint8_t* rdram, recomp_context* ctx);
 void bumble_cancel_life_decrement(uint8_t* rdram, recomp_context* ctx);
 void bumble_remove_lives_gate(uint8_t* rdram, recomp_context* ctx);
-void bumble_apply_unlimited_health_gate(uint8_t* rdram, recomp_context* ctx);
+void bumble_apply_damage_immunity(uint8_t* rdram, recomp_context* ctx);
 void bumble_apply_honeycomb_water_rescue(uint8_t* rdram, recomp_context* ctx);
 void bumble_apply_ammo_pickup_amount(uint8_t* rdram, recomp_context* ctx);
 void bumble_apply_mission_time_limit(uint8_t* rdram, recomp_context* ctx);
@@ -436,6 +436,8 @@ void buck_native_rsp_task_probe(
     uint32_t anchor_pc
 );
 void buck_si_device_busy_clear(uint8_t* rdram, recomp_context* ctx);
+void bumble_scale_cutscene_text_delay(uint8_t* rdram, recomp_context* ctx);
+void bumble_retire_player_lifetime(uint8_t* rdram, recomp_context* ctx);
 
 #ifdef __cplusplus
 }

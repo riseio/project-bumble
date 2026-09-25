@@ -1,4 +1,5 @@
 #include "native_widescreen.hpp"
+
 #include "native_text_overlay_state.hpp"
 
 #include <algorithm>
@@ -24,11 +25,32 @@
 #include "native_electric_effect.hpp"
 #include "native_gameplay_options.hpp"
 #include "native_graphics_options.hpp"
+
 #include "native_input_bindings.hpp"
 #include "native_visible_ui_state.hpp"
 #include "native_weapon_system.hpp"
 #include "common/rt64_performance_profiler.h"
 #include "common/rt64_bumble_ui.h"
+
+namespace {
+int64_t g_text_delay_remainder = 0;
+uint32_t g_text_delay_speed = 1u;
+}
+
+extern "C" void bumble_scale_cutscene_text_delay(uint8_t* rdram, recomp_context* context) {
+    const int32_t delay = MEM_W(0x10, context->r29);
+    const uint32_t speed = bumble::graphics_options::cutscene_text_speed();
+    if (speed != g_text_delay_speed) {
+        g_text_delay_remainder = 0;
+        g_text_delay_speed = speed;
+    }
+    if (delay > 0 && speed > 1u) {
+        const int64_t total = delay + g_text_delay_remainder;
+        const int32_t scaled = static_cast<int32_t>(std::max<int64_t>(1, total / speed));
+        g_text_delay_remainder = std::max<int64_t>(-int64_t(speed), total - int64_t(scaled) * speed);
+        MEM_W(0x10, context->r29) = scaled;
+    }
+}
 
 namespace {
 
@@ -4262,6 +4284,7 @@ extern "C" void bumble_ui_end_script_text(
 }
 
 extern "C" void bumble_reset_briefing_text(uint8_t*, recomp_context*) {
+    g_text_delay_remainder = 0;
     std::scoped_lock lock(g_briefing_queue_mutex);
     g_briefing_queue.clear();
     g_briefing_native_text.clear();

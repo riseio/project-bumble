@@ -25,6 +25,7 @@ struct SpatialIntent {
 };
 
 void configure(bool enabled, float look_sensitivity, bool invert_look_y);
+void retire_player_lifetime(uint8_t* rdram, uint32_t actor);
 bool enabled();
 
 void set_replay_automation(bool enabled);
@@ -51,7 +52,7 @@ void set_loop_de_loop_pressed(bool pressed);
 void set_quick_flip_pressed(bool pressed);
 void set_sprint_pressed(bool pressed);
 void set_barrel_roll_pressed(bool pressed);
-void set_movement_input(float forward, float strafe);
+void set_movement_input(float forward, float strafe, float vertical = 0.0f);
 
 bool query_spatial_intent(
     uint8_t* rdram,

@@ -1,0 +1,33 @@
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index 2f90a4d..28907ed 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -947,6 +947,7 @@ namespace plume {
+         const RenderClearValue *optimizedClearValue = nullptr;
+         RenderTextureFlags flags = RenderTextureFlag::NONE;
+         bool committed = false;
++        bool sharedWithCopyQueue = false;
+ 
+         RenderTextureDesc() = default;
+ 
+
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 6949feb..33a7ae3 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -1012,6 +1012,15 @@ namespace plume {
+         imageInfo.tiling = toVk(desc.textureArrangement);
+         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        const uint32_t families[] = {
++            device->queueFamilyIndices[toFamilyIndex(RenderCommandListType::DIRECT)],
++            device->queueFamilyIndices[toFamilyIndex(RenderCommandListType::COPY)]
++        };
++        if (desc.sharedWithCopyQueue && families[0] != families[1]) {
++            imageInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
++            imageInfo.queueFamilyIndexCount = 2;
++            imageInfo.pQueueFamilyIndices = families;
++        }
+         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+         imageInfo.usage |= (desc.flags & RenderTextureFlag::RENDER_TARGET) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0;
+         imageInfo.usage |= (desc.flags & RenderTextureFlag::DEPTH_TARGET) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;

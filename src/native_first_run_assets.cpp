@@ -24,6 +24,7 @@
 #include <json/json.hpp>
 #include <miniz/miniz.h>
 #include <stb_image.h>
+#include "librecomp/game.hpp"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
@@ -871,7 +872,7 @@ void build_faithful_pack(
     }
 }
 
-bool current_assets(const std::filesystem::path& root) {
+bool current_assets(const std::filesystem::path& root, const std::atomic_bool* cancelled = nullptr) {
     try {
         std::ifstream stream(root / "manifest.json");
         const json manifest = json::parse(stream);
@@ -904,37 +905,26 @@ bool current_assets(const std::filesystem::path& root) {
             std::filesystem::is_regular_file(
                 root / "completion" /
                 "BuckBumble_GameCompletion_Background.png") &&
-            std::filesystem::is_regular_file(
-                root / "textures" / "textures.rtz");
+            bumble::first_run::validate_texture_archive(root / "textures" / "textures.rtz", cancelled);
     } catch (...) {
         return false;
     }
 }
 
-std::vector<uint8_t> read_rom(const std::filesystem::path& path) {
-    std::ifstream stream(path, std::ios::binary);
-    stream.seekg(0, std::ios::end);
-    const std::streamoff size = stream.tellg();
-    stream.seekg(0, std::ios::beg);
-    if (!stream || size != static_cast<std::streamoff>(kRomSize)) {
-        throw std::runtime_error("verified ROM cannot be reopened");
-    }
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    if (!stream.read(
-            reinterpret_cast<char*>(bytes.data()),
-            static_cast<std::streamsize>(bytes.size()))) {
-        throw std::runtime_error("verified ROM cannot be read");
-    }
-    return bytes;
+std::vector<uint8_t> read_rom() {
+    const auto rom = recomp::get_rom();
+    if (rom.size() != kRomSize || rom[0] != 0x80 || rom[1] != 0x37 ||
+        rom[2] != 0x12 || rom[3] != 0x40)
+        throw std::runtime_error("Validated ROM is unavailable");
+    return {rom.begin(), rom.end()};
 }
 
 void build_assets(
     const std::filesystem::path& root,
-    const std::filesystem::path& rom_path,
     bumble::first_run::PreparationProgress& progress,
     bool enhanced
 ) {
-    const std::vector<uint8_t> rom = read_rom(rom_path);
+    const std::vector<uint8_t> rom = read_rom();
     std::filesystem::create_directories(root);
     build_menu_assets(root / "menu", rom, progress);
     build_faithful_pack(root / "textures", rom, progress);
@@ -986,6 +976,30 @@ std::vector<uint8_t> bumble::first_run::make_faithful_dds(
     return make_rgba8_unorm_dds(std::move(pixels), width, height, mip_count);
 }
 
+bool bumble::first_run::validate_texture_archive(const std::filesystem::path& path,
+    const std::atomic_bool* cancelled) {
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream || stream.tellg() <= 0) return false;
+    const auto size = static_cast<mz_uint64>(stream.tellg());
+    mz_zip_archive archive{};
+    struct Reader { std::ifstream& stream; const std::atomic_bool* cancelled; } reader{stream, cancelled};
+    archive.m_pIO_opaque = &reader;
+    archive.m_pRead = [](void* opaque, mz_uint64 offset, void* output, size_t count) -> size_t {
+        auto& reader = *static_cast<Reader*>(opaque);
+        if (reader.cancelled && reader.cancelled->load(std::memory_order_acquire)) return 0;
+        auto& input = reader.stream;
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(offset));
+        input.read(static_cast<char*>(output), static_cast<std::streamsize>(count));
+        return static_cast<size_t>(input.gcount());
+    };
+    if (!mz_zip_reader_init(&archive, size, 0)) return false;
+    const bool valid = mz_zip_reader_get_num_files(&archive) > 0 &&
+        mz_zip_validate_archive(&archive, 0);
+    mz_zip_reader_end(&archive);
+    return valid;
+}
+
 namespace {
 void recover_prepared(const std::filesystem::path& target) {
     const std::filesystem::path backup = target.string() + ".previous";
@@ -1007,14 +1021,14 @@ void publish_prepared(const std::filesystem::path& staging, const std::filesyste
     std::filesystem::remove_all(backup, error);
 }
 
-bool current_enhanced(const std::filesystem::path& root) {
+bool current_enhanced(const std::filesystem::path& root, const std::atomic_bool* cancelled = nullptr) {
     try {
         std::ifstream stream(root / "manifest.json");
         const auto manifest = json::parse(stream);
         return manifest.at("generator").get<std::string>() == kGenerator &&
             manifest.at("schema_version").get<unsigned>() == 4 &&
             manifest.at("source_rom_sha256").get<std::string>() == kRomSha256 &&
-            std::filesystem::is_regular_file(root / "textures.rtz");
+            bumble::first_run::validate_texture_archive(root / "textures.rtz", cancelled);
     } catch (...) { return false; }
 }
 }
@@ -1040,7 +1054,6 @@ bool bumble::first_run::request_texture_prompt() {
 
 bumble::first_run::AssetResult bumble::first_run::ensure_assets(
     const std::filesystem::path& data_root,
-    const std::filesystem::path& rom_path,
     bool unattended
 ) {
     g_enhanced_available.store(false, std::memory_order_release);
@@ -1054,8 +1067,6 @@ bumble::first_run::AssetResult bumble::first_run::ensure_assets(
         recover_prepared(assets);
         recover_prepared(enhanced);
         recover_prepared(preference);
-        const bool base_ready = current_assets(assets);
-        const bool enhanced_ready = base_ready && current_enhanced(enhanced);
         std::string policy = "ask";
         if (!unattended) {
             try {
@@ -1064,6 +1075,18 @@ bumble::first_run::AssetResult bumble::first_run::ensure_assets(
                 if (saved.at("schema_version").get<unsigned>() == 1)
                     policy = saved.at("choice").get<std::string>();
             } catch (...) {}
+        }
+        bool base_ready = false, enhanced_ready = false;
+        if (std::filesystem::exists(assets)) {
+            run_preparation([&](PreparationProgress& progress) {
+                base_ready = current_assets(assets, &progress.cancelled);
+                progress.check();
+                if (base_ready && policy != "skip") {
+                    progress.report("Checking enhanced textures");
+                    enhanced_ready = current_enhanced(enhanced, &progress.cancelled);
+                }
+                progress.check();
+            }, true);
         }
         TextureChoice choice;
         choice.generate = unattended || policy == "generate" || (enhanced_ready && policy != "skip");
@@ -1077,9 +1100,15 @@ bumble::first_run::AssetResult bumble::first_run::ensure_assets(
             staging = target.string() + ".building";
             std::filesystem::remove_all(staging);
             run_preparation([&](PreparationProgress& progress) {
-                if (prepare_base) build_assets(staging, rom_path, progress, choice.generate);
-                else build_faithful_pack(staging, read_rom(rom_path), progress, true);
+                if (prepare_base) build_assets(staging, progress, choice.generate);
+                else build_faithful_pack(staging, read_rom(), progress, true);
+                progress.report("Checking textures");
+                bool valid = prepare_base ? current_assets(staging, &progress.cancelled)
+                    : current_enhanced(staging, &progress.cancelled);
+                if (valid && prepare_base && choice.generate)
+                    valid = current_enhanced(staging / "textures-enhanced", &progress.cancelled);
                 progress.check();
+                if (!valid) throw std::runtime_error("Generated texture archive failed validation");
                 publish_prepared(staging, target);
             });
         }
@@ -1089,10 +1118,6 @@ bumble::first_run::AssetResult bumble::first_run::ensure_assets(
             publish_prepared(temporary, preference);
         }
         g_enhanced_available.store(choice.generate, std::memory_order_release);
-        std::fprintf(stderr, "BUMBLE_FIRST_RUN stage=assets_ready source=%s enhanced=%d generator=%.*s\n",
-            prepare_base || prepare_enhanced ? "generated" : "existing", choice.generate ? 1 : 0,
-            static_cast<int>(kGenerator.size()), kGenerator.data());
-        std::fflush(stderr);
         return AssetResult::Ready;
     } catch (const PreparationCancelled&) {
         std::error_code error;
@@ -1101,7 +1126,7 @@ bumble::first_run::AssetResult bumble::first_run::ensure_assets(
     } catch (const std::exception& exception) {
         std::error_code error;
         if (!staging.empty()) std::filesystem::remove_all(staging, error);
-        std::fprintf(stderr, "BUMBLE_FIRST_RUN stage=assets_failed reason=%s\n", exception.what());
+        std::fprintf(stderr, "Cannot prepare textures: %s\n", exception.what());
         std::fflush(stderr);
         return AssetResult::Failed;
     }

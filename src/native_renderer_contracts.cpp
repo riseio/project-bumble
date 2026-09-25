@@ -4,9 +4,12 @@
 #include "native_electric_effect.hpp"
 #include "hle/rt64_framebuffer_manager.h"
 #include "hle/rt64_rdp.h"
+#include "hle/rt64_workload_queue.h"
 #include "xxHash/xxh3.h"
 #include "common/rt64_tmem_hasher.h"
 #include "common/rt64_recording_mutex.h"
+#include "common/rt64_filesystem_zip.h"
+#include <miniz/miniz.h>
 #include "render/rt64_texture_cache.h"
 #include "render/rt64_shader_compiler.h"
 #include "render/rt64_bumble_shadow_geometry.h"
@@ -36,11 +39,104 @@ namespace dxil {
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <utility>
 #include <thread>
 
 namespace {
+void validate_texture_retirement(RenderDevice* device) {
+    RT64::RenderWorker direct(device, "Texture Retirement Direct", RenderCommandListType::DIRECT);
+    RT64::RenderWorker copy(device, "Texture Retirement Copy", RenderCommandListType::COPY);
+    RT64::ShaderLibrary shaders(false, false);
+    RT64::TextureCache cache(&direct, &copy, &direct, 0, &shaders);
+    RT64::WorkloadQueue queue;
+    queue.ext.textureCache = &cache;
+    queue.interpolationGraphicsWorkers[0] = std::make_unique<RT64::RenderWorker>(
+        device, "Texture Retirement Slot", RenderCommandListType::DIRECT, &direct);
+    auto& worker = *queue.interpolationGraphicsWorkers[0];
+    bool passed = true;
+    for (bool retiredElsewhere : {false, true, false, true}) {
+        const uint64_t lease = cache.incrementLock();
+        ++queue.pendingTextureLocks;
+        queue.interpolationWorkerTextureLocks[0] = lease;
+        cache.textureMap.evictedTextures.push_back(new RT64::Texture());
+        worker.commandList->begin();
+        worker.commandList->end();
+        worker.execute();
+        if (retiredElsewhere) worker.waitIfPending();
+        queue.retireInterpolationWorker(0);
+        passed &= cache.lockCounter == 0 && cache.textureMap.evictedTextures.empty() &&
+            queue.pendingTextureLocks == 0 && !queue.interpolationWorkerTextureLocks[0];
+        if (queue.interpolationWorkerTextureLocks[0]) cache.decrementLock(lease);
+        queue.pendingTextureLocks = 0;
+        queue.interpolationWorkerTextureLocks[0] = 0;
+        queue.retireInterpolationWorker(0);
+        passed &= cache.lockCounter == 0 && queue.pendingTextureLocks == 0;
+    }
+    const auto first = cache.incrementLock();
+    const auto second = cache.incrementLock();
+    cache.textureMap.evictedTextures.push_back(new RT64::Texture());
+    cache.decrementLock(first);
+    passed &= cache.retiredTextures.size() == 1;
+    const auto newer = cache.incrementLock();
+    cache.decrementLock(second);
+    passed &= cache.lockCounter == 1 && cache.retiredTextures.empty();
+    cache.decrementLock(newer);
+
+    const auto oldest = cache.incrementLock();
+    const auto recent = cache.incrementLock();
+    cache.textureMap.evictedTextures.push_back(new RT64::Texture());
+    cache.decrementLock(recent);
+    passed &= cache.retiredTextures.size() == 1;
+    cache.decrementLock(oldest);
+    passed &= cache.retiredTextures.empty() && cache.lockCounter == 0;
+    if (!passed) throw std::runtime_error("Texture retirement ownership contract failed");
+    std::fprintf(stderr, "BUMBLE_TEXTURE_RETIREMENT_CONTRACT result=pass direct=2 sibling=2 repeated=4 overlapping=1 out_of_order=1\n");
+}
+
+void validate_archive_contract() {
+    auto require = [](bool ok) { if (!ok) throw std::runtime_error("Texture archive contract failed"); };
+    const auto path = std::filesystem::current_path() / "cache" / "archive-contract.rtz";
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); }
+    } cleanup{path};
+    const std::array<uint8_t, 8> payload{1, 3, 5, 7, 9, 11, 13, 15};
+    mz_zip_archive archive{};
+    require(mz_zip_writer_init_heap(&archive, 0, 0));
+    require(mz_zip_writer_add_mem(&archive, "test.bin", payload.data(), payload.size(), 0));
+    void* memory = nullptr;
+    size_t size = 0;
+    require(mz_zip_writer_finalize_heap_archive(&archive, &memory, &size));
+    mz_zip_writer_end(&archive);
+    std::vector<uint8_t> bytes(static_cast<uint8_t*>(memory), static_cast<uint8_t*>(memory) + size);
+    mz_free(memory);
+    auto check = [&](const std::vector<uint8_t>& content, bool expected) {
+        {
+            std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+            stream.write(reinterpret_cast<const char*>(content.data()), content.size());
+            require(bool(stream));
+        }
+        require(bumble::first_run::validate_texture_archive(path) == expected);
+        auto fileSystem = RT64::FileSystemZip::create(path, "");
+        std::vector<uint8_t> decoded;
+        const bool loaded = fileSystem && fileSystem->load("test.bin", decoded);
+        require(loaded == expected);
+        if (loaded) require(std::equal(decoded.begin(), decoded.end(), payload.begin(), payload.end()));
+    };
+    check(bytes, true);
+    auto corrupted = bytes;
+    corrupted[30 + 8] ^= 0x80;
+    check(corrupted, false);
+    corrupted = bytes;
+    corrupted[28] = corrupted[29] = 255;
+    check(corrupted, false);
+    bytes.resize(20);
+    check(bytes, false);
+    std::fprintf(stderr, "BUMBLE_ARCHIVE_CONTRACT result=pass crc=1 bounds=1 truncation=1\n");
+}
+
 void validate_recording_mutex() {
     RT64::RecordingMutex recording;
     std::mutex manager;
@@ -401,6 +497,8 @@ bool validate_raster_identity(RenderDevice* device, RenderShaderFormat format) {
 }
 
 void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, RenderShaderFormat format) {
+    validate_texture_retirement(device);
+    validate_archive_contract();
     {
         using namespace bumble::textures;
         Image flat{12, 12, std::vector<uint8_t>(12 * 12 * 4, 127)};
@@ -603,7 +701,8 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         require(!RT64::bumbleShadowCasterDynamic(geometry, 0, 0));
     }
     std::fprintf(stderr, "BUMBLE_SHADOW_OWNERSHIP_CONTRACT result=pass hierarchy=1 pause=1 unmatched=1 deformation=1 level_reset=1\n");
-    constexpr uint64_t bytes = 406 * 4 * sizeof(float);
+    constexpr uint32_t uploadTexels = 13 * 9 + 6 * 4 + 3 * 2 + 1;
+    constexpr uint64_t bytes = (406 + uploadTexels) * 4 * sizeof(float);
     RT64::RenderWorker worker(device, "Bumble Texture Contract", RenderCommandListType::DIRECT);
     std::unique_ptr<RenderBuffer> upload;
     for (size_t length = 0; length < 4; ++length) {
@@ -614,6 +713,7 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     for (uint32_t i = 0; i < 16; ++i) pixels.insert(pixels.end(), {128, 64, 32, 255});
     auto dds = first_run::make_faithful_dds(std::move(pixels), 4, 4, 3);
     require(dds.size() == 148 + (16 + 4 + 1) * 4 && dds[128] == 28);
+    // Reject invalid metadata before submitting GPU commands.
     for (const auto [offset, value] : std::array<std::pair<size_t, uint32_t>, 4>{{
             {28, 32}, {16, UINT32_MAX}, {140, 2}, {132, 4}}}) {
         auto invalid = dds;
@@ -632,7 +732,7 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     const RenderDescriptorSetDesc setDesc(ranges, 1);
     auto set = device->createDescriptorSet(setDesc);
     const RenderDescriptorRange textureRange(RenderDescriptorRangeType::TEXTURE, 0, 8192);
-    const RenderDescriptorSetDesc textureDesc(&textureRange, 1, true, 3);
+    const RenderDescriptorSetDesc textureDesc(&textureRange, 1, true, 4);
     auto textureSet = device->createDescriptorSet(textureDesc);
     RenderSamplerDesc samplerDesc;
     samplerDesc.addressU = samplerDesc.addressV = RenderTextureAddressMode::CLAMP;
@@ -711,6 +811,32 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     textureSet->setTexture(2, enhancedTexture->texture.get(), RenderTextureLayout::SHADER_READ);
     worker.commandList->barriers(RenderBarrierStage::COMPUTE,
         RenderTextureBarrier(enhancedTexture->texture.get(), RenderTextureLayout::SHADER_READ));
+    auto patternedDDS = first_run::make_faithful_dds(
+        std::vector<uint8_t>(13 * 9 * 4, 255), 13, 9, 4);
+    require(patternedDDS.size() == 148 + uploadTexels * 4);
+    uint32_t texel = 0;
+    for (uint32_t mip = 0; mip < 4; ++mip) {
+        for (uint32_t y = 0; y < std::max(9u >> mip, 1u); ++y) {
+            for (uint32_t x = 0; x < std::max(13u >> mip, 1u); ++x, ++texel) {
+                patternedDDS[148 + texel * 4] = uint8_t(17 * x + 31 * mip);
+                patternedDDS[149 + texel * 4] = uint8_t(23 * y + 43 * mip);
+                patternedDDS[150 + texel * 4] = uint8_t(11 * x + 7 * y + 59 * mip);
+                patternedDDS[151 + texel * 4] = uint8_t(255 - 37 * mip);
+            }
+        }
+    }
+    std::unique_ptr<RenderBuffer> patternedUpload;
+    RT64::RenderWorker copyWorker(device, "Bumble Texture Upload Contract", RenderCommandListType::COPY);
+    copyWorker.commandList->begin();
+    std::unique_ptr<RT64::Texture> patternedTexture(RT64::TextureCache::loadTextureFromBytes(
+        device, copyWorker.commandList.get(), patternedDDS, patternedUpload));
+    require(patternedTexture != nullptr);
+    copyWorker.commandList->end();
+    copyWorker.execute();
+    copyWorker.wait();
+    textureSet->setTexture(3, patternedTexture->texture.get(), RenderTextureLayout::SHADER_READ);
+    worker.commandList->barriers(RenderBarrierStage::COMPUTE,
+        RenderTextureBarrier(patternedTexture->texture.get(), RenderTextureLayout::SHADER_READ));
     mixedSet->setTexture(3, otherTexture->texture.get(), RenderTextureLayout::SHADER_READ);
     worker.commandList->barriers(RenderBarrierStage::COMPUTE,
         RenderTextureBarrier(otherTexture->texture.get(), RenderTextureLayout::SHADER_READ));
@@ -736,6 +862,14 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
     const float* values = static_cast<const float*>(readback->map(0, &readRange));
     require(values != nullptr);
     bool matches = true;
+    bool uploadPassed = true;
+    for (uint32_t i = 0; i < uploadTexels; ++i)
+        for (uint32_t c = 0; c < 4; ++c)
+            uploadPassed &= std::abs(values[(406 + i) * 4 + c] -
+                float(patternedDDS[148 + i * 4 + c]) / 255.f) < .0001f;
+    matches &= uploadPassed;
+    std::fprintf(stderr, "BUMBLE_TEXTURE_UPLOAD_CONTRACT result=%s texels=%u mips=4 npot=1 copy_to_direct=1\n",
+        uploadPassed ? "pass" : "fail", uploadTexels);
     for (uint32_t i = 0; i < 256; ++i) {
         const double expected = std::clamp(.5 * std::log2(std::max(double(gradients[i % 16]), 1.0)) - .25, 0.0, double(i / 16));
         const std::array<double, 4> expectedValues{expected, std::floor(expected), std::min(std::floor(expected) + 1, double(i / 16)), expected - std::floor(expected)};
@@ -820,6 +954,7 @@ void bumble::rt64_renderer::validate_texture_contracts(RenderDevice* device, Ren
         compiler.link(L"VSMain", L"vs_6_3", libraries, names, 2, &linked);
         require(linked != nullptr);
         std::fprintf(stderr, "BUMBLE_RASTER_LIBRARY_CONTRACT result=pass generated_wrapper_linked=1\n");
+        // Driver rejection must return failure.
         const uint32_t invalidCode = 0;
         auto badShader = device->createShader(&invalidCode, sizeof(invalidCode), "CSMain", format);
         pipelineDesc.computeShader = badShader.get();

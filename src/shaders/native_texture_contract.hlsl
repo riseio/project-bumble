@@ -16,6 +16,17 @@ static const float gradients[16] = {
 [numthreads(64, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
+    if (i < 148) {
+        uint index = i;
+        uint width = 13, height = 9, mip = 0;
+        while (index >= width * height) {
+            index -= width * height;
+            width = max(width >> 1, 1);
+            height = max(height >> 1, 1);
+            ++mip;
+        }
+        outputValues[406 + i] = gTextures[3].Load(int3(index % width, index / width, mip));
+    }
     if (i < 2) {
         OtherMode mode = (OtherMode)0;
         RDPTile tile = (RDPTile)0;

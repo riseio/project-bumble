@@ -21,7 +21,7 @@ diff --git a/src/hle/rt64_framebuffer_manager.cpp b/src/hle/rt64_framebuffer_man
 index c345166..246c46a 100644
 --- a/src/hle/rt64_framebuffer_manager.cpp
 +++ b/src/hle/rt64_framebuffer_manager.cpp
-@@ -625,114 +625,142 @@ namespace RT64 {
+@@ -625,114 +625,145 @@ namespace RT64 {
          }
      }
  
@@ -218,8 +218,11 @@ index c345166..246c46a 100644
              it++;
          }
  
-+        // Upper TMEM holds RGBA32's second bank or the TLUT.
-+        // Check the CI4 palette span; CI8 can reference the whole TLUT.
++        // When using TLUT or RGBA32, the upper region of TMEM must also be checked for possible synchronizations,
++        // as it is sampled by the texture. It's not really necessary to check all possible individual
++        // pixels sampled by the texture, so we check for the entire upper region of TMEM when it's CI8,
++        // and only the pixels indicated by the palette value when it's CI4. If it's RGBA32, we just offset
++        // the current region being checked into the upper area of TMEM.
 +        if ((usesTLUT || RGBA32) && !result.syncRequired) {
 +            if (RGBA32) {
 +                tmemStart += 256;

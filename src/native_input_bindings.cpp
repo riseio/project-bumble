@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <initializer_list>
 #include <mutex>
@@ -239,6 +240,14 @@ bumble::input_bindings::Settings bumble::input_bindings::default_settings(uint32
             controller_value(ControllerInput::X),
         }
     );
+    if (version >= 8u) {
+        assign(settings.keyboard_mouse, InputAction::FlyUp, {'F'});
+        assign(settings.keyboard_mouse, InputAction::FlyDown, {'V'});
+        assign(settings.controller, InputAction::ForwardDash, {controller_value(ControllerInput::X)});
+        assign(settings.controller, InputAction::BarrelRoll, {controller_value(ControllerInput::LeftTrigger)});
+        assign(settings.controller, InputAction::FlyUp, {controller_value(ControllerInput::LeftStick)});
+        assign(settings.controller, InputAction::FlyDown, {controller_value(ControllerInput::RightStick)});
+    }
     return settings;
 }
 
@@ -250,6 +259,9 @@ void bumble::input_bindings::upgrade_keyboard_defaults(Settings& settings, uint3
 
 void bumble::input_bindings::configure(const Settings& requested) {
     Settings sanitized = requested;
+    sanitized.mouse_sensitivity = std::clamp(sanitized.mouse_sensitivity, 10u, 400u);
+    sanitized.mouse_sensitivity_x = std::clamp(sanitized.mouse_sensitivity_x, 10u, 400u);
+    sanitized.mouse_sensitivity_y = std::clamp(sanitized.mouse_sensitivity_y, 10u, 400u);
     if (static_cast<uint32_t>(sanitized.device_mode) >
         static_cast<uint32_t>(InputDeviceMode::Controller)) {
         sanitized.device_mode = InputDeviceMode::Auto;
@@ -292,6 +304,16 @@ void bumble::input_bindings::configure(const Settings& requested) {
     g_revision.fetch_add(1u, std::memory_order_acq_rel);
 }
 
+std::pair<float, float> bumble::input_bindings::scale_mouse_delta(
+    const Settings& settings, float x, float y, float seconds) {
+    const float acceleration = settings.mouse_acceleration
+        ? 1.0f + std::clamp((std::hypot(x, y) / std::clamp(seconds, .001f, .1f) - 300.0f) / 1500.0f, 0.0f, 2.0f)
+        : 1.0f;
+    const float gain = float(settings.mouse_sensitivity) * acceleration / 10000.0f;
+    return {x * gain * settings.mouse_sensitivity_x,
+        y * gain * settings.mouse_sensitivity_y};
+}
+
 bool bumble::input_bindings::validate_default_contracts() {
     bool menu_pass = true;
     for (unsigned directions = 0; directions < 16; ++directions) {
@@ -305,6 +327,19 @@ bool bumble::input_bindings::validate_default_contracts() {
         }
     }
     const auto defaults = default_settings();
+    auto mouse = defaults;
+    mouse.mouse_sensitivity = 200;
+    mouse.mouse_sensitivity_x = 50;
+    mouse.mouse_sensitivity_y = 150;
+    const auto scaled = scale_mouse_delta(mouse, 3, -2, .01f);
+    const auto slow = scale_mouse_delta(mouse, 3, -2, .1f);
+    bool mouse_pass = scaled == std::pair<float, float>{3, -6} && scaled == slow;
+    mouse.mouse_acceleration = true;
+    const auto accelerated = scale_mouse_delta(mouse, 30, -20, .01f);
+    const auto half = scale_mouse_delta(mouse, 15, -10, .005f);
+    mouse_pass &= accelerated.first > 30 && accelerated.second < -60 &&
+        std::abs(accelerated.first - 2 * half.first) < .0001f &&
+        std::abs(accelerated.second - 2 * half.second) < .0001f;
     auto legacy = default_settings(6u);
     const auto controller = legacy.controller;
     legacy.controller[action_index(InputAction::BarrelRoll)] =
@@ -315,7 +350,7 @@ bool bumble::input_bindings::validate_default_contracts() {
     custom.keyboard_mouse[action_index(InputAction::MoveForward)] = {'T', 0u, 0u};
     const auto custom_keyboard = custom.keyboard_mouse;
     upgrade_keyboard_defaults(custom, 6u);
-    const bool pass = menu_pass && defaults.controller == controller &&
+    const bool pass = mouse_pass && menu_pass && default_settings(7u).controller == controller &&
         legacy.controller == custom_controller &&
         legacy.keyboard_mouse == defaults.keyboard_mouse &&
         custom.keyboard_mouse == custom_keyboard &&
@@ -326,8 +361,12 @@ bool bumble::input_bindings::validate_default_contracts() {
         defaults.keyboard_mouse[action_index(InputAction::PreviousWeapon)][1] == mouse_binding(MouseButton::WheelUp) &&
         defaults.keyboard_mouse[action_index(InputAction::NextWeapon)][1] == mouse_binding(MouseButton::WheelDown) &&
         valid_keyboard_binding(mouse_binding(MouseButton::WheelUp)) &&
-        valid_keyboard_binding(mouse_binding(MouseButton::WheelDown));
-    std::fprintf(stderr, "BUMBLE_PC_BINDING_CONTRACT result=%s defaults_migrated=1 custom_preserved=1 controller_unchanged=1 wheel_bindable=1\n",
+        valid_keyboard_binding(mouse_binding(MouseButton::WheelDown)) &&
+        defaults.controller[action_index(InputAction::FlyUp)][0] == controller_value(ControllerInput::LeftStick) &&
+        defaults.controller[action_index(InputAction::FlyDown)][0] == controller_value(ControllerInput::RightStick) &&
+        defaults.controller[action_index(InputAction::ForwardDash)][1] == 0u &&
+        defaults.controller[action_index(InputAction::BarrelRoll)][1] == 0u;
+    std::fprintf(stderr, "BUMBLE_PC_BINDING_CONTRACT result=%s defaults_migrated=1 custom_preserved=1 vertical_flight=1 wheel_bindable=1\n",
         pass ? "pass" : "fail");
     return pass;
 }
@@ -418,6 +457,10 @@ void bumble::input_bindings::reset_profile(BindingProfile profile) {
             defaults.invert_joystick_look_y;
     } else {
         g_settings.keyboard_mouse = defaults.keyboard_mouse;
+        g_settings.mouse_sensitivity = defaults.mouse_sensitivity;
+        g_settings.mouse_sensitivity_x = defaults.mouse_sensitivity_x;
+        g_settings.mouse_sensitivity_y = defaults.mouse_sensitivity_y;
+        g_settings.mouse_acceleration = defaults.mouse_acceleration;
     }
     publish_change_locked("reset_profile", profile, InputAction::MoveForward);
 }
@@ -615,6 +658,8 @@ const char* bumble::input_bindings::action_config_name(InputAction action) {
     case InputAction::MenuConfirm: return "MenuConfirm";
     case InputAction::MenuBack: return "MenuBack";
     case InputAction::ToggleModernVisuals: return "ToggleModernVisuals";
+    case InputAction::FlyUp: return "FlyUp";
+    case InputAction::FlyDown: return "FlyDown";
     case InputAction::Count: break;
     }
     return "Unknown";
@@ -638,6 +683,8 @@ const char* bumble::input_bindings::action_label(InputAction action) {
     case InputAction::MenuConfirm: return "MENU CONFIRM";
     case InputAction::MenuBack: return "MENU BACK";
     case InputAction::ToggleModernVisuals: return "CYCLE VISUAL MODES";
+    case InputAction::FlyUp: return "FLY UP";
+    case InputAction::FlyDown: return "FLY DOWN";
     case InputAction::Count: break;
     }
     return "UNKNOWN";
