@@ -8,6 +8,16 @@
 #include <string>
 
 namespace bumble::first_run {
+class VideoSession {
+public:
+    VideoSession();
+    ~VideoSession();
+    VideoSession(const VideoSession&) = delete;
+    VideoSession& operator=(const VideoSession&) = delete;
+private:
+    bool gl_loaded = false;
+};
+
 struct PreparationCancelled : std::runtime_error {
     PreparationCancelled() : std::runtime_error("Preparation cancelled") {}
 };

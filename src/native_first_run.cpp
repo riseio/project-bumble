@@ -1,6 +1,7 @@
 #include "native_first_run.hpp"
 
 #include <fstream>
+#include <cstdio>
 #include <optional>
 
 #include <json/json.hpp>
@@ -30,6 +31,8 @@ std::optional<std::filesystem::path> remembered_rom(
 
 std::optional<std::filesystem::path> choose_rom() {
     if (NFD_Init() != NFD_OKAY) {
+        const char* error = NFD_GetError();
+        std::fprintf(stderr, "Cannot initialize ROM picker: %s\n", error ? error : "Unknown error");
         return std::nullopt;
     }
     nfdu8char_t* selected = nullptr;
@@ -39,6 +42,9 @@ std::optional<std::filesystem::path> choose_rom() {
     if (result == NFD_OKAY && selected != nullptr) {
         path = std::filesystem::path(selected);
         NFD_FreePathU8(selected);
+    } else if (result == NFD_ERROR) {
+        const char* error = NFD_GetError();
+        std::fprintf(stderr, "Cannot open ROM picker: %s\n", error ? error : "Unknown error");
     }
     NFD_Quit();
     return path;

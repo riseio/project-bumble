@@ -16,6 +16,31 @@
 #include "bumble_text_font.h"
 
 namespace bumble::first_run {
+VideoSession::VideoSession() {
+    SDL_SetMainReady();
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) throw std::runtime_error(SDL_GetError());
+#if !defined(_WIN32)
+    const char* driver = SDL_GetCurrentVideoDriver();
+    if (driver && std::strcmp(driver, "x11") == 0) {
+        SDL_SetHintWithPriority(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0", SDL_HINT_OVERRIDE);
+    } else if (driver && std::strcmp(driver, "wayland") == 0) {
+        // SDL2 Wayland surfaces need GL; retain it across preparation windows.
+        if (SDL_GL_LoadLibrary(nullptr) != 0) {
+            const std::string error = SDL_GetError();
+            SDL_QuitSubSystem(SDL_INIT_VIDEO);
+            throw std::runtime_error(error);
+        }
+        gl_loaded = true;
+    }
+#endif
+}
+
+VideoSession::~VideoSession() {
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) return;
+    if (gl_loaded) SDL_GL_UnloadLibrary();
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+}
+
 void PreparationProgress::check() const {
     if (cancelled.load(std::memory_order_acquire)) throw PreparationCancelled();
 }
@@ -72,10 +97,10 @@ struct PreparationWindow {
     }
 
     void present() {
-        if (auto* surface = SDL_GetWindowSurface(window.get())) {
-            SDL_BlitSurface(canvas.get(), nullptr, surface, nullptr);
-            SDL_UpdateWindowSurface(window.get());
-        }
+        auto* surface = SDL_GetWindowSurface(window.get());
+        if (!surface || SDL_BlitSurface(canvas.get(), nullptr, surface, nullptr) != 0 ||
+            SDL_UpdateWindowSurface(window.get()) != 0)
+            throw std::runtime_error(SDL_GetError());
     }
 };
 bool closing(const SDL_Event& event, Uint32 id) {
@@ -93,6 +118,10 @@ void run_preparation(const std::function<void(PreparationProgress&)>& work, bool
     PreparationProgress progress;
     progress.report(checking ? "Checking textures" : "Preparing menus");
     auto pending = std::async(std::launch::async, [&]() { work(progress); });
+    struct CancelOnExit {
+        PreparationProgress& progress;
+        ~CancelOnExit() { progress.cancelled.store(true, std::memory_order_release); }
+    } cancel{progress};
     std::string lastStage;
     uint32_t lastCompleted = UINT32_MAX, lastTotal = UINT32_MAX;
     const auto started = std::chrono::steady_clock::now();
@@ -127,11 +156,7 @@ void run_preparation(const std::function<void(PreparationProgress&)>& work, bool
             }
             text(std::to_string(seconds / 60) + "m " + std::to_string(seconds % 60) + "s elapsed", 360, 193);
             text("Close this window or press Escape to cancel.", 30, 222);
-            auto* surface = SDL_GetWindowSurface(window.get());
-            if (surface) {
-                SDL_BlitSurface(canvas.get(), nullptr, surface, nullptr);
-                SDL_UpdateWindowSurface(window.get());
-            }
+            ui.present();
             lastStage = state.stage; lastCompleted = state.completed; lastTotal = state.total; redraw = false;
             lastSecond = seconds;
         }

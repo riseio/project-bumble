@@ -22,6 +22,7 @@
 #include <csignal>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <stdexcept>
 #include <system_error>
@@ -42,6 +43,7 @@
 #include "native_game_completion_screen.hpp"
 #include "native_first_run.hpp"
 #include "native_first_run_assets.hpp"
+#include "native_preparation.hpp"
 #include "native_graphics_options.hpp"
 #include "native_input_bindings.hpp"
 #include "native_level_editor.hpp"
@@ -147,17 +149,25 @@ bool acquire_single_instance() {
         FALSE,
         L"Local\\BumbleRecomp.SingleInstance"
     );
-    return g_single_instance_mutex != nullptr &&
-        GetLastError() != ERROR_ALREADY_EXISTS;
+    if (!g_single_instance_mutex)
+        throw std::system_error(GetLastError(), std::system_category(), "Cannot check running instance");
+    return GetLastError() != ERROR_ALREADY_EXISTS;
 #else
     const std::string name = "bumble-recomp-" + std::to_string(getuid());
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path + 1, name.data(), name.size());
     g_single_instance_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    return g_single_instance_fd >= 0 && bind(g_single_instance_fd,
+    if (g_single_instance_fd < 0)
+        throw std::system_error(errno, std::generic_category(), "Cannot create instance socket");
+    if (bind(g_single_instance_fd,
         reinterpret_cast<const sockaddr*>(&address),
-        offsetof(sockaddr_un, sun_path) + 1 + name.size()) == 0;
+        offsetof(sockaddr_un, sun_path) + 1 + name.size()) == 0) return true;
+    const int error = errno;
+    close(g_single_instance_fd);
+    g_single_instance_fd = -1;
+    if (error == EADDRINUSE) return false;
+    throw std::system_error(error, std::generic_category(), "Cannot bind instance socket");
 #endif
 }
 
@@ -1161,7 +1171,7 @@ static int run_game(int argc, char** argv) {
     std::filesystem::path controller_pak_root;
     std::filesystem::path data_root;
     std::string replay_mask = "NONE";
-    const bool direct_launch = argc == 1;
+    const bool direct_launch = argc == 1 || std::strncmp(argv[1], "--", 2) == 0;
     bool modern_controls = true;
     bool control_mode_explicit = false;
     bool show_intro = false;
@@ -1171,7 +1181,7 @@ static int run_game(int argc, char** argv) {
     float mouse_sensitivity = 0.15f;
     ultramodern::input::Pak connected_pak = ultramodern::input::Pak::ControllerPak;
     bool connected_pak_explicit = false;
-    for (int index = 2; index < argc; ++index) {
+    for (int index = direct_launch ? 1 : 2; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--replay" && index + 1 < argc) {
             replay_path = std::filesystem::absolute(argv[++index]);
@@ -1381,6 +1391,12 @@ static int run_game(int argc, char** argv) {
         return 6;
     }
     bumble::diagnostics::phase("texture preparation");
+    std::optional<bumble::first_run::VideoSession> preparation_video;
+    try { preparation_video.emplace(); }
+    catch (const std::exception& error) {
+        std::fprintf(stderr, "Cannot initialize preparation window: %s\n", error.what());
+        return 8;
+    }
     const auto assets = bumble::first_run::ensure_assets(data_root, !replay_path.empty());
     if (assets == bumble::first_run::AssetResult::Cancelled) return 0;
     if (assets != bumble::first_run::AssetResult::Ready) {
@@ -1550,7 +1566,15 @@ static int run_game(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    if (!acquire_single_instance()) return 0;
+    try {
+        if (!acquire_single_instance()) {
+            std::fprintf(stderr, "Bumble is already running.\n");
+            return 1;
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "%s\n", error.what());
+        return 3;
+    }
     bool console = false;
     bool explicit_root = false;
     std::filesystem::path root;
