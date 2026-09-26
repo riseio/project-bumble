@@ -95,8 +95,8 @@ Use Steam's **Gamepad** layout. These are the default in-game bindings:
 | View (▢▢) | Cycle visual modes |
 | A / B in menus | Confirm / back |
 
-Custom bindings override these defaults. Trackpads and rear buttons can be
-assigned through Steam Input.
+Custom bindings override these defaults. Trackpads and rear buttons can be assigned through Steam Input.
+Should I add gyro?
 
 ## Disclaimer
 
@@ -118,22 +118,6 @@ Buck Bumble, its characters, names, artwork, music, trademarks and all other
 original game content belong to their respective copyright and trademark
 holders. We claim no ownership of that content. This project grants no rights
 to copy or redistribute the original game or its assets.
-
-## Crash reports
-
-Each launch saves a report in `logs` beside the game or AppImage. If the game
-fails, zip that folder and send it with your bug report. Keep the whole folder,
-including the launcher log, runtime log and any crash files. The latest five
-runs are kept; startup logs are limited to 16 MB per run. Gameplay logging is
-disabled, including with `--diagnostic-logging`. Crash reporting stays active.
-
-Windows crash files are `crash.txt` and `crash.dmp`. Linux and Steam Deck
-crash files are `crash.txt`, `crash.maps` and `crash.stack`. Send whatever
-was created, along with your operating system and what happened.
-
-The Reports can contain file paths or portions of memory which I need for debugging. If you are worried about this you can send them to me privately via our discord in a support ticket.
-
-If you use `--data-root`, the `logs` folder is inside that location instead.
 
 ## Project
 
