@@ -372,22 +372,7 @@ void log_skip(const char* reason) {
 } // namespace
 
 void bumble::modern_sky::set_enabled(bool enabled_value) {
-    const bool previous = g_enabled.exchange(
-        enabled_value,
-        std::memory_order_acq_rel
-    );
-    if (previous != enabled_value) {
-        std::fprintf(
-            stderr,
-            "BUMBLE_SKY stage=mode_configured enabled=%d"
-            " asset=none model=direction_space_procedural"
-            " reviewed_presets=garden_cloudy_day,trench_industrial_dark_overcast"
-            " other_playable_worlds=boundary_only denied=cinematics"
-            " identity_contract=full_0x24\n",
-            enabled_value ? 1 : 0
-        );
-        std::fflush(stderr);
-    }
+    g_enabled.store(enabled_value, std::memory_order_release);
 }
 
 bool bumble::modern_sky::enabled() {

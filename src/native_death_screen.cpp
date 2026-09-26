@@ -222,19 +222,6 @@ bool bumble::death_screen::configure(
     );
 #endif
     g_state.configured.store(true, std::memory_order_release);
-    std::fprintf(
-        stderr,
-        "BUMBLE_DEATH_SCREEN stage=asset_ready path=%s bytes=%zu"
-        " source=user_authored redistribution_authorized=1"
-        " rom_derived=0 width=%" PRIu32 " height=%" PRIu32
-        " forced_diagnostic=%d\n",
-        asset_directory.string().c_str(),
-        g_state.image_bytes.size(),
-        kExpectedWidth,
-        kExpectedHeight,
-        g_state.force_diagnostic.load(std::memory_order_acquire) ? 1 : 0
-    );
-    std::fflush(stderr);
     return true;
 }
 

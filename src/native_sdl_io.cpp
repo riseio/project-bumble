@@ -4297,24 +4297,12 @@ void scan_controllers_locked() {
     const auto bindings = bumble::input_bindings::current();
     const bool controller_active =
         controller_preferred_for_gameplay(bindings);
-    const char* preferred_name =
-        slot != 0u && g_controllers[0] != nullptr
-        ? SDL_GameControllerName(g_controllers[0])
-        : nullptr;
     g_modern_visuals_toggle_down = controller_input_down(
         g_controllers[0],
         bumble::input_bindings::ControllerInput::Back
     );
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=controllers_scanned count=%zu"
-        " requested=%s effective=%s preferred=\"%s\""
-        " hotplug_fallback=keyboard_mouse\n",
-        slot,
-        bumble::input_bindings::device_mode_name(bindings.device_mode),
-        controller_active ? "controller" : "keyboard_mouse",
-        preferred_name != nullptr ? preferred_name : "none"
-    );
+    std::fprintf(stderr, "Input: %s, %zu controllers\n",
+        controller_active ? "controller" : "keyboard and mouse", slot);
     std::fflush(stderr);
     g_rescan_requested = false;
 }
@@ -5033,7 +5021,7 @@ bool bumble::native_io::initialize() {
         scan_controllers_locked();
     }
     g_initialized = true;
-    std::fprintf(stderr, "BUMBLE_RT64_PROBE stage=sdl_io_ready\n");
+    std::fprintf(stderr, "Input and audio ready\n");
     std::fflush(stderr);
     return true;
 }
@@ -5517,11 +5505,7 @@ void bumble::native_io::poll_input() {
         }
     }
 
-    const uint64_t count = g_input_polls.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count == 1 || count == 60 || count == 600) {
-        std::fprintf(stderr, "BUMBLE_RT64_PROBE stage=input_polled count=%llu\n", static_cast<unsigned long long>(count));
-        std::fflush(stderr);
-    }
+    g_input_polls.fetch_add(1, std::memory_order_relaxed);
     g_keyboard_pressed_for_poll.fill(0);
     g_mouse_buttons_pressed_for_poll = 0u;
 }

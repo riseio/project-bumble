@@ -5562,41 +5562,8 @@ bool bumble::graphics_options::initialize(
     );
     save_settings(settings);
 
-    std::fprintf(
-        stderr,
-        "BUMBLE_GRAPHICS_OPTIONS stage=loaded path=%s menu_enabled=1"
-        " display=%s resolution=%" PRIu32 "x%" PRIu32
-        " aspect=%s fog_scale=%.1f frame_pacing=%s"
-        " hd_terrain=%d modern_lighting=%d grass=%s"
-        " collision_overlay=%d"
-        " all_weapons=%d unlimited_ammo=%d unlimited_health=%d"
-        " honeycomb_water_rescue=%d ray_traced_lighting=%d resolution_choices=%zu\n",
-        g_config_path.string().c_str(),
-        settings.display_mode == DisplayMode::Fullscreen
-            ? "fullscreen"
-            : "bordered_window",
-        settings.resolution_width,
-        settings.resolution_height,
-        settings.aspect_mode == AspectMode::Widescreen ? "widescreen" : "4x3",
-        static_cast<double>(fog_scale()),
-        settings.frame_pacing == FramePacing::Interpolated120Hz
-            ? "interpolated_120hz"
-            : settings.frame_pacing == FramePacing::Interpolated60Hz
-                ? "interpolated_60hz"
-                : "original_30hz",
-        settings.hd_terrain ? 1 : 0,
-        settings.modern_lighting ? 1 : 0,
-        settings.grass_mode == GrassMode::Off
-            ? "off"
-            : settings.grass_mode == GrassMode::Low ? "low" : "high",
-        settings.collision_overlay ? 1 : 0,
-        settings.all_weapons ? 1 : 0,
-        settings.unlimited_ammo ? 1 : 0,
-        settings.unlimited_health ? 1 : 0,
-        settings.honeycomb_water_rescue ? 1 : 0,
-        0,
-        g_resolution_choices.size()
-    );
+    std::fprintf(stderr, "Display: %ux%u, %s\n", settings.resolution_width,
+        settings.resolution_height, settings.display_mode == DisplayMode::Fullscreen ? "fullscreen" : "windowed");
     std::fflush(stderr);
     return true;
 }

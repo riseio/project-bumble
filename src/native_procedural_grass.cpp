@@ -111,7 +111,6 @@ constexpr uint32_t kGrassRenderMode = 0x00553078u; // AA_ZB_TEX_EDGE, both cycle
 constexpr uint32_t kGrassPrimitiveColor = 0x629B3CFFu;
 
 std::atomic<uint32_t> g_mode{static_cast<uint32_t>(Mode::Off)};
-std::atomic<uint32_t> g_last_logged_mode{UINT32_MAX};
 std::atomic_bool g_extended_gbi_required{false};
 std::atomic_uint64_t g_emitted_passes{0};
 std::atomic_bool g_allocation_failure_logged{false};
@@ -1047,28 +1046,6 @@ void bumble::procedural_grass::set_mode(Mode mode_value) {
         ? raw
         : static_cast<uint32_t>(Mode::Off);
     g_mode.store(accepted, std::memory_order_release);
-    const uint32_t previous =
-        g_last_logged_mode.exchange(accepted, std::memory_order_acq_rel);
-    if (previous != accepted) {
-        const char* name = accepted == static_cast<uint32_t>(Mode::High)
-            ? "high"
-            : accepted == static_cast<uint32_t>(Mode::Low) ? "low" : "off";
-        std::fprintf(
-            stderr,
-            "BUMBLE_GRASS stage=mode_configured mode=%s gpu_enabled=%d"
-            " legacy_cards=%d off_instances=%d off_draws=%d\n",
-            name,
-#if defined(BUMBLE_GPU_GRASS_RT64) && BUMBLE_GPU_GRASS_RT64
-            accepted != static_cast<uint32_t>(Mode::Off) ? 1 : 0,
-#else
-            0,
-#endif
-            debug_visualization_enabled() ? 1 : 0,
-            accepted == static_cast<uint32_t>(Mode::Off) ? 0 : -1,
-            accepted == static_cast<uint32_t>(Mode::Off) ? 0 : -1
-        );
-        std::fflush(stderr);
-    }
 }
 
 Mode bumble::procedural_grass::mode() {

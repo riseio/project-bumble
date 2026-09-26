@@ -10657,10 +10657,10 @@ index 9fae0d4..1dd9f99 100644
 +            );
 +        std::fprintf(
 +            stderr,
-+            "BUMBLE_GRASS stage=gpu_renderer_owner owner=FramebufferRenderer"
-+            " placement=world_hud_boundary state_owner=%d"
-+            " retained_targets=0 retained_draw_indices=0\n",
-+            workloadOwner ? 0 : 1
++            "Grass renderer: "
++            "%s"
++            "\n",
++            workloadOwner ? "workload" : "state"
 +        );
 +        std::fflush(stderr);
 +

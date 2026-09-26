@@ -5,6 +5,7 @@
 /build/
 /.cache/
 /generated/
+/logs/
 
 # Local editor and compiler output.
 /.vs/

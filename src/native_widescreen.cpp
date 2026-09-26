@@ -381,7 +381,6 @@ std::atomic_uint64_t g_no_fog_expansion_calls{0};
 std::atomic_uint64_t g_terrain_scratch_verified_calls{0};
 std::atomic_uint64_t g_terrain_scratch_failures{0};
 std::atomic_uint64_t g_last_logged_size{0};
-std::atomic_uint64_t g_last_publish_signature{UINT64_MAX};
 std::atomic_bool g_completion_credit_text_logged{false};
 std::atomic<float> g_visibility_camera_eye_x{0.0f};
 std::atomic<float> g_visibility_camera_eye_z{0.0f};
@@ -2233,36 +2232,6 @@ void bumble::widescreen::publish_render_size(
     const uint64_t packed = pack_size(width, height);
     g_render_size.store(packed, std::memory_order_release);
     g_enabled.store(enabled, std::memory_order_release);
-    const uint64_t signature =
-        packed ^ (enabled ? UINT64_C(0x8000000000000000) : 0u);
-    uint64_t previous =
-        g_last_publish_signature.load(std::memory_order_acquire);
-    if (previous != signature &&
-        g_last_publish_signature.compare_exchange_strong(
-            previous,
-            signature,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire
-        )) {
-        const double aspect = height == 0
-            ? 0.0
-            : static_cast<double>(width) / height;
-        const double scale = enabled
-            ? std::max(aspect / kOriginalAspect, 1.0)
-            : 1.0;
-        std::fprintf(
-            stderr,
-            "BUMBLE_WIDESCREEN stage=aspect_configured enabled=%d"
-            " window_width=%" PRIu32 " window_height=%" PRIu32
-            " target_aspect=%.6f source_aspect=1.333333 scale=%.6f\n",
-            enabled ? 1 : 0,
-            width,
-            height,
-            aspect,
-            scale
-        );
-        std::fflush(stderr);
-    }
 }
 
 double bumble::widescreen::horizontal_expansion_scale() {

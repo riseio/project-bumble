@@ -151,11 +151,11 @@ bool prepare(const std::filesystem::path& data_root, bool diagnostics) {
                 fail("Load verified runtime DLL");
         }
         RT64::DynamicLibraries::usePreloadedLibraries();
-        std::fprintf(stderr, "BUMBLE_PORTABLE stage=ready files=%zu repaired=%u cache=%ls\n",
+        std::fprintf(stderr, "Runtime: %zu files, %u repaired\nFolder: %ls\n",
             std::size(kPayloads), repaired, cache.c_str());
         return true;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "BUMBLE_PORTABLE stage=failed error=%s\n", error.what());
+        std::fprintf(stderr, "Runtime setup failed: %s\n", error.what());
         if (!diagnostics) {
             const std::string message = std::string("Bumble could not prepare its bundled runtime.\n\n") +
                 error.what() + "\n\nCheck that your user-data location is writable and has free space.";

@@ -92,23 +92,6 @@ bool bumble::menu_background::configure(
         g_asset_root = asset_root;
     }
     g_configured.store(true, std::memory_order_release);
-    std::fprintf(
-        stderr,
-        "BUMBLE_MENU_BACKGROUND stage=asset_ready path=%s"
-        " variants=2 composition=project_background_rt64"
-        " background_strips=%" PRIu32
-        " suppressed_guest_logo_textures=%" PRIu32
-        " high_resolution_gameplay_ui_textures=%" PRIu32
-        " menu_scale=aspect_matched guest_text=native_embedded_roboto"
-        " gameplay_ui_upscale=32x_palette_preserving_scale2x"
-        " gameplay_ui_screen_scale=0.5 dynamic_radar=live"
-        " format=rt64_png_rgba32 guest_writes=0\n",
-        asset_root.string().c_str(),
-        kHighResolutionBackgroundStripCount,
-        kSuppressedGuestLogoTextureCount,
-        kHighResolutionGameplayUiTextureCount
-    );
-    std::fflush(stderr);
     return true;
 }
 

@@ -6504,17 +6504,6 @@ void bumble::native_checkpoint::configure_mission1_completion_replay(
         enabled,
         std::memory_order_release
     );
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=mission1_completion_replay_configured"
-        " enabled=%d withhold_one_owner=%d"
-        " control_path=modern_aim_movement_plus_guest_buttons"
-        " pickup_path=guest_collision weapon_path=guest_c_button"
-        " counter_result_level_writes=0\n",
-        enabled ? 1 : 0,
-        enabled && withhold_one_owner ? 1 : 0
-    );
-    std::fflush(stderr);
 }
 
 bool bumble::native_checkpoint::mission1_completion_replay_enabled() {
@@ -6584,18 +6573,6 @@ void bumble::native_checkpoint::configure_widescreen_hud_validation(
         enabled,
         std::memory_order_release
     );
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=widescreen_hud_validation_configured"
-        " enabled=%d aspect=widescreen weapon_slots=%" PRIu32
-        " ammo_each=%" PRIu32
-        " cycle_driver=replay_full_inventory_fixture"
-        " carousel_owner=func_800A4B54 replay_only=1\n",
-        enabled ? 1 : 0,
-        kWidescreenHudWeaponCount,
-        kWidescreenHudValidationAmmo
-    );
-    std::fflush(stderr);
 }
 
 uint32_t bumble::native_checkpoint::take_widescreen_hud_capture_request() {

@@ -1,6 +1,7 @@
 # Project Bumble
 A native PC and Steamdeck port of **Buck Bumble**, with widescreen support, modern graphics, a plethora of QOL enhancements,
 and keyboard, mouse and controller controls. This is hobby project originally built for my own playthrough, now shared because sharing is caring.
+While feedback and bug reports are welcome, please keep your virtue signalling and code quality objections to reddit.
 
 ## Download and play
 
@@ -21,8 +22,23 @@ You can restore the prompt from **Options > Graphics / Effects**.
   `FuzzyBumble_<version>` executable is also available, but needs its runtime
   libraries installed.
 
+Windows requires an x86-64 CPU with SSE4.1 and a compatible D3D12 or Vulkan GPU.
+Linux requires x86-64 with AVX2 and F16C.
+The AppImage includes SDL, audio libraries, and C/C++ runtimes. It uses the
+system Vulkan loader and graphics/display libraries to match the installed
+drivers. A supported Linux kernel and desktop session are still required.
+
 Saves, settings, and generated textures live in `userdata` beside the executable
-or AppImage. Keep that folder when updating or moving the game.
+or AppImage. Keep that folder when updating or moving the game. On the first
+portable launch, existing user-profile data is copied there without deleting
+the original. The game folder must be writable.
+
+Game-managed caches and temporary files also stay in `userdata`; there is no
+fallback to AppData. Linux shader-cache locations are redirected there where the
+driver supports it. AppImage mounting/extraction, OS crash reports, graphics-driver
+services and desktop file-picker history are managed by the system, not the game.
+Advanced `--data-root` and `--controller-pak-root` options explicitly override
+their respective locations; diagnostic output paths must stay inside the data root.
 
 ## Enhancements
 
@@ -30,13 +46,13 @@ or AppImage. Keep that folder when updating or moving the game.
 - Original 30 Hz or interpolated 60/120 Hz rendering.
 - Mouse aiming and dual-stick flight controls, with direct buttons for maneuvers.
 - Remappable controls, stick-layout options, sensitivity, deadzone and inversion settings.
-- Separate mouse sensitivity for each axis, with acceleration toggle.
-- Cutscene text speed toggle of 1x, 2x, and 4x (default).
+- Separate mouse sensitivity for each axis, with optional acceleration.
+- Cutscene text speeds of 1x, 2x, and 4x (default).
 - Modern menus with keyboard, mouse and controller navigation.
 - Updated weapon labels, boss health display and damage feedback.
 - Optional modern lighting, water effects, terrain textures and grass.
-- Cycle original, pixelated, and enhanced textures during play.
-
+- Cycle original, modern, and modern with enhanced textures during play.
+- Local saves and settings, with no account or online connection needed to play.
 
 ## PC controls
 
@@ -55,6 +71,9 @@ or AppImage. Keep that folder when updating or moving the game.
 | Enter or Escape | Pause |
 
 Controls can be changed in the settings menu.
+
+Enhanced textures use JetForce Capricorn's 9× reconstruction, generated once
+from your ROM and cached locally. Original and modern modes remain available.
 
 ## Steam Deck controls
 
@@ -76,7 +95,8 @@ Use Steam's **Gamepad** layout. These are the default in-game bindings:
 | View (▢▢) | Cycle visual modes |
 | A / B in menus | Confirm / back |
 
-Custom bindings override these defaults. 
+Custom bindings override these defaults. Trackpads and rear buttons can be
+assigned through Steam Input.
 
 ## Disclaimer
 
@@ -98,6 +118,22 @@ Buck Bumble, its characters, names, artwork, music, trademarks and all other
 original game content belong to their respective copyright and trademark
 holders. We claim no ownership of that content. This project grants no rights
 to copy or redistribute the original game or its assets.
+
+## Crash reports
+
+Each launch saves a report in `logs` beside the game or AppImage. If the game
+fails, zip that folder and send it with your bug report. Keep the whole folder,
+including the launcher log, runtime log and any crash files. The latest five
+runs are kept; startup logs are limited to 16 MB per run. Gameplay logging is
+disabled, including with `--diagnostic-logging`. Crash reporting stays active.
+
+Windows crash files are `crash.txt` and `crash.dmp`. Linux and Steam Deck
+crash files are `crash.txt`, `crash.maps` and `crash.stack`. Send whatever
+was created, along with your operating system and what happened.
+
+The Reports can contain file paths or portions of memory which I need for debugging. If you are worried about this you can send them to me privately via our discord in a support ticket.
+
+If you use `--data-root`, the `logs` folder is inside that location instead.
 
 ## Project
 

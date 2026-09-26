@@ -639,7 +639,7 @@ FaithfulTexturePackContract load_faithful_texture_pack_contract(
 }
 
 void log_stage(const char* stage) {
-    std::fprintf(stderr, "BUMBLE_RT64_PROBE stage=%s\n", stage);
+    std::fprintf(stderr, "%s\n", stage);
     std::fflush(stderr);
 }
 
@@ -671,12 +671,6 @@ void configure_texture_dump_directory(RT64::State& state) {
     const std::filesystem::path requested =
         texture_dump_directory_from_environment();
     if (requested.empty()) {
-        std::fprintf(
-            stderr,
-            "BUMBLE_RT64_PROBE stage=rt64_texture_dump enabled=0"
-            " source=BUMBLE_RT64_TEXTURE_DUMP_DIR\n"
-        );
-        std::fflush(stderr);
         return;
     }
 
@@ -690,24 +684,14 @@ void configure_texture_dump_directory(RT64::State& state) {
         error = std::make_error_code(std::errc::not_a_directory);
     }
     if (error) {
-        std::fprintf(
-            stderr,
-            "BUMBLE_RT64_PROBE stage=rt64_texture_dump enabled=0"
-            " source=BUMBLE_RT64_TEXTURE_DUMP_DIR error=%d path=%s\n",
-            error.value(),
-            requested.string().c_str()
-        );
+        std::fprintf(stderr, "Cannot create texture dump folder: %s (error %d)\n",
+            requested.string().c_str(), error.value());
         std::fflush(stderr);
         return;
     }
 
     state.dumpingTexturesDirectory = resolved;
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=rt64_texture_dump enabled=1"
-        " source=BUMBLE_RT64_TEXTURE_DUMP_DIR path=%s\n",
-        resolved.string().c_str()
-    );
+    std::fprintf(stderr, "Texture dump folder: %s\n", resolved.string().c_str());
     std::fflush(stderr);
 }
 
@@ -995,39 +979,9 @@ public:
         app_->swapChain->setVsyncEnabled(initial_vsync);
         frame_pacing_active_ = initial_frame_pacing;
 
-        std::fprintf(
-            stderr,
-            "BUMBLE_RT64_PROBE stage=rt64_quality_config"
-            " resolution=window_output_scale msaa_samples=%" PRIu32
-            " msaa_source=%s"
-            " internal_color=automatic filtering=anti_aliased_pixel_scaling"
-            " refresh=%s display_rate=%" PRIu32
-            " requested_target_rate=%" PRIu32
-            " logical_target_rate=%d pacing_owner=rt64_present_queue"
-            " idle_gpu_work=1 vsync=%d"
-            " interpolation_allocation_safety_ceiling=12"
-            " interpolation_policy=fixed_resource_ceiling_uniform_samples"
-            " interpolation_sampling=uniform_full_source_interval"
-            " interpolation=rt64 fog_scale=%.6f"
-            " aspect_mode=%s extended_aspect_mode=%s"
-            " shared_aspect_mode=%d shared_extended_aspect_mode=%d\n",
-            app_->userConfig.msaaSampleCount(),
-            probe_msaa.source,
-            frame_pacing_name(initial_frame_pacing),
-            app_->sharedQueueResources->swapChainRate,
-            initial_requested_hz,
-            static_cast<int>(initial_target_hz),
-            initial_vsync ? 1 : 0,
-            static_cast<double>(g_fog_scale.load(std::memory_order_acquire)),
-            adaptive_aspect ? "expand" : "original",
-            adaptive_aspect ? "expand" : "original",
-            static_cast<int>(
-                app_->sharedQueueResources->userConfig.aspectRatio
-            ),
-            static_cast<int>(
-                app_->sharedQueueResources->userConfig.extAspectRatio
-            )
-        );
+        std::fprintf(stderr, "Graphics: %s, MSAA %u, target %u Hz\n",
+            chosen_api == ultramodern::renderer::GraphicsApi::Vulkan ? "Vulkan" : "D3D12",
+            app_->userConfig.msaaSampleCount(), initial_target_hz);
         std::fflush(stderr);
         if (grass_no_interpolation_diagnostic) {
             std::fprintf(
@@ -1113,10 +1067,10 @@ public:
             const std::lock_guard lock(g_active_application_mutex);
             g_active_application = app_.get();
         }
-        log_stage("rt64_renderer_ready");
+        log_stage("Graphics ready");
         }
         catch (const std::exception& error) {
-            std::fprintf(stderr, "BUMBLE_RT64_PROBE stage=rt64_initialization_failed error=%s\n", error.what());
+            std::fprintf(stderr, "Graphics initialization failed: %s\n", error.what());
             std::fflush(stderr);
             setup_result = ultramodern::renderer::SetupResult::GraphicsDeviceNotFound;
             shutdown();
@@ -2095,7 +2049,6 @@ private:
             " rendered_total=%" PRIu64 " presented_total=%" PRIu64
             " logical_target_rate=%" PRIu32 " display_rate=%" PRIu32
             " source_workload_rate=%" PRIu32
-            " pacing_owner=rt64_present_queue idle_gpu_work=1"
             " vsync=%d present_intervals=%" PRIu64
             " present_interval_mean_ms=%.3f present_interval_p50_ms=%.3f"
             " present_interval_p95_ms=%.3f present_interval_p99_ms=%.3f"
@@ -2104,9 +2057,7 @@ private:
             " present_intervals_over_200pct=%" PRIu64
             " present_intervals_over_16_67ms=%" PRIu64
             " present_intervals_over_33_33ms=%" PRIu64
-            " interpolation_allocation_safety_ceiling=12"
-            " interpolation_policy=fixed_resource_ceiling_uniform_samples"
-            " interpolation_sampling=uniform_full_source_interval\n",
+            "\n",
             frame_pacing_name(frame_pacing_active_),
             source_vi_rate,
             rendered_rate,
@@ -2372,22 +2323,6 @@ private:
             app_->swapChain->setVsyncEnabled(vsync);
             app_->updateUserConfig(false);
             bumble::frame_pacing::configure(logical_target_hz);
-            std::fprintf(
-                stderr,
-                "BUMBLE_RT64_PROBE stage=frame_pacing_applied mode=%s"
-                " pacing_owner=rt64_present_queue idle_gpu_work=1"
-                " vsync=%d requested_target_rate=%" PRIu32
-                " logical_target_rate=%d"
-                " interpolation_allocation_safety_ceiling=12"
-                " interpolation_policy=fixed_resource_ceiling_uniform_samples"
-                " interpolation_sampling=uniform_full_source_interval"
-                " simulation_rate=unchanged\n",
-                frame_pacing_name(frame_pacing),
-                vsync ? 1 : 0,
-                requested_hz,
-                static_cast<int>(logical_target_hz)
-            );
-            std::fflush(stderr);
         }
         const auto configured_grass =
             bumble::graphics_options::grass_mode();
@@ -2400,20 +2335,6 @@ private:
         bumble::procedural_grass::set_mode(grass_mode);
         if (force_log || grass_mode_active_ != grass_mode) {
             grass_mode_active_ = grass_mode;
-            const char* name = grass_mode ==
-                    bumble::procedural_grass::Mode::High
-                ? "high"
-                : grass_mode == bumble::procedural_grass::Mode::Low
-                    ? "low"
-                    : "off";
-            std::fprintf(
-                stderr,
-                "BUMBLE_RT64_PROBE stage=procedural_grass mode=%s"
-                " material_filter=translucency_scan"
-                " low_budget=48 high_budget=96\n",
-                name
-            );
-            std::fflush(stderr);
         }
 
         const bool high_resolution_textures =
@@ -2563,21 +2484,8 @@ bool bumble::rt64_renderer::mission2_screen_presented() {
 
 void bumble::rt64_renderer::set_fog_scale(float scale) {
     const float clamped = std::clamp(scale, 0.0f, 1.0f);
-    const float previous = g_fog_scale.exchange(
-        clamped,
-        std::memory_order_acq_rel
-    );
+    g_fog_scale.store(clamped, std::memory_order_release);
     bumble::widescreen::publish_fog_scale(clamped);
-    if (previous != clamped) {
-        std::fprintf(
-            stderr,
-            "BUMBLE_RT64_PROBE stage=rt64_fog_scale_updated"
-            " previous=%.1f current=%.1f\n",
-            static_cast<double>(previous),
-            static_cast<double>(clamped)
-        );
-        std::fflush(stderr);
-    }
 }
 
 float bumble::rt64_renderer::fog_scale() {

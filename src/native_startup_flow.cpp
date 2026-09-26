@@ -162,13 +162,6 @@ void bumble::startup_flow::configure(bool skip_intro, bool suppress_attract) {
     g_attract_suppression_count.store(0, std::memory_order_release);
     g_attract_transition_preemption_count.store(0, std::memory_order_release);
     g_attract_transition_preemption_pending = false;
-    std::fprintf(
-        stderr,
-        "BUMBLE_STARTUP_FLOW stage=configured skip_intro=%d suppress_attract=%d\n",
-        skip_intro ? 1 : 0,
-        suppress_attract ? 1 : 0
-    );
-    std::fflush(stderr);
 }
 
 bool bumble::startup_flow::skip_intro_enabled() {
@@ -196,12 +189,6 @@ void bumble::startup_flow::configure_rumble_prompt_bypass(
     );
     g_rumble_prompt_bypass_latched.store(false, std::memory_order_release);
     g_rumble_prompt_bypass_count.store(0, std::memory_order_release);
-    std::fprintf(
-        stderr,
-        "BUMBLE_STARTUP_FLOW stage=rumble_prompt_configured bypass=%d\n",
-        bypass_prompt ? 1 : 0
-    );
-    std::fflush(stderr);
 }
 
 bool bumble::startup_flow::rumble_prompt_bypass_enabled() {

@@ -913,16 +913,6 @@ bool bumble::text_overlay::configure_menu_background(
         return false;
     }
     g_state.menu_background_configured = true;
-    std::fprintf(
-        stderr,
-        "BUMBLE_TEXT_OVERLAY stage=menu_background_ready path=%s bytes=%zu"
-        " source=user_authored width=%" PRIu32 " height=%" PRIu32 "\n",
-        asset_directory.string().c_str(),
-        g_state.menu_background_bytes.size(),
-        kMenuBackgroundWidth,
-        kMenuBackgroundHeight
-    );
-    std::fflush(stderr);
     return true;
 }
 
@@ -1010,16 +1000,6 @@ bool bumble::text_overlay::bind_renderer(
     g_state.presented_logged = false;
     g_state.wide_panel_layout_logged = false;
     set_renderer_ready(true);
-    std::fprintf(
-        stderr,
-        "BUMBLE_TEXT_OVERLAY stage=renderer_ready"
-        " font=Roboto_Medium source=embedded"
-        " rasterization=output_resolution cross_platform=1"
-        " outline=bitmap_dilation panel_side_fill=disabled"
-        " menu_backdrop=user_authored_full_viewport"
-        " guest_font_asset_packaged=0\n"
-    );
-    std::fflush(stderr);
     return true;
 }
 

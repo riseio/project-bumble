@@ -36,6 +36,7 @@
 #include "native_boot_overlays.hpp"
 #include "native_checkpoint_bridge.hpp"
 #include "native_death_screen.hpp"
+#include "native_diagnostics.hpp"
 #include "native_electric_effect.hpp"
 #include "native_controller_pak.hpp"
 #include "native_game_completion_screen.hpp"
@@ -161,12 +162,12 @@ bool acquire_single_instance() {
 }
 
 void log_stage(const char* stage) {
-    std::fprintf(stderr, "BUMBLE_RT64_PROBE stage=%s\n", stage);
+    std::fprintf(stderr, "%s\n", stage);
     std::fflush(stderr);
 }
 
 void log_error(const char* stage, unsigned long value) {
-    std::fprintf(stderr, "BUMBLE_RT64_PROBE stage=%s error=%lu\n", stage, value);
+    std::fprintf(stderr, "%s (error %lu)\n", stage, value);
     std::fflush(stderr);
 }
 
@@ -546,74 +547,6 @@ void handle_validation_synthetic_mouse(LPARAM lparam) {
     bumble::modern_controls::add_raw_mouse_delta(delta_x, delta_y);
 }
 
-void log_abort_stack(int) {
-    void* frames[48]{};
-    const USHORT count = CaptureStackBackTrace(0, 48, frames, nullptr);
-    std::fprintf(stderr, "BUMBLE_CRASH stage=abort thread=%lu frames=%u\n",
-        GetCurrentThreadId(), static_cast<unsigned>(count));
-    for (USHORT i = 0; i < count; ++i) {
-        HMODULE module = nullptr;
-        wchar_t path[MAX_PATH]{};
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCWSTR>(frames[i]), &module)) {
-            GetModuleFileNameW(module, path, MAX_PATH);
-        }
-        std::fprintf(stderr, "BUMBLE_CRASH frame=%u module=%ls rva=0x%" PRIXPTR "\n",
-            static_cast<unsigned>(i), module ? path : L"<unknown>",
-            reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(module));
-    }
-    std::fflush(stderr);
-    // Return to CRT abort: preserve its fatal-exit and WER behavior.
-}
-
-void log_terminate() noexcept {
-    try {
-        if (const auto exception = std::current_exception()) {
-            std::rethrow_exception(exception);
-        }
-        std::fprintf(stderr, "BUMBLE_CRASH stage=terminate exception=none\n");
-    } catch (const std::exception& exception) {
-        std::fprintf(stderr, "BUMBLE_CRASH stage=terminate what=%s\n", exception.what());
-    } catch (...) {
-        std::fprintf(stderr, "BUMBLE_CRASH stage=terminate exception=non_std\n");
-    }
-    std::fflush(stderr);
-    std::abort();
-}
-
-LONG WINAPI log_unhandled_exception(EXCEPTION_POINTERS* exception) {
-    const EXCEPTION_RECORD* record = exception->ExceptionRecord;
-    HMODULE module = nullptr;
-    wchar_t module_path[MAX_PATH]{};
-    const auto address = record->ExceptionAddress;
-    const bool found_module = GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(address),
-        &module
-    ) != 0;
-    if (found_module) {
-        GetModuleFileNameW(module, module_path, MAX_PATH);
-    }
-    const auto module_offset = found_module
-        ? reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(module)
-        : 0;
-
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=unhandled_exception code=0x%08lX "
-        "address=%p thread=%lu module=%ls module_offset=0x%" PRIXPTR "\n",
-        record->ExceptionCode,
-        address,
-        GetCurrentThreadId(),
-        found_module ? module_path : L"<unknown>",
-        module_offset
-    );
-    std::fflush(stderr);
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
 #else
 void update_cursor_clip() {
 }
@@ -685,7 +618,7 @@ void on_game_init(uint8_t* rdram, recomp_context*) {
 }
 
 void diagnostic_entrypoint(uint8_t* rdram, recomp_context* context) {
-    log_stage("guest_entrypoint_enter");
+    log_stage("Starting game");
     context->r29 = kInitialStack;
     for (uint32_t address = kInitialBssStart; address < kInitialBssEnd; address += 4) {
         MEM_W(0, static_cast<int32_t>(address)) = 0;
@@ -893,7 +826,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         bumble::modern_controls::set_mouse_capture(false);
         ClipCursor(nullptr);
         g_window = nullptr;
-        log_stage("window_destroyed");
+        log_stage("Window closed");
         std::fprintf(stderr, "BUMBLE_RT64_SHUTDOWN stage=runtime_quit_begin\n");
         std::fflush(stderr);
         ultramodern::quit();
@@ -986,7 +919,7 @@ bool create_visible_window() {
         std::fflush(stderr);
     }
     reconcile_window_focus("window_created");
-    log_stage("visible_window_created");
+    log_stage("Window ready");
     return true;
 }
 
@@ -1064,7 +997,7 @@ void pump_messages(void*) {
 
     if (bumble::rt64_renderer::screen_update_count() >= 2 &&
         !g_game_start_requested.exchange(true, std::memory_order_acq_rel)) {
-        log_stage("game_start_requested_after_visible_vi");
+        log_stage("Starting game");
         recomp::start_game(kGameId);
     }
 }
@@ -1099,7 +1032,7 @@ bool create_visible_window() {
     g_window_focused = true;
     bumble::modern_controls::set_window_focused(true);
     refresh_mouse_capture();
-    log_stage("visible_window_created");
+    log_stage("Window ready");
     return true;
 }
 
@@ -1131,7 +1064,7 @@ void pump_messages(void*) {
 
     if (bumble::rt64_renderer::screen_update_count() >= 2 &&
         !g_game_start_requested.exchange(true, std::memory_order_acq_rel)) {
-        log_stage("game_start_requested_after_visible_vi");
+        log_stage("Starting game");
         recomp::start_game(kGameId);
     }
 }
@@ -1148,7 +1081,7 @@ void destroy_visible_window() {
         SDL_DestroyWindow(g_window);
         g_window = nullptr;
     }
-    log_stage("window_destroyed");
+    log_stage("Window closed");
 }
 #endif
 
@@ -1194,7 +1127,7 @@ bool parse_connected_pak(
 
 } // namespace
 
-int main(int argc, char** argv) {
+static int run_game(int argc, char** argv) {
     bool release_diagnostic_logging = false;
     for (int index = 1; index < argc; ++index) {
         if (std::string(argv[index]) == "--diagnostic-logging") {
@@ -1202,39 +1135,15 @@ int main(int argc, char** argv) {
             break;
         }
     }
-    if (!release_diagnostic_logging) {
-#if defined(_WIN32)
-        FILE* null_stream = nullptr;
-        (void)freopen_s(&null_stream, "NUL", "w", stdout);
-        (void)freopen_s(&null_stream, "NUL", "w", stderr);
-#else
-        (void)std::freopen("/dev/null", "w", stdout);
-        (void)std::freopen("/dev/null", "w", stderr);
-#endif
-    } else {
-        std::setvbuf(stdout, nullptr, _IONBF, 0);
-        std::setvbuf(stderr, nullptr, _IONBF, 0);
-    }
     bumble::object_cull_telemetry::set_diagnostics_enabled(
-        release_diagnostic_logging
+        false
     );
     bumble::electric_effect::set_diagnostics_enabled(
-        release_diagnostic_logging
+        false
     );
     bumble::weapon_system::set_diagnostics_enabled(
-        release_diagnostic_logging
+        false
     );
-#if defined(_WIN32)
-    SetUnhandledExceptionFilter(log_unhandled_exception);
-    if (release_diagnostic_logging) {
-        std::signal(SIGABRT, log_abort_stack);
-        std::set_terminate(log_terminate);
-    }
-#endif
-    if (!acquire_single_instance()) {
-        log_stage("duplicate_instance_rejected");
-        return 0;
-    }
 
     const char* validation_synthetic_input =
         std::getenv("BUMBLE_RT64_VALIDATION_SYNTHETIC_INPUT");
@@ -1277,7 +1186,7 @@ int main(int argc, char** argv) {
             if (!parse_connected_pak(argv[++index], connected_pak)) {
                 std::fprintf(
                     stderr,
-                    "BUMBLE_RT64_PROBE stage=argument_error value=%s\n",
+                    "Invalid argument: %s\n",
                     argv[index]
                 );
                 return 2;
@@ -1302,7 +1211,7 @@ int main(int argc, char** argv) {
             } catch (...) {
                 std::fprintf(
                     stderr,
-                    "BUMBLE_RT64_PROBE stage=argument_error value=%s\n",
+                    "Invalid argument: %s\n",
                     argv[index]
                 );
                 return 2;
@@ -1311,7 +1220,7 @@ int main(int argc, char** argv) {
                 mouse_sensitivity < 0.01f || mouse_sensitivity > 2.0f) {
                 std::fprintf(
                     stderr,
-                    "BUMBLE_RT64_PROBE stage=argument_error value=%s\n",
+                    "Invalid argument: %s\n",
                     argv[index]
                 );
                 return 2;
@@ -1323,7 +1232,7 @@ int main(int argc, char** argv) {
         } else if (argument == "--diagnostic-logging") {
             // Handled before startup.
         } else {
-            std::fprintf(stderr, "BUMBLE_RT64_PROBE stage=argument_error value=%s\n", argument.c_str());
+            std::fprintf(stderr, "Invalid argument: %s\n", argument.c_str());
             return 2;
         }
     }
@@ -1344,6 +1253,7 @@ int main(int argc, char** argv) {
     }
 
     std::filesystem::path rom_path;
+    bumble::diagnostics::phase("portable data");
     if (data_root.empty()) {
         try { data_root = default_release_data_root(); }
         catch (const std::exception& error) {
@@ -1388,7 +1298,7 @@ int main(int argc, char** argv) {
     if (directory_error) {
         std::fprintf(
             stderr,
-            "BUMBLE_RT64_PROBE stage=config_directory_failed error=%s\n",
+            "Cannot create settings folder: %s\n",
             directory_error.message().c_str()
         );
         return 3;
@@ -1398,7 +1308,7 @@ int main(int argc, char** argv) {
     if (directory_error) {
         std::fprintf(
             stderr,
-            "BUMBLE_RT64_PROBE stage=controller_pak_directory_failed path=%s error=%s\n",
+            "Cannot create save folder %s: %s\n",
             controller_pak_root.string().c_str(),
             directory_error.message().c_str()
         );
@@ -1437,17 +1347,18 @@ int main(int argc, char** argv) {
         .on_init_callback = on_game_init,
     };
     if (!recomp::register_game(game)) {
-        log_stage("game_registration_failed");
+        log_stage("Cannot register game");
         return 4;
     }
 
     register_bumble_overlays();
 
+    bumble::diagnostics::phase("ROM validation");
     const recomp::RomValidationError validation = recomp::select_rom(rom_path, game.game_id);
     if (validation != recomp::RomValidationError::Good) {
         std::fprintf(
             stderr,
-            "BUMBLE_RT64_PROBE stage=rom_selection_failed result=%s value=%d\n",
+            "Cannot load ROM: %s (code %d)\n",
             validation_error_name(validation),
             static_cast<int>(validation)
         );
@@ -1466,13 +1377,14 @@ int main(int argc, char** argv) {
         return 5;
     }
     if (!recomp::load_stored_rom(game.game_id)) {
-        log_stage("stored_rom_preflight_failed");
+        log_stage("Cannot load saved ROM");
         return 6;
     }
+    bumble::diagnostics::phase("texture preparation");
     const auto assets = bumble::first_run::ensure_assets(data_root, !replay_path.empty());
     if (assets == bumble::first_run::AssetResult::Cancelled) return 0;
     if (assets != bumble::first_run::AssetResult::Ready) {
-        log_stage("first_run_asset_generation_failed");
+        log_stage("Texture preparation failed");
         return 8;
     }
 
@@ -1481,7 +1393,7 @@ int main(int argc, char** argv) {
             return 8;
         }
         if (first_run_only) {
-            log_stage("first_run_ready");
+            log_stage("Textures ready");
             return 0;
         }
     }
@@ -1534,6 +1446,7 @@ int main(int argc, char** argv) {
         return 8;
     }
 
+    bumble::diagnostics::phase("input and window");
     if (!bumble::native_io::initialize()) {
         return 9;
     }
@@ -1611,15 +1524,17 @@ int main(int argc, char** argv) {
     RT64::ProfilerGuestVI::install();
     config.events_callbacks = ultramodern::events::callbacks_t{
         .vi_callback = profile_vi_tick,
-        .gfx_init_callback = nullptr,
+        .gfx_init_callback = bumble::diagnostics::end_startup,
         .graphics_action_dequeued = profile_graphics_action_dequeued,
         .graphics_action_completed = profile_graphics_action_completed,
     };
     config.message_queue_control = ultramodern::MessageQueueControl{};
 
-    log_stage("runtime_start_enter");
+    log_stage("Starting runtime");
+    bumble::diagnostics::phase("game runtime");
     recomp::start(config);
-    log_stage("runtime_start_returned");
+    log_stage("Runtime stopped");
+    bumble::diagnostics::phase("shutdown");
 
     const bool replay_failed = bumble::native_io::replay_configured() &&
         (!bumble::native_io::replay_complete() ||
@@ -1631,46 +1546,48 @@ int main(int argc, char** argv) {
     bumble::graphics_options::shutdown();
     bumble::native_io::shutdown();
     bumble::controller_pak::reset_runtime_state();
-    std::fprintf(
-        stderr,
-        "BUMBLE_RT64_PROBE stage=clean_shutdown input_polls=%llu input_transitions=%llu "
-        "audio_samples_queued=%llu audio_samples_consumed=%llu display_lists=%" PRIu32
-        " screen_updates=%" PRIu32
-        " intro_skips=%llu"
-        " rumble_prompt_bypasses=%llu"
-        " modern_player_frames=%llu modern_aim_updates=%llu"
-        " modern_movement_frames=%llu"
-        " replay_configured=%d replay_complete=%d replay_semantic_success=%d"
-        " widescreen_hud_validation_complete=%d"
-        " replay_tick=%llu replay_game_events=%" PRIu32 "/%" PRIu32 "\n",
-        static_cast<unsigned long long>(bumble::native_io::input_poll_count()),
-        static_cast<unsigned long long>(bumble::native_io::input_transition_count()),
-        static_cast<unsigned long long>(bumble::native_io::queued_audio_sample_count()),
-        static_cast<unsigned long long>(bumble::native_io::consumed_audio_sample_count()),
-        bumble::rt64_renderer::display_list_count(),
-        bumble::rt64_renderer::screen_update_count(),
-        static_cast<unsigned long long>(
-            bumble::startup_flow::intro_skip_count()
-        ),
-        static_cast<unsigned long long>(
-            bumble::startup_flow::rumble_prompt_bypass_count()
-        ),
-        static_cast<unsigned long long>(
-            bumble::modern_controls::active_player_frame_count()
-        ),
-        static_cast<unsigned long long>(
-            bumble::modern_controls::player_aim_update_count()
-        ),
-        static_cast<unsigned long long>(
-            bumble::modern_controls::movement_frame_count()
-        ),
-        bumble::native_io::replay_configured() ? 1 : 0,
-        bumble::native_io::replay_complete() ? 1 : 0,
-        bumble::native_io::replay_semantic_success() ? 1 : 0,
-        bumble::native_checkpoint::widescreen_hud_validation_complete() ? 1 : 0,
-        static_cast<unsigned long long>(bumble::native_io::replay_tick()),
-        bumble::native_io::replay_completed_game_event_count(),
-        bumble::native_io::replay_expected_game_event_count()
-    );
     return replay_failed ? 10 : 0;
+}
+
+int main(int argc, char** argv) {
+    if (!acquire_single_instance()) return 0;
+    bool console = false;
+    bool explicit_root = false;
+    std::filesystem::path root;
+    try {
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--diagnostic-logging") == 0) console = true;
+            else if (std::strcmp(argv[i], "--data-root") == 0 && i + 1 < argc) root = argv[++i];
+        }
+        explicit_root = !root.empty();
+        if (!explicit_root) {
+            root = executable_directory();
+#if !defined(_WIN32)
+            if (const char* appimage = std::getenv("APPIMAGE"); appimage && *appimage)
+                root = std::filesystem::absolute(appimage).parent_path();
+#endif
+        }
+        if (root.empty()) throw std::runtime_error("Cannot locate the game folder");
+        bumble::diagnostics::initialize(root / "logs", console);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "Cannot prepare launch reports: %s\n", error.what());
+        bumble::diagnostics::finish(3);
+#if defined(_WIN32)
+        MessageBoxA(nullptr, "Bumble needs a writable game folder for launch reports. Move the game to a folder you own and try again.",
+            "Bumble startup error", MB_OK | MB_ICONERROR);
+#endif
+        return 3;
+    }
+    try {
+        if (const char* test = std::getenv("BUMBLE_CRASH_REPORT_TEST"); test && console && explicit_root) {
+            bumble::diagnostics::test_crash(test);
+            bumble::diagnostics::finish(0);
+            return 0;
+        }
+        const int result = run_game(argc, argv);
+        bumble::diagnostics::finish(result);
+        return result;
+    } catch (...) {
+        std::terminate();
+    }
 }

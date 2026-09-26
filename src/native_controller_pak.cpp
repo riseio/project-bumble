@@ -154,12 +154,6 @@ void configure_storage_root(const std::filesystem::path& root) {
     for (auto& card : g_cards) {
         card.reset();
     }
-    std::fprintf(
-        stderr,
-        "BUMBLE_CONTROLLER_PAK stage=storage_configured root=%s\n",
-        g_storage_root.string().c_str()
-    );
-    std::fflush(stderr);
 }
 
 void reset_runtime_state() {
