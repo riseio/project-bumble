@@ -1,4 +1,4 @@
-# Project taken down
+# Thank You Everyone!
 
 Out of respect for the legacy and future work of Argonaut Games, I have decided to take down this project.
 
